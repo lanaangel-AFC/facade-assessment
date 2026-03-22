@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
-import { Plus, Building2, MapPin, User, Calendar, ChevronRight, Trash2 } from "lucide-react";
+import { Plus, Building2, MapPin, User, Calendar, ChevronRight, Trash2, Settings } from "lucide-react";
 import type { Project } from "@shared/schema";
 import { useState } from "react";
 
@@ -67,13 +67,19 @@ export default function ProjectList() {
           </h1>
           <p className="text-sm text-muted-foreground mt-1">Building envelope inspection projects</p>
         </div>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="w-4 h-4 mr-2" />
-              New Project
+        <div className="flex items-center gap-2">
+          <Link href="/settings">
+            <Button variant="outline" size="icon" title="Settings">
+              <Settings className="w-4 h-4" />
             </Button>
-          </DialogTrigger>
+          </Link>
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="w-4 h-4 mr-2" />
+                New Project
+              </Button>
+            </DialogTrigger>
           <DialogContent className="max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>New Project</DialogTitle>
@@ -180,6 +186,7 @@ export default function ProjectList() {
             </form>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
 
       {isLoading ? (

@@ -19,6 +19,7 @@ export const projects = sqliteTable("projects", {
   inspectionScope: text("inspection_scope").default(""),
   limitations: text("limitations").default("[]"), // JSON array of limitation strings
   backgroundDocs: text("background_docs").default("[]"), // JSON array of {title, author, date}
+  executiveSummary: text("executive_summary").default(""),
   createdAt: text("created_at").notNull(),
 });
 
@@ -82,6 +83,23 @@ export const photos = sqliteTable("photos", {
   createdAt: text("created_at").notNull(),
 });
 
+// Settings (key-value store for API key etc.)
+export const settings = sqliteTable("settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+});
+
+// AI Training Data (stores corrections for future fine-tuning)
+export const aiTrainingData = sqliteTable("ai_training_data", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  taskType: text("task_type").notNull(),
+  inputData: text("input_data").notNull(),
+  aiOutput: text("ai_output").notNull(),
+  userCorrected: text("user_corrected").default(""),
+  accepted: integer("accepted").default(0),
+  createdAt: text("created_at").notNull(),
+});
+
 // Users (kept from template)
 export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -95,6 +113,8 @@ export const insertFacadeSystemSchema = createInsertSchema(facadeSystems).omit({
 export const insertObservationSchema = createInsertSchema(observations).omit({ id: true });
 export const insertRecommendationSchema = createInsertSchema(recommendations).omit({ id: true });
 export const insertPhotoSchema = createInsertSchema(photos).omit({ id: true });
+export const insertSettingSchema = createInsertSchema(settings);
+export const insertTrainingDataSchema = createInsertSchema(aiTrainingData).omit({ id: true });
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
 
 // Types
@@ -108,5 +128,9 @@ export type Recommendation = typeof recommendations.$inferSelect;
 export type InsertRecommendation = z.infer<typeof insertRecommendationSchema>;
 export type Photo = typeof photos.$inferSelect;
 export type InsertPhoto = z.infer<typeof insertPhotoSchema>;
+export type Setting = typeof settings.$inferSelect;
+export type InsertSetting = z.infer<typeof insertSettingSchema>;
+export type TrainingData = typeof aiTrainingData.$inferSelect;
+export type InsertTrainingData = z.infer<typeof insertTrainingDataSchema>;
 export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;

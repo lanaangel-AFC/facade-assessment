@@ -11,12 +11,25 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useToast } from "@/hooks/use-toast";
 import { DictationButton } from "@/components/DictationButton";
 import {
-  ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp,
+  ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2,
 } from "lucide-react";
 import type { FacadeSystem, Observation, Photo, Recommendation } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+
+const aiRequest = async (url: string, body: any) => {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || `Request failed (${res.status})`);
+  }
+  return res;
+};
 
 const DEFECT_CATEGORIES = [
   "Gasket failure",
@@ -96,6 +109,9 @@ export default function ObservationForm() {
   const [indicators, setIndicators] = useState<string[]>([]);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [uploading, setUploading] = useState<string | null>(null);
+  const [aiNarrativeLoading, setAiNarrativeLoading] = useState(false);
+  const [aiRecLoading, setAiRecLoading] = useState(false);
+  const [originalAiNarrative, setOriginalAiNarrative] = useState<string | null>(null);
 
   // Recommendations state
   const [recs, setRecs] = useState<Recommendation[]>([]);
@@ -195,9 +211,24 @@ export default function ObservationForm() {
         return res.json();
       }
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
       toast({ title: isEdit ? "Observation updated" : "Observation created" });
+      
+      // Save training data if AI narrative was used
+      if (originalAiNarrative) {
+        try {
+          await aiRequest("/api/ai/training-data", {
+            taskType: "observation_narrative",
+            inputData: JSON.stringify({ observationId: obsIdParam, defectCategory: form.defectCategory, severity: form.severity }),
+            aiOutput: originalAiNarrative,
+            userCorrected: form.aiNarrative !== originalAiNarrative ? form.aiNarrative : "",
+            accepted: form.aiNarrative === originalAiNarrative,
+          });
+        } catch {}
+        setOriginalAiNarrative(null);
+      }
+      
       if (!isEdit) {
         navigate(`/projects/${projectId}/observations/${data.id}`, { replace: true });
       }
@@ -544,13 +575,43 @@ export default function ObservationForm() {
 
         {/* AI Narrative */}
         <div>
-          <Label htmlFor="aiNarrative">AI Narrative</Label>
+          <div className="flex items-center justify-between mb-1">
+            <Label htmlFor="aiNarrative">Observation Narrative</Label>
+            {isEdit && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={aiNarrativeLoading}
+                onClick={async () => {
+                  setAiNarrativeLoading(true);
+                  try {
+                    const res = await aiRequest("/api/ai/generate-observation-narrative", { observationId: Number(obsIdParam) });
+                    const data = await res.json();
+                    setForm(prev => ({ ...prev, aiNarrative: data.narrative }));
+                    setOriginalAiNarrative(data.narrative);
+                    toast({ title: "Narrative generated — review and edit as needed" });
+                  } catch (err: any) {
+                    toast({ title: err.message || "Narrative generation failed", variant: "destructive" });
+                  } finally {
+                    setAiNarrativeLoading(false);
+                  }
+                }}
+              >
+                {aiNarrativeLoading ? (
+                  <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
+                ) : (
+                  <><Sparkles className="w-4 h-4 mr-1" /> Generate Narrative</>
+                )}
+              </Button>
+            )}
+          </div>
           <Textarea
             id="aiNarrative"
-            placeholder="AI-generated detailed narrative will appear here in a future update"
+            placeholder={isEdit ? "Click 'Generate Narrative' to create AI-generated text" : "Save the observation first, then generate a narrative"}
             value={form.aiNarrative}
             onChange={set("aiNarrative")}
-            rows={4}
+            rows={6}
           />
         </div>
 
@@ -570,22 +631,57 @@ export default function ObservationForm() {
         <div className="mt-8 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-medium">Recommendations</h2>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                setEditingRecId(null);
-                setRecForm({ action: "", timeframe: "", category: "", budgetEstimate: "", budgetBasis: "" });
-                setShowRecForm(!showRecForm);
-              }}
-            >
-              {showRecForm && !editingRecId ? (
-                <><ChevronUp className="w-4 h-4 mr-1" /> Cancel</>
-              ) : (
-                <><Plus className="w-4 h-4 mr-1" /> Add Recommendation</>
-              )}
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={aiRecLoading}
+                onClick={async () => {
+                  setAiRecLoading(true);
+                  try {
+                    const res = await aiRequest("/api/ai/generate-recommendation", { observationId: Number(obsIdParam) });
+                    const data = await res.json();
+                    setEditingRecId(null);
+                    setRecForm({
+                      action: data.action || "",
+                      timeframe: data.timeframe || "",
+                      category: data.category || "",
+                      budgetEstimate: data.budgetEstimate || "",
+                      budgetBasis: data.budgetBasis || "",
+                    });
+                    setShowRecForm(true);
+                    toast({ title: "Recommendation generated — review and save" });
+                  } catch (err: any) {
+                    toast({ title: err.message || "Recommendation generation failed", variant: "destructive" });
+                  } finally {
+                    setAiRecLoading(false);
+                  }
+                }}
+              >
+                {aiRecLoading ? (
+                  <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
+                ) : (
+                  <><Sparkles className="w-4 h-4 mr-1" /> AI Suggest</>
+                )}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setEditingRecId(null);
+                  setRecForm({ action: "", timeframe: "", category: "", budgetEstimate: "", budgetBasis: "" });
+                  setShowRecForm(!showRecForm);
+                }}
+              >
+                {showRecForm && !editingRecId ? (
+                  <><ChevronUp className="w-4 h-4 mr-1" /> Cancel</>
+                ) : (
+                  <><Plus className="w-4 h-4 mr-1" /> Add Recommendation</>
+                )}
+              </Button>
+            </div>
           </div>
 
           {/* Existing recommendations */}

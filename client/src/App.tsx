@@ -9,6 +9,7 @@ import ProjectList from "@/pages/project-list";
 import ProjectDetail from "@/pages/project-detail";
 import SystemForm from "@/pages/system-form";
 import ObservationForm from "@/pages/observation-form";
+import Settings from "@/pages/settings";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
 
 function AppRouter() {
@@ -20,6 +21,7 @@ function AppRouter() {
       <Route path="/projects/:projectId/systems/:systemId" component={SystemForm} />
       <Route path="/projects/:projectId/observations/new" component={ObservationForm} />
       <Route path="/projects/:projectId/observations/:observationId" component={ObservationForm} />
+      <Route path="/settings" component={Settings} />
       <Route component={NotFound} />
     </Switch>
   );

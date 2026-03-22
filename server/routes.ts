@@ -7,6 +7,13 @@ import {
   insertObservationSchema,
   insertRecommendationSchema,
 } from "@shared/schema";
+import {
+  identifySystem,
+  generateSystemDescription,
+  generateObservationNarrative,
+  generateRecommendation,
+  generateExecutiveSummary,
+} from "./ai";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -290,6 +297,127 @@ export async function registerRoutes(
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
     res.status(204).end();
+  });
+
+  // === SETTINGS ===
+  app.get("/api/settings/:key", async (req, res) => {
+    const value = await storage.getSetting(req.params.key);
+    if (value === undefined) return res.json({ value: null });
+    // Mask API key for security — only return last 4 chars
+    if (req.params.key === "openai_api_key" && value) {
+      return res.json({ value: "sk-..." + value.slice(-4), hasKey: true });
+    }
+    res.json({ value });
+  });
+
+  app.post("/api/settings", async (req, res) => {
+    const { key, value } = req.body;
+    if (!key || value === undefined) return res.status(400).json({ message: "Key and value are required" });
+    await storage.setSetting(key, value);
+    res.json({ success: true });
+  });
+
+  // === AI ENDPOINTS ===
+  app.post("/api/ai/identify-system", async (req, res) => {
+    try {
+      const { photoIds } = req.body;
+      if (!photoIds || !Array.isArray(photoIds) || photoIds.length === 0) {
+        return res.status(400).json({ message: "photoIds array is required" });
+      }
+      const result = await identifySystem(photoIds);
+      res.json(result);
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "AI identification failed" });
+    }
+  });
+
+  app.post("/api/ai/generate-system-description", async (req, res) => {
+    try {
+      const { systemId } = req.body;
+      if (!systemId) return res.status(400).json({ message: "systemId is required" });
+      const description = await generateSystemDescription(Number(systemId));
+      res.json({ description });
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Description generation failed" });
+    }
+  });
+
+  app.post("/api/ai/generate-observation-narrative", async (req, res) => {
+    try {
+      const { observationId } = req.body;
+      if (!observationId) return res.status(400).json({ message: "observationId is required" });
+      const narrative = await generateObservationNarrative(Number(observationId));
+      res.json({ narrative });
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Narrative generation failed" });
+    }
+  });
+
+  app.post("/api/ai/generate-recommendation", async (req, res) => {
+    try {
+      const { observationId } = req.body;
+      if (!observationId) return res.status(400).json({ message: "observationId is required" });
+      const result = await generateRecommendation(Number(observationId));
+      res.json(result);
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Recommendation generation failed" });
+    }
+  });
+
+  app.post("/api/ai/generate-executive-summary", async (req, res) => {
+    try {
+      const { projectId } = req.body;
+      if (!projectId) return res.status(400).json({ message: "projectId is required" });
+      const summary = await generateExecutiveSummary(Number(projectId));
+      res.json({ summary });
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Executive summary generation failed" });
+    }
+  });
+
+  // === TRAINING DATA ===
+  app.post("/api/ai/training-data", async (req, res) => {
+    try {
+      const { taskType, inputData, aiOutput, userCorrected, accepted } = req.body;
+      if (!taskType || !inputData || !aiOutput) {
+        return res.status(400).json({ message: "taskType, inputData, and aiOutput are required" });
+      }
+      const record = await storage.createTrainingData({
+        taskType,
+        inputData: typeof inputData === "string" ? inputData : JSON.stringify(inputData),
+        aiOutput,
+        userCorrected: userCorrected || "",
+        accepted: accepted ? 1 : 0,
+        createdAt: new Date().toISOString(),
+      });
+      res.status(201).json(record);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "Failed to save training data" });
+    }
+  });
+
+  app.get("/api/ai/training-data/count", async (_req, res) => {
+    const count = await storage.getTrainingDataCount();
+    res.json({ count });
+  });
+
+  app.get("/api/ai/training-data/export", async (_req, res) => {
+    const data = await storage.getAllTrainingData();
+    const jsonl = data.map(d => JSON.stringify({
+      messages: [
+        { role: "system", content: `Task: ${d.taskType}` },
+        { role: "user", content: d.inputData },
+        { role: "assistant", content: d.userCorrected || d.aiOutput },
+      ],
+    })).join("\n");
+    res.setHeader("Content-Type", "application/jsonl");
+    res.setHeader("Content-Disposition", "attachment; filename=training-data.jsonl");
+    res.send(jsonl);
   });
 
   return httpServer;

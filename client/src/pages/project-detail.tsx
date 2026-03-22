@@ -20,10 +20,25 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar,
+  FileText, Calendar, Sparkles, Loader2,
 } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
+
+const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+
+const aiRequest = async (url: string, body: any) => {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || `Request failed (${res.status})`);
+  }
+  return res;
+};
 
 const COMMON_LIMITATIONS = [
   "Visual inspection only — no destructive or invasive testing",
@@ -61,6 +76,8 @@ export default function ProjectDetail() {
   const [limitations, setLimitations] = useState<string[]>([]);
   const [backgroundDocs, setBackgroundDocs] = useState<{ title: string; author: string; date: string }[]>([]);
   const saveTimer = useRef<NodeJS.Timeout | null>(null);
+  const [aiSummaryLoading, setAiSummaryLoading] = useState(false);
+  const [originalAiSummary, setOriginalAiSummary] = useState<string | null>(null);
 
   useEffect(() => {
     if (project) {
@@ -233,6 +250,45 @@ export default function ProjectDetail() {
         {/* === OVERVIEW TAB === */}
         <TabsContent value="overview">
           <div className="space-y-6">
+            {/* Executive Summary */}
+            <Card className="p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-medium">Executive Summary</h3>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={aiSummaryLoading}
+                  onClick={async () => {
+                    setAiSummaryLoading(true);
+                    try {
+                      const res = await aiRequest("/api/ai/generate-executive-summary", { projectId: Number(id) });
+                      const data = await res.json();
+                      updateField("executiveSummary", data.summary);
+                      setOriginalAiSummary(data.summary);
+                      toast({ title: "Executive summary generated — review and edit" });
+                    } catch (err: any) {
+                      toast({ title: err.message || "Summary generation failed", variant: "destructive" });
+                    } finally {
+                      setAiSummaryLoading(false);
+                    }
+                  }}
+                >
+                  {aiSummaryLoading ? (
+                    <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
+                  ) : (
+                    <><Sparkles className="w-4 h-4 mr-1" /> Generate Summary</>
+                  )}
+                </Button>
+              </div>
+              <Textarea
+                value={editForm.executiveSummary || ""}
+                onChange={e => updateField("executiveSummary", e.target.value)}
+                rows={8}
+                placeholder="Click 'Generate Summary' after adding observations and recommendations to create an AI-drafted executive summary."
+              />
+            </Card>
+
             <Card className="p-4 space-y-4">
               <h3 className="text-sm font-medium">Project Details</h3>
               <div className="grid grid-cols-2 gap-4">

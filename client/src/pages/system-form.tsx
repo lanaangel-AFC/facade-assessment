@@ -8,11 +8,24 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, Sparkles, Loader2 } from "lucide-react";
 import type { FacadeSystem, Photo } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+
+const aiRequest = async (url: string, body: any) => {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || `Request failed (${res.status})`);
+  }
+  return res;
+};
 
 const SYSTEM_TYPES = [
   "Curtain wall - stick system",
@@ -64,6 +77,10 @@ export default function SystemForm() {
   const [featureInput, setFeatureInput] = useState("");
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [uploading, setUploading] = useState<string | null>(null);
+  const [aiIdentifying, setAiIdentifying] = useState(false);
+  const [aiDescribing, setAiDescribing] = useState(false);
+  const [originalAiDescription, setOriginalAiDescription] = useState<string | null>(null);
+  const [originalAiIdentification, setOriginalAiIdentification] = useState<string | null>(null);
 
   // Fetch existing system if editing
   const { data: existingSystem } = useQuery<FacadeSystem>({
@@ -116,9 +133,36 @@ export default function SystemForm() {
         return res.json();
       }
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/systems`] });
       toast({ title: isEdit ? "System updated" : "System created" });
+      
+      // Save training data if AI was used
+      if (originalAiDescription) {
+        try {
+          await aiRequest("/api/ai/training-data", {
+            taskType: "system_description",
+            inputData: JSON.stringify({ systemId, name: form.name, systemType: form.systemType }),
+            aiOutput: originalAiDescription,
+            userCorrected: form.aiDescription !== originalAiDescription ? form.aiDescription : "",
+            accepted: form.aiDescription === originalAiDescription,
+          });
+        } catch {} // Don't fail the save if training data fails
+        setOriginalAiDescription(null);
+      }
+      if (originalAiIdentification) {
+        try {
+          await aiRequest("/api/ai/training-data", {
+            taskType: "system_photo_id",
+            inputData: JSON.stringify({ systemId, photoCount: photos.length }),
+            aiOutput: originalAiIdentification,
+            userCorrected: JSON.stringify({ systemType: form.systemType, materials, keyFeatures, estimatedAge: form.estimatedAge }),
+            accepted: false, // Always save corrected version for identification
+          });
+        } catch {}
+        setOriginalAiIdentification(null);
+      }
+      
       if (!isEdit) {
         navigate(`/projects/${projectId}/systems/${data.id}`, { replace: true });
       }
@@ -332,7 +376,47 @@ export default function SystemForm() {
 
         {/* Context Photos */}
         <Card className="p-4 space-y-4">
-          <h3 className="text-sm font-medium">Context Photos (up to 4)</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-medium">Context Photos (up to 4)</h3>
+            {isEdit && photos.length > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={aiIdentifying}
+                onClick={async () => {
+                  setAiIdentifying(true);
+                  try {
+                    const photoIds = photos.map(p => p.id);
+                    const res = await aiRequest("/api/ai/identify-system", { photoIds });
+                    const data = await res.json();
+                    
+                    // Populate form fields with AI results
+                    setForm(prev => ({
+                      ...prev,
+                      systemType: data.systemType || prev.systemType,
+                      estimatedAge: data.estimatedAge || prev.estimatedAge,
+                    }));
+                    if (data.materials?.length) setMaterials(data.materials);
+                    if (data.keyFeatures?.length) setKeyFeatures(data.keyFeatures);
+                    
+                    setOriginalAiIdentification(JSON.stringify(data));
+                    toast({ title: "AI identification complete — review and adjust the results" });
+                  } catch (err: any) {
+                    toast({ title: err.message || "AI identification failed", variant: "destructive" });
+                  } finally {
+                    setAiIdentifying(false);
+                  }
+                }}
+              >
+                {aiIdentifying ? (
+                  <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Identifying...</>
+                ) : (
+                  <><Sparkles className="w-4 h-4 mr-1" /> Identify System</>
+                )}
+              </Button>
+            )}
+          </div>
           <div className="grid grid-cols-2 gap-4">
             {PHOTO_SLOTS.map((slot) => {
               const photo = getPhotoForSlot(slot.key);
@@ -409,13 +493,43 @@ export default function SystemForm() {
 
         {/* AI Description */}
         <div>
-          <Label htmlFor="aiDescription">AI Description</Label>
+          <div className="flex items-center justify-between mb-1">
+            <Label htmlFor="aiDescription">System Description</Label>
+            {isEdit && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={aiDescribing}
+                onClick={async () => {
+                  setAiDescribing(true);
+                  try {
+                    const res = await aiRequest("/api/ai/generate-system-description", { systemId: Number(systemId) });
+                    const data = await res.json();
+                    setForm(prev => ({ ...prev, aiDescription: data.description }));
+                    setOriginalAiDescription(data.description);
+                    toast({ title: "Description generated — review and edit as needed" });
+                  } catch (err: any) {
+                    toast({ title: err.message || "Description generation failed", variant: "destructive" });
+                  } finally {
+                    setAiDescribing(false);
+                  }
+                }}
+              >
+                {aiDescribing ? (
+                  <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
+                ) : (
+                  <><Sparkles className="w-4 h-4 mr-1" /> Generate Description</>
+                )}
+              </Button>
+            )}
+          </div>
           <Textarea
             id="aiDescription"
-            placeholder="AI-generated description will appear here in a future update"
+            placeholder={isEdit ? "Click 'Generate Description' to create AI-generated prose" : "Save the system first, then generate a description"}
             value={form.aiDescription}
             onChange={set("aiDescription")}
-            rows={4}
+            rows={6}
           />
         </div>
 

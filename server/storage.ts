@@ -5,6 +5,8 @@ import {
   type Observation, type InsertObservation, observations,
   type Recommendation, type InsertRecommendation, recommendations,
   type Photo, type InsertPhoto, photos,
+  type Setting, settings,
+  type TrainingData, type InsertTrainingData, aiTrainingData,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -20,10 +22,117 @@ const dbPath = path.join(dataDir, "data.db");
 const sqlite = new Database(dbPath);
 sqlite.pragma("journal_mode = WAL");
 
+// Auto-create tables that may not exist yet (safe to run on every start)
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    address TEXT NOT NULL,
+    client TEXT NOT NULL,
+    inspector TEXT NOT NULL,
+    afc_reference TEXT DEFAULT '',
+    revision TEXT DEFAULT '01',
+    building_age TEXT DEFAULT '',
+    building_use TEXT DEFAULT '',
+    storey_count TEXT DEFAULT '',
+    refurbishment_history TEXT DEFAULT '',
+    inspection_dates TEXT DEFAULT '[]',
+    inspection_scope TEXT DEFAULT '',
+    limitations TEXT DEFAULT '[]',
+    background_docs TEXT DEFAULT '[]',
+    executive_summary TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS facade_systems (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    location TEXT NOT NULL,
+    system_type TEXT NOT NULL,
+    materials TEXT DEFAULT '[]',
+    key_features TEXT DEFAULT '[]',
+    estimated_age TEXT DEFAULT '',
+    related_systems TEXT DEFAULT '',
+    ai_description TEXT DEFAULT '',
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    system_id INTEGER,
+    observation_id TEXT NOT NULL,
+    location TEXT NOT NULL,
+    defect_category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    extent TEXT NOT NULL,
+    field_note TEXT DEFAULT '',
+    indicators TEXT DEFAULT '[]',
+    ai_narrative TEXT DEFAULT '',
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    category TEXT NOT NULL,
+    budget_estimate TEXT DEFAULT '',
+    budget_basis TEXT DEFAULT '',
+    dependencies TEXT DEFAULT '',
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    system_id INTEGER,
+    observation_id INTEGER,
+    filename TEXT NOT NULL,
+    caption TEXT DEFAULT '',
+    slot TEXT DEFAULT 'photo',
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS ai_training_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_type TEXT NOT NULL,
+    input_data TEXT NOT NULL,
+    ai_output TEXT NOT NULL,
+    user_corrected TEXT DEFAULT '',
+    accepted INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password TEXT NOT NULL
+  );
+`);
+
+// Add executive_summary column to projects if it doesn't exist
+try {
+  sqlite.exec(`ALTER TABLE projects ADD COLUMN executive_summary TEXT DEFAULT ''`);
+} catch (e) {
+  // Column already exists — ignore
+}
+
 export const db = drizzle(sqlite);
 export { dataDir };
 
 export interface IStorage {
+  // Settings
+  getSetting(key: string): Promise<string | undefined>;
+  setSetting(key: string, value: string): Promise<void>;
+  // Training Data
+  createTrainingData(data: InsertTrainingData): Promise<TrainingData>;
+  getTrainingDataCount(): Promise<number>;
+  getAllTrainingData(): Promise<TrainingData[]>;
   // Users
   getUser(id: number): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
@@ -54,6 +163,7 @@ export interface IStorage {
   updateRecommendation(id: number, recommendation: Partial<InsertRecommendation>): Promise<Recommendation | undefined>;
   deleteRecommendation(id: number): Promise<void>;
   // Photos
+  getPhoto(id: number): Promise<Photo | undefined>;
   getPhotosBySystem(systemId: number): Promise<Photo[]>;
   getPhotosByObservation(observationId: number): Promise<Photo[]>;
   createPhoto(photo: InsertPhoto): Promise<Photo>;
@@ -62,6 +172,32 @@ export interface IStorage {
 }
 
 export class DatabaseStorage implements IStorage {
+  // Settings
+  async getSetting(key: string): Promise<string | undefined> {
+    const row = db.select().from(settings).where(eq(settings.key, key)).get();
+    return row?.value;
+  }
+  async setSetting(key: string, value: string): Promise<void> {
+    const existing = db.select().from(settings).where(eq(settings.key, key)).get();
+    if (existing) {
+      db.update(settings).set({ value }).where(eq(settings.key, key)).run();
+    } else {
+      db.insert(settings).values({ key, value }).run();
+    }
+  }
+
+  // Training Data
+  async createTrainingData(data: InsertTrainingData): Promise<TrainingData> {
+    return db.insert(aiTrainingData).values(data).returning().get();
+  }
+  async getTrainingDataCount(): Promise<number> {
+    const rows = db.select().from(aiTrainingData).all();
+    return rows.length;
+  }
+  async getAllTrainingData(): Promise<TrainingData[]> {
+    return db.select().from(aiTrainingData).all();
+  }
+
   // Users
   async getUser(id: number): Promise<User | undefined> {
     return db.select().from(users).where(eq(users.id, id)).get();
@@ -186,6 +322,9 @@ export class DatabaseStorage implements IStorage {
   }
 
   // Photos
+  async getPhoto(id: number): Promise<Photo | undefined> {
+    return db.select().from(photos).where(eq(photos.id, id)).get();
+  }
   async getPhotosBySystem(systemId: number): Promise<Photo[]> {
     return db.select().from(photos).where(eq(photos.systemId, systemId)).all();
   }
