@@ -7,6 +7,7 @@ import {
   insertObservationSchema,
   insertRecommendationSchema,
 } from "@shared/schema";
+import type { FacadeSystem, Observation, Recommendation, Photo } from "@shared/schema";
 import {
   identifySystem,
   generateSystemDescription,
@@ -17,6 +18,32 @@ import {
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  AlignmentType,
+  HeadingLevel,
+  BorderStyle,
+  ImageRun,
+  BookmarkStart,
+  BookmarkEnd,
+  InternalHyperlink,
+  PageBreak,
+  Header,
+  Footer,
+  PageNumber,
+  ShadingType,
+  VerticalAlign,
+  TableLayoutType,
+  TabStopPosition,
+  TabStopType,
+} from "docx";
 
 const uploadDir = path.join(dataDir, "uploads");
 if (!fs.existsSync(uploadDir)) {
@@ -418,6 +445,800 @@ export async function registerRoutes(
     res.setHeader("Content-Type", "application/jsonl");
     res.setHeader("Content-Disposition", "attachment; filename=training-data.jsonl");
     res.send(jsonl);
+  });
+
+  // === WORD EXPORT ===
+  app.get("/api/export/word/:projectId", async (req, res) => {
+    try {
+      const projectId = Number(req.params.projectId);
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const systems = await storage.getSystemsByProject(projectId);
+      const allObservations = await storage.getObservationsByProject(projectId);
+      const allRecommendations = await storage.getRecommendationsByProject(projectId);
+
+      // Fetch photos for each system and observation
+      const systemPhotosMap: Record<number, Photo[]> = {};
+      for (const sys of systems) {
+        systemPhotosMap[sys.id] = await storage.getPhotosBySystem(sys.id);
+      }
+      const obsPhotosMap: Record<number, Photo[]> = {};
+      for (const obs of allObservations) {
+        obsPhotosMap[obs.id] = await storage.getPhotosByObservation(obs.id);
+      }
+
+      // Sort systems by sortOrder then id
+      systems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+
+      // Group observations by system
+      const obsBySystem: Record<number, Observation[]> = {};
+      const unlinkedObs: Observation[] = [];
+      for (const obs of allObservations) {
+        if (obs.systemId) {
+          if (!obsBySystem[obs.systemId]) obsBySystem[obs.systemId] = [];
+          obsBySystem[obs.systemId].push(obs);
+        } else {
+          unlinkedObs.push(obs);
+        }
+      }
+
+      // Map recommendations by observation id
+      const recsByObs: Record<number, Recommendation[]> = {};
+      for (const rec of allRecommendations) {
+        if (!recsByObs[rec.observationId]) recsByObs[rec.observationId] = [];
+        recsByObs[rec.observationId].push(rec);
+      }
+
+      // Helper: sanitize bookmark id (only alphanumeric and underscores)
+      const sanitizeBookmark = (obsId: string) => `obs_${obsId.replace(/[^a-zA-Z0-9]/g, "_")}`;
+
+      // Bookmark numeric ID counter
+      let bookmarkLinkId = 1;
+      const bookmarkIdMap: Record<string, number> = {}; // obsId → numeric linkId
+      const getBookmarkLinkId = (obsId: string): number => {
+        if (!bookmarkIdMap[obsId]) {
+          bookmarkIdMap[obsId] = bookmarkLinkId++;
+        }
+        return bookmarkIdMap[obsId];
+      };
+
+      // Helper: parse JSON safely
+      const safeJsonArray = (str: string | null | undefined): any[] => {
+        if (!str) return [];
+        try { return JSON.parse(str); } catch { return []; }
+      };
+
+      // Helper: format date
+      const formatDate = (dateStr: string) => {
+        try {
+          const d = new Date(dateStr);
+          return d.toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" });
+        } catch { return dateStr; }
+      };
+
+      // Color constants
+      const TEAL = "00B5B8";
+      const WHITE = "FFFFFF";
+      const BLACK = "000000";
+      const DARK_GRAY = "333333";
+      const MUTED = "666666";
+      const ALT_ROW = "F5F5F5";
+
+      // Helper: read photo from disk and return ImageRun or null
+      const embedPhoto = (filename: string, caption: string, maxWidth: number): ImageRun | null => {
+        const filePath = path.join(uploadDir, filename);
+        if (!fs.existsSync(filePath)) {
+          console.warn(`Photo file not found: ${filePath}`);
+          return null;
+        }
+        try {
+          const data = fs.readFileSync(filePath);
+          const ext = path.extname(filename).toLowerCase();
+          let type: "jpg" | "png" | "gif" | "bmp" = "jpg";
+          if (ext === ".png") type = "png";
+          else if (ext === ".gif") type = "gif";
+          else if (ext === ".bmp") type = "bmp";
+
+          return new ImageRun({
+            data,
+            transformation: { width: maxWidth, height: Math.round(maxWidth * 0.75) },
+            type,
+            altText: { title: caption || filename, description: caption || "", name: filename },
+          });
+        } catch (err) {
+          console.warn(`Failed to read photo ${filename}:`, err);
+          return null;
+        }
+      };
+
+      // Helper: create photo rows (2 per row) with captions
+      const buildPhotoRows = (photoList: Photo[], figureCounter: { n: number }): Paragraph[] => {
+        const paragraphs: Paragraph[] = [];
+        for (let i = 0; i < photoList.length; i += 2) {
+          const rowChildren: (ImageRun | TextRun)[] = [];
+          const photo1 = embedPhoto(photoList[i].filename, photoList[i].caption || "", 240);
+          if (photo1) {
+            rowChildren.push(photo1);
+            if (i + 1 < photoList.length) {
+              rowChildren.push(new TextRun({ text: "    " }));
+              const photo2 = embedPhoto(photoList[i + 1].filename, photoList[i + 1].caption || "", 240);
+              if (photo2) rowChildren.push(photo2);
+            }
+          }
+          if (rowChildren.length > 0) {
+            paragraphs.push(new Paragraph({ children: rowChildren, spacing: { before: 100, after: 50 } }));
+            // Captions
+            const cap1 = photoList[i].caption || "";
+            const capText = `Figure ${figureCounter.n}${cap1 ? ` \u2013 ${cap1}` : ""}`;
+            figureCounter.n++;
+            let capLine = capText;
+            if (i + 1 < photoList.length) {
+              const cap2 = photoList[i + 1].caption || "";
+              capLine += `          Figure ${figureCounter.n}${cap2 ? ` \u2013 ${cap2}` : ""}`;
+              figureCounter.n++;
+            }
+            paragraphs.push(new Paragraph({
+              children: [new TextRun({ text: capLine, font: "Arial", size: 18, italics: true, color: MUTED })],
+              spacing: { after: 150 },
+            }));
+          }
+        }
+        return paragraphs;
+      };
+
+      // Teal border for headers/footers
+      const tealBorder = { style: BorderStyle.SINGLE, size: 6, color: TEAL };
+      const noBorder = { style: BorderStyle.NONE, size: 0, color: WHITE };
+
+      // Common header for content sections
+      const contentHeader = new Header({
+        children: [
+          new Paragraph({
+            children: [
+              new TextRun({ text: project.address, font: "Arial", size: 18, color: TEAL }),
+              new TextRun({ text: "\t" }),
+              new TextRun({ text: "ANGEL FA\u00C7ADE CONSULTING", font: "Arial", size: 18, color: TEAL, bold: true }),
+            ],
+            tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
+            border: { bottom: tealBorder },
+            spacing: { after: 100 },
+          }),
+        ],
+      });
+
+      // Common footer for content sections
+      const contentFooter = new Footer({
+        children: [
+          new Paragraph({
+            children: [
+              new TextRun({ text: "FACADE DUE DILIGENCE REPORT", font: "Arial", size: 16, color: MUTED }),
+              new TextRun({ text: "\t" }),
+              new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: MUTED }),
+            ],
+            tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
+            border: { top: tealBorder },
+            spacing: { before: 100 },
+          }),
+        ],
+      });
+
+      // Helper: build a CAPEX table row
+      const buildCapexRow = (
+        obsId: string, location: string, defect: string, action: string,
+        timeframe: string, category: string, budget: string,
+        isHeader: boolean, isAlt: boolean, withLink: boolean
+      ): TableRow => {
+        const bgColor = isHeader ? TEAL : isAlt ? ALT_ROW : WHITE;
+        const textColor = isHeader ? WHITE : BLACK;
+        const fontSize = isHeader ? 18 : 16;
+        const bold = isHeader;
+
+        const cellProps = (width: number) => ({
+          width: { size: width, type: WidthType.DXA },
+          shading: { type: ShadingType.CLEAR, fill: bgColor },
+          verticalAlign: VerticalAlign.CENTER,
+        });
+
+        const textRun = (text: string) => new TextRun({ text, font: "Arial", size: fontSize, color: textColor, bold });
+
+        const idChildren = withLink && !isHeader
+          ? [new InternalHyperlink({
+              anchor: sanitizeBookmark(obsId),
+              children: [new TextRun({ text: obsId, font: "Arial", size: fontSize, color: TEAL, bold: true, underline: {} })],
+            })]
+          : [textRun(obsId)];
+
+        return new TableRow({
+          children: [
+            new TableCell({ ...cellProps(800), children: [new Paragraph({ children: idChildren })] }),
+            new TableCell({ ...cellProps(1200), children: [new Paragraph({ children: [textRun(location)] })] }),
+            new TableCell({ ...cellProps(1800), children: [new Paragraph({ children: [textRun(defect)] })] }),
+            new TableCell({ ...cellProps(2200), children: [new Paragraph({ children: [textRun(action)] })] }),
+            new TableCell({ ...cellProps(800), children: [new Paragraph({ children: [textRun(timeframe)] })] }),
+            new TableCell({ ...cellProps(900), children: [new Paragraph({ children: [textRun(category)] })] }),
+            new TableCell({ ...cellProps(1326), children: [new Paragraph({ children: [textRun(budget)] })] }),
+          ],
+        });
+      };
+
+      // Build CAPEX table rows for a set of recommendations
+      const buildCapexTableRows = (recs: { obsId: string; location: string; defect: string; rec: Recommendation }[]): TableRow[] => {
+        const rows: TableRow[] = [
+          buildCapexRow("ID", "Location", "Defect/Issue", "Actions", "Time", "Category", "Budget", true, false, false),
+        ];
+        recs.forEach((r, idx) => {
+          rows.push(buildCapexRow(
+            r.obsId, r.location, r.defect,
+            r.rec.action, r.rec.timeframe, r.rec.category, r.rec.budgetEstimate || "",
+            false, idx % 2 === 1, true
+          ));
+        });
+        return rows;
+      };
+
+      // === SECTION 0: COVER PAGE ===
+      const coverChildren: Paragraph[] = [];
+      // Spacing at top
+      coverChildren.push(new Paragraph({ spacing: { before: 2000 } }));
+      // AFC text top right
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.RIGHT,
+        children: [new TextRun({ text: "ANGEL FA\u00C7ADE CONSULTING", font: "Arial", size: 28, bold: true, color: TEAL })],
+        spacing: { after: 600 },
+      }));
+      // Project address large caps
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: (project.address || "").toUpperCase(), font: "Arial", size: 72, bold: true, color: BLACK })],
+        spacing: { before: 1600, after: 200 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: "FACADE DUE DILIGENCE REPORT", font: "Arial", size: 32, bold: true, color: DARK_GRAY })],
+        spacing: { after: 400 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `Revision: ${project.revision || "01"}`, font: "Arial", size: 22, color: MUTED })],
+        spacing: { after: 100 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `Date: ${formatDate(project.createdAt)}`, font: "Arial", size: 22, color: MUTED })],
+        spacing: { after: 600 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: "ANGEL FA\u00C7ADE CONSULTING", font: "Arial", size: 24, bold: true, color: TEAL })],
+        spacing: { after: 100 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `${project.inspector} (0419 630 922)`, font: "Arial", size: 22, color: MUTED })],
+        spacing: { after: 400 },
+      }));
+      coverChildren.push(new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `AFC Reference: ${project.afcReference || ""}`, font: "Arial", size: 22, color: MUTED })],
+      }));
+
+      // === SECTION 1: EXECUTIVE SUMMARY ===
+      const execChildren: (Paragraph | Table)[] = [];
+      execChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: "1. Executive Summary", font: "Arial", size: 36, bold: true, color: TEAL })],
+        spacing: { before: 400, after: 200 },
+      }));
+
+      if (project.executiveSummary) {
+        // Split executive summary into paragraphs
+        const summaryParagraphs = project.executiveSummary.split("\n").filter(l => l.trim());
+        for (const para of summaryParagraphs) {
+          execChildren.push(new Paragraph({
+            children: [new TextRun({ text: para, font: "Arial", size: 22 })],
+            spacing: { after: 150 },
+          }));
+        }
+      } else {
+        execChildren.push(new Paragraph({
+          children: [new TextRun({ text: "Executive summary not yet generated.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 150 },
+        }));
+      }
+
+      // Major recommendations table (Essential or Safety/Risk)
+      const majorRecs = allRecommendations.filter(r => {
+        const obs = allObservations.find(o => o.id === r.observationId);
+        return r.category === "Essential" || obs?.severity === "Safety/Risk";
+      });
+
+      if (majorRecs.length > 0) {
+        execChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "Major Recommendations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        }));
+
+        const majorCapexData = majorRecs.map(rec => {
+          const obs = allObservations.find(o => o.id === rec.observationId);
+          return {
+            obsId: obs?.observationId || "",
+            location: obs?.location || "",
+            defect: obs?.defectCategory || "",
+            rec,
+          };
+        });
+
+        execChildren.push(new Table({
+          layout: TableLayoutType.FIXED,
+          width: { size: 9026, type: WidthType.DXA },
+          rows: buildCapexTableRows(majorCapexData),
+        } as any));
+      }
+
+      // === SECTION 2: INTRODUCTION ===
+      const introChildren: Paragraph[] = [];
+      introChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: "2. Introduction", font: "Arial", size: 36, bold: true, color: TEAL })],
+        spacing: { before: 400, after: 200 },
+      }));
+
+      // 2.1 General
+      introChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "2.1 General", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+      introChildren.push(new Paragraph({
+        children: [new TextRun({ text: `Angel Fa\u00E7ade Consulting (AFC) was engaged by ${project.client} to carry out a condition assessment of the building envelope(s) at ${project.address}.`, font: "Arial", size: 22 })],
+        spacing: { after: 150 },
+      }));
+
+      // 2.2 Inspection
+      introChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "2.2 Inspection", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+      introChildren.push(new Paragraph({
+        children: [new TextRun({ text: "The inspection was carried out on the following dates:", font: "Arial", size: 22 })],
+        spacing: { after: 100 },
+      }));
+
+      const dates = safeJsonArray(project.inspectionDates);
+      if (dates.length > 0) {
+        for (const date of dates) {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: formatDate(date), font: "Arial", size: 22 })],
+            bullet: { level: 0 },
+            spacing: { after: 50 },
+          }));
+        }
+      } else {
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: "No inspection dates recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 100 },
+        }));
+      }
+
+      if (project.inspectionScope) {
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: project.inspectionScope, font: "Arial", size: 22 })],
+          spacing: { before: 100, after: 150 },
+        }));
+      }
+
+      // 2.3 Background Information
+      introChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "2.3 Background Information", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+
+      const bgDocs = safeJsonArray(project.backgroundDocs);
+      if (bgDocs.length > 0) {
+        for (const doc of bgDocs) {
+          const docText = `${doc.title || "Untitled"}${doc.author ? ` \u2014 ${doc.author}` : ""}${doc.date ? ` (${doc.date})` : ""}`;
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: docText, font: "Arial", size: 22 })],
+            bullet: { level: 0 },
+            spacing: { after: 50 },
+          }));
+        }
+      } else {
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: "No background documents recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 150 },
+        }));
+      }
+
+      // 2.4 Limitations
+      introChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "2.4 Limitations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+
+      const lims = safeJsonArray(project.limitations);
+      if (lims.length > 0) {
+        lims.forEach((lim: string, idx: number) => {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: `${idx + 1}. ${lim}`, font: "Arial", size: 22 })],
+            spacing: { after: 80 },
+          }));
+        });
+      } else {
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: "No limitations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 150 },
+        }));
+      }
+
+      // === SECTION 3: SITE DESCRIPTION ===
+      const siteChildren: Paragraph[] = [];
+      const figureCounter = { n: 1 };
+
+      siteChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: "3. Site Description", font: "Arial", size: 36, bold: true, color: TEAL })],
+        spacing: { before: 400, after: 200 },
+      }));
+
+      // 3.1 Introduction
+      siteChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "3.1 Introduction", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+
+      const buildingDesc = `${project.address} is a ${project.buildingAge || "building"} ${project.buildingUse || "property"}${project.refurbishmentHistory ? ` that ${project.refurbishmentHistory}` : ""}.`;
+      siteChildren.push(new Paragraph({
+        children: [new TextRun({ text: buildingDesc, font: "Arial", size: 22 })],
+        spacing: { after: 150 },
+      }));
+
+      // 3.2 Facade Description
+      if (systems.length > 0) {
+        siteChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "3.2 Facade Description", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        }));
+
+        systems.forEach((sys, idx) => {
+          siteChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_3,
+            children: [new TextRun({ text: `3.2.${idx + 1} ${sys.name}`, font: "Arial", size: 24, bold: true, color: DARK_GRAY })],
+            spacing: { before: 200, after: 100 },
+          }));
+
+          if (sys.aiDescription) {
+            const descParas = sys.aiDescription.split("\n").filter(l => l.trim());
+            for (const p of descParas) {
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: p, font: "Arial", size: 22 })],
+                spacing: { after: 100 },
+              }));
+            }
+          }
+
+          // System photos
+          const sysPhotos = systemPhotosMap[sys.id] || [];
+          if (sysPhotos.length > 0) {
+            siteChildren.push(...buildPhotoRows(sysPhotos, figureCounter));
+          }
+        });
+      }
+
+      // === SECTION 4: OBSERVATIONS ===
+      const obsChildren: Paragraph[] = [];
+      obsChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: "4. Observations", font: "Arial", size: 36, bold: true, color: TEAL })],
+        spacing: { before: 400, after: 200 },
+      }));
+
+      obsChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: "4.1 Overview", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+        spacing: { before: 300, after: 150 },
+      }));
+
+      if (allObservations.length === 0) {
+        obsChildren.push(new Paragraph({
+          children: [new TextRun({ text: "No observations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 150 },
+        }));
+      } else {
+        obsChildren.push(new Paragraph({
+          children: [new TextRun({ text: "The following sections detail the observations recorded during the facade inspection.", font: "Arial", size: 22 })],
+          spacing: { after: 150 },
+        }));
+
+        let sectionNum = 2;
+        // Observations grouped by system
+        for (const sys of systems) {
+          const sysObs = obsBySystem[sys.id] || [];
+          if (sysObs.length === 0) continue;
+
+          obsChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: `4.${sectionNum} ${sys.name}`, font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            spacing: { before: 300, after: 150 },
+          }));
+          sectionNum++;
+
+          for (const obs of sysObs) {
+            const bookmarkId = sanitizeBookmark(obs.observationId);
+            obsChildren.push(new Paragraph({
+              heading: HeadingLevel.HEADING_3,
+              children: [
+                new BookmarkStart(bookmarkId, getBookmarkLinkId(obs.observationId)),
+                new TextRun({ text: `${obs.observationId} ${obs.defectCategory}`, font: "Arial", size: 24, bold: true, color: DARK_GRAY }),
+                new BookmarkEnd(getBookmarkLinkId(obs.observationId)),
+              ],
+              spacing: { before: 200, after: 100 },
+            }));
+
+            // Location
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Location: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: obs.location, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 50 },
+            }));
+
+            // Severity & Extent
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Severity: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: `${obs.severity} \u2014 ${obs.extent}`, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 100 },
+            }));
+
+            // AI Narrative
+            if (obs.aiNarrative) {
+              const narrativeParas = obs.aiNarrative.split("\n").filter(l => l.trim());
+              for (const p of narrativeParas) {
+                obsChildren.push(new Paragraph({
+                  children: [new TextRun({ text: p, font: "Arial", size: 22 })],
+                  spacing: { after: 100 },
+                }));
+              }
+            }
+
+            // Observation photos
+            const oPhotos = obsPhotosMap[obs.id] || [];
+            if (oPhotos.length > 0) {
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+            }
+
+            // Recommendations for this observation
+            const obsRecs = recsByObs[obs.id] || [];
+            if (obsRecs.length > 0) {
+              for (const rec of obsRecs) {
+                obsChildren.push(new Paragraph({
+                  children: [
+                    new TextRun({ text: "Recommended action: ", font: "Arial", size: 22, bold: true }),
+                    new TextRun({ text: rec.action, font: "Arial", size: 22 }),
+                  ],
+                  spacing: { before: 100, after: 50 },
+                }));
+                obsChildren.push(new Paragraph({
+                  children: [
+                    new TextRun({ text: `Timeframe: ${rec.timeframe} | Category: ${rec.category} | Budget: ${rec.budgetEstimate || "TBD"}`, font: "Arial", size: 20, color: MUTED }),
+                  ],
+                  spacing: { after: 150 },
+                }));
+              }
+            }
+          }
+        }
+
+        // Unlinked observations
+        if (unlinkedObs.length > 0) {
+          obsChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: `4.${sectionNum} General Observations`, font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            spacing: { before: 300, after: 150 },
+          }));
+
+          for (const obs of unlinkedObs) {
+            const bookmarkId = sanitizeBookmark(obs.observationId);
+            obsChildren.push(new Paragraph({
+              heading: HeadingLevel.HEADING_3,
+              children: [
+                new BookmarkStart(bookmarkId, getBookmarkLinkId(obs.observationId)),
+                new TextRun({ text: `${obs.observationId} ${obs.defectCategory}`, font: "Arial", size: 24, bold: true, color: DARK_GRAY }),
+                new BookmarkEnd(getBookmarkLinkId(obs.observationId)),
+              ],
+              spacing: { before: 200, after: 100 },
+            }));
+
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Location: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: obs.location, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 50 },
+            }));
+
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Severity: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: `${obs.severity} \u2014 ${obs.extent}`, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 100 },
+            }));
+
+            if (obs.aiNarrative) {
+              const narrativeParas = obs.aiNarrative.split("\n").filter(l => l.trim());
+              for (const p of narrativeParas) {
+                obsChildren.push(new Paragraph({
+                  children: [new TextRun({ text: p, font: "Arial", size: 22 })],
+                  spacing: { after: 100 },
+                }));
+              }
+            }
+
+            const oPhotos = obsPhotosMap[obs.id] || [];
+            if (oPhotos.length > 0) {
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+            }
+
+            const obsRecs = recsByObs[obs.id] || [];
+            for (const rec of obsRecs) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: "Recommended action: ", font: "Arial", size: 22, bold: true }),
+                  new TextRun({ text: rec.action, font: "Arial", size: 22 }),
+                ],
+                spacing: { before: 100, after: 50 },
+              }));
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Timeframe: ${rec.timeframe} | Category: ${rec.category} | Budget: ${rec.budgetEstimate || "TBD"}`, font: "Arial", size: 20, color: MUTED }),
+                ],
+                spacing: { after: 150 },
+              }));
+            }
+          }
+        }
+      }
+
+      // === SECTION 5: CAPEX SUMMARY ===
+      const capexChildren: (Paragraph | Table)[] = [];
+      capexChildren.push(new Paragraph({
+        heading: HeadingLevel.HEADING_1,
+        children: [new TextRun({ text: "5. CAPEX Summary", font: "Arial", size: 36, bold: true, color: TEAL })],
+        spacing: { before: 400, after: 200 },
+      }));
+
+      capexChildren.push(new Paragraph({
+        children: [new TextRun({ text: "The following table is an aggregation of the recommendations presented in this report, allocated against key timeframes.", font: "Arial", size: 22 })],
+        spacing: { after: 200 },
+      }));
+
+      if (allRecommendations.length > 0) {
+        const allCapexData = allRecommendations.map(rec => {
+          const obs = allObservations.find(o => o.id === rec.observationId);
+          return {
+            obsId: obs?.observationId || "",
+            location: obs?.location || "",
+            defect: obs?.defectCategory || "",
+            rec,
+          };
+        }).sort((a, b) => a.obsId.localeCompare(b.obsId));
+
+        capexChildren.push(new Table({
+          layout: TableLayoutType.FIXED,
+          width: { size: 9026, type: WidthType.DXA },
+          rows: buildCapexTableRows(allCapexData),
+        } as any));
+      } else {
+        capexChildren.push(new Paragraph({
+          children: [new TextRun({ text: "No recommendations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          spacing: { after: 150 },
+        }));
+      }
+
+      // Build the document with multiple sections
+      const doc = new Document({
+        styles: {
+          default: {
+            document: {
+              run: { font: "Arial", size: 22 },
+            },
+          },
+        },
+        sections: [
+          // Cover page - no header/footer
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            children: coverChildren,
+          },
+          // Executive Summary
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: execChildren,
+          },
+          // Introduction
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: introChildren,
+          },
+          // Site Description
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: siteChildren,
+          },
+          // Observations
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: obsChildren,
+          },
+          // CAPEX Summary
+          {
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: capexChildren,
+          },
+        ],
+      });
+
+      const buffer = await Packer.toBuffer(doc);
+      const filename = `${project.afcReference || project.name}-Report.docx`.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.send(Buffer.from(buffer));
+    } catch (err: any) {
+      console.error("Word export error:", err);
+      res.status(500).json({ message: err.message || "Word export failed" });
+    }
   });
 
   return httpServer;

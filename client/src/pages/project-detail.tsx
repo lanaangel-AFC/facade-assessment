@@ -224,7 +224,17 @@ export default function ProjectDetail() {
         </button>
       </Link>
 
-      <h1 className="text-xl font-semibold tracking-tight mb-1">{project.name}</h1>
+      <div className="flex items-center justify-between mb-1">
+        <h1 className="text-xl font-semibold tracking-tight">{project.name}</h1>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => window.open(`${API_BASE}/api/export/word/${id}`, '_blank')}
+        >
+          <FileText className="w-4 h-4 mr-2" />
+          Export Word
+        </Button>
+      </div>
       <p className="text-sm text-muted-foreground mb-6">{project.address}</p>
 
       <Tabs defaultValue="overview">
