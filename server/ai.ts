@@ -11,6 +11,21 @@ async function getClient(): Promise<OpenAI> {
   return new OpenAI({ apiKey });
 }
 
+// Load training data for style calibration
+async function getTrainingExamples(outputType: string, limit: number = 3): Promise<string> {
+  try {
+    const allTraining = await storage.getAllTrainingData();
+    const relevant = allTraining
+      .filter((t: any) => t.outputType === outputType && t.correctedOutput)
+      .slice(-limit);
+    if (relevant.length === 0) return "";
+    return "\n\nHere are examples of corrected outputs to match in style and tone:\n" +
+      relevant.map((t: any) => `---\nInput: ${t.originalPrompt}\nCorrected output: ${t.correctedOutput}`).join("\n");
+  } catch {
+    return "";
+  }
+}
+
 export async function identifySystem(photoIds: number[]): Promise<{
   systemType: string;
   materials: { name: string; detail: string }[];
@@ -21,7 +36,6 @@ export async function identifySystem(photoIds: number[]): Promise<{
   const client = await getClient();
   const uploadDir = path.join(dataDir, "uploads");
 
-  // Build image content parts
   const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
   for (const photoId of photoIds) {
     const photo = await storage.getPhoto(photoId);
@@ -47,23 +61,20 @@ export async function identifySystem(photoIds: number[]): Promise<{
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer performing a building envelope condition assessment. 
-Analyze the facade photo(s) and identify:
-1. System type (e.g., curtain wall - stick system, unitised curtain wall, concrete wall, render/plaster, metal cladding, composite cladding, fibre cement cladding, masonry/brick, glazed shopfront, roof membrane, balustrade/handrail, stone/tile cladding, louvre system)
-2. Materials visible (framing material, glazing/infill type, sealants, gaskets, fixings)
-3. Key features (butt-jointed corners, pressure-equalised system, face-sealed, toggle-fixed glass, structural silicone, etc.)
-4. Approximate age/era based on construction style and materials
-5. Any immediately visible defects or areas of concern
+        content: `You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
 
-Be specific and technical. Use terminology consistent with Australian facade engineering practice.
-Respond ONLY with valid JSON in this exact format:
+Report only what is visible. Do not speculate or pad. Use Australian facade engineering terminology.
+
+Respond ONLY with valid JSON:
 {
-  "systemType": "string",
-  "materials": [{"name": "string", "detail": "string"}],
-  "keyFeatures": ["string"],
-  "estimatedAge": "string",
-  "visibleConcerns": ["string"]
-}`,
+  "systemType": "e.g. stick system curtain wall, window wall, unitised curtain wall, rendered concrete, metal cladding, fibre cement cladding, masonry, glazed shopfront, louvre system",
+  "materials": [{"name": "Framing", "detail": "white powdercoated aluminium"}, {"name": "Glazing", "detail": "blue-tinted monolithic, gasket retained"}],
+  "keyFeatures": ["e.g. structural silicone retained", "vertical sunshades with perforated steel infill"],
+  "estimatedAge": "e.g. circa 2010s based on materials and style",
+  "visibleConcerns": ["only list if clearly visible, e.g. gasket shortening at mullion heads"]
+}
+
+Keep each field brief. Materials: list only what you can see. Key features: 2-4 items max. Visible concerns: only obvious defects, not speculation.`,
       },
       {
         role: "user",
@@ -73,12 +84,11 @@ Respond ONLY with valid JSON in this exact format:
         ],
       },
     ],
-    max_tokens: 1000,
+    max_tokens: 600,
     temperature: 0.3,
   });
 
   const content = response.choices[0]?.message?.content || "";
-  // Extract JSON from the response (handle markdown code blocks)
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("Failed to parse AI response.");
   return JSON.parse(jsonMatch[0]);
@@ -104,34 +114,54 @@ Estimated Age: ${system.estimatedAge || "Not specified"}
 Related Systems: ${system.relatedSystems || "None noted"}
   `.trim();
 
+  const trainingExamples = await getTrainingExamples("system_description");
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing a Technical Due Diligence report for a commercial building.
-Generate a professional system description in the style of Section 3.3 of an Australian facade condition assessment report.
+        content: `You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
-The description should:
-- Open with the system name and location on the building
-- Describe the construction type and framing system
-- Detail the glazing or cladding materials and their characteristics
-- Mention key features, connections, and interfaces with adjacent systems
-- Note the estimated age and any implications for expected performance
-- Be written in formal, technical prose suitable for a commercial property report
-- Be 2-4 paragraphs, approximately 150-300 words
+STYLE RULES:
+- Use a structured numbered/lettered list format, NOT flowing paragraphs.
+- Be concise. Only elaborate on the information provided — do not invent details.
+- Use Australian facade engineering terminology.
 
-Use terminology consistent with Australian Standards (AS 4284, NCC) and facade engineering practice.
-Do NOT use bullet points — write in flowing paragraphs.
-Return ONLY the description text, nothing else.`,
+FORMAT — follow this exact structure:
+a. [System type and key characteristic, e.g. "Stick system curtain wall with white powdercoated aluminium framing"]
+b. [Glazing/infill description, e.g. "Glass is blue-tinted monolithic, gasket retained on four sides"]
+   i. [Sub-detail if relevant, e.g. "Fully toughened (FT) spandrels"]
+   ii. [Sub-detail if relevant, e.g. "Heat strengthened (HS) visions"]
+c. [Additional features, e.g. "Vertically affixed white powdercoated metal sunshades present on north and west elevations"]
+
+EXAMPLE (from a real report):
+a. Stick system curtain wall with white powdercoated aluminium framing
+b. Glass is blue-tinted monolithic, gasket retained on four sides, with stamps that indicate:
+   i. Fully toughened (FT) spandrels
+   ii. Heat strengthened (HS) visions
+c. Vertically affixed white powdercoated metal sunshades are present on the north and west elevations. Infill panels are perforated steel.
+
+ANOTHER EXAMPLE:
+a. Cantilevered precast concrete ledges at slab levels. Some areas are also bordered by vertical concrete fins.
+   i. Panel joints are transverse to the direction of the ledge, regularly spaced, and sealed with a polymeric sealant.
+   ii. The undersides of the cantilevered ledges have cast in drip grooves.
+b. Floor to ceiling glazing assembly comprising three panels: spandrel/vision/spandrel.
+   i. All glass is retained on four sides with structural silicone.
+   ii. Spandrel glass is monolithic colour-backed heat strengthened (HS).
+   iii. Vision panes are insulated glazing units (IGUs).
+c. Frames are aluminium with a powdercoated finish.
+
+Keep it to 3-6 lettered items. Only include information that was provided or can be directly inferred from the system data. Do not add boilerplate about standards compliance or expected performance.
+Return ONLY the description text.${trainingExamples}`,
       },
       {
         role: "user",
-        content: `Generate a Section 3.3 system description based on these details:\n\n${context}`,
+        content: `Generate a facade system description based on these details:\n\n${context}`,
       },
     ],
-    max_tokens: 800,
-    temperature: 0.4,
+    max_tokens: 400,
+    temperature: 0.3,
   });
 
   return response.choices[0]?.message?.content?.trim() || "";
@@ -166,33 +196,59 @@ Field Note: ${observation.fieldNote || "None"}
 Indicators Observed: ${indicators.join(", ") || "None specified"}
   `.trim();
 
+  const trainingExamples = await getTrainingExamples("observation_narrative");
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing a Technical Due Diligence report. 
-Generate a detailed observation narrative for a facade defect, in the style of Section 4 of an Australian facade condition assessment report.
+        content: `You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
-The narrative should:
-- Open with a clear statement of the defect type and its location
-- Describe the observed indicators and their significance
-- Provide causal analysis — explain WHY this defect likely occurred (age, UV exposure, thermal cycling, water ingress, poor detailing, etc.)
-- Assess the current severity and likely progression if untreated
-- Reference relevant performance expectations (design life of sealants ~15-20 years, gasket compression set, etc.)
-- Be written in formal, technical prose suitable for a commercial property report
-- Be 1-3 paragraphs, approximately 80-200 words
+STYLE RULES:
+- Be concise. Only elaborate on the information provided in the field data.
+- Use numbered points with lettered sub-items (a, b, c) for details.
+- State what was observed, the likely cause, and the implication — nothing more.
+- Do not pad with generic information about standards or typical design life unless directly relevant to the defect.
+- Use Australian facade engineering terminology.
 
-Use terminology consistent with Australian Standards and facade engineering practice.
-Return ONLY the narrative text, nothing else.`,
+FORMAT — follow this structure:
+Start with a brief opening line about the system condition, then numbered observations:
+
+1. [Defect type]:
+   a. [What was observed]
+   b. [Likely cause or contributing factor]
+   c. [Implication if left unaddressed]
+
+2. [Next defect if applicable]:
+   a. [Details]
+
+EXAMPLE (from a real report):
+The WW facade system appears to be in generally good condition from a materials perspective. We have some concerns relating to its construction detailing.
+
+Key observations are:
+1. WW unit installation:
+   a. Very high unsealed joints at sill level between the WW units and the cantilevered slab edges; open joint widths ~50mm were commonly observed.
+   b. Lack of sealants at the heads of units in some areas.
+2. PCC panel joint sealants are cracked, torn, damaged by birds and debonding.
+
+ANOTHER EXAMPLE:
+1. Disengaged spandrel panels:
+   a. We identified 6 glass spandrel panels which are not engaged within the head glazing pocket.
+   b. All panels are at the Level 4 slab edge.
+   c. If left unaddressed, the gaps may result in air and water leaks.
+   d. There is an unlikely, though non-zero chance that the glass may become disengaged entirely and fall from the building.
+
+Keep it short — typically 30-120 words. Only describe what was found and its significance.
+Return ONLY the narrative text.${trainingExamples}`,
       },
       {
         role: "user",
-        content: `Generate a Section 4 observation narrative based on these details:\n\n${context}`,
+        content: `Generate an observation narrative based on these field data:\n\n${context}`,
       },
     ],
-    max_tokens: 600,
-    temperature: 0.4,
+    max_tokens: 400,
+    temperature: 0.3,
   });
 
   return response.choices[0]?.message?.content?.trim() || "";
@@ -233,42 +289,45 @@ Field Note: ${observation.fieldNote || "None"}
 Indicators: ${indicators.join(", ") || "None specified"}
   `.trim();
 
+  const trainingExamples = await getTrainingExamples("recommendation");
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing recommendations for a Technical Due Diligence report.
-Based on the defect observation provided, generate a recommended remedial action.
+        content: `You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 
-The recommendation should include:
-- A clear action statement (what needs to be done)
-- Suggested timeframe: one of "Now", "1 year", "2 years", "5 years", "Prior to leasing"
-- Category: one of "Essential", "Desirable", "Monitor"
-- Budget estimate range if possible
-- Budget basis (e.g., rate per lineal metre, per panel, lump sum)
+STYLE RULES:
+- The "action" field should be concise and direct — what needs to be done, in 1-3 sentences max.
+- Do not pad with generic advice. Be specific to the defect described.
+- Use Australian facade engineering terminology.
 
-Consider:
-- Safety implications (prioritise Safety/Risk items as "Now")
-- Whether temporary measures are needed before full remediation
-- Grouped/batch efficiencies for widespread defects
-- Common Australian facade remediation rates
+EXAMPLES of good action text:
+- "Replace all external PU with new sealant. Compatibility with glazing weather seals must be considered."
+- "Identify and repair all developing spalls and failing repair patches. Technical specification by remedial engineer to suit concrete characteristics."
+- "Install steel plates in areas of high wear. Repair the BMU slab surface in all other areas."
+- "Replace existing membrane system with new. Introduce falls (min 1:100) and re-level drains as part of the process."
+- "Carry out urgent stabilisation (repositioning) works to the 7 glass spandrels."
 
-Respond ONLY with valid JSON in this exact format:
+Timeframe options: "Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"
+Category options: "Essential", "Desirable", "Monitor"
+
+Respond ONLY with valid JSON:
 {
-  "action": "string",
+  "action": "string — concise remedial action, 1-3 sentences",
   "timeframe": "string",
   "category": "string",
-  "budgetEstimate": "string",
-  "budgetBasis": "string"
-}`,
+  "budgetEstimate": "string — e.g. $5,000-$10,000 or TBC",
+  "budgetBasis": "string — e.g. per lineal metre, per panel, lump sum, rate-based"
+}${trainingExamples}`,
       },
       {
         role: "user",
         content: `Generate a recommendation for this observation:\n\n${context}`,
       },
     ],
-    max_tokens: 500,
+    max_tokens: 300,
     temperature: 0.3,
   });
 
@@ -327,33 +386,60 @@ Summary Statistics:
 - Approximate total CAPEX: $${totalBudget.toLocaleString() || "TBC"}
   `.trim();
 
+  const trainingExamples = await getTrainingExamples("executive_summary");
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing the Executive Summary for a Technical Due Diligence report on a commercial building's facade.
+        content: `You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
 
-Generate a professional executive summary that:
-- Opens with the purpose and scope of the assessment
-- Summarises the building and its facade systems
-- Highlights key findings, prioritising safety/risk items
-- Summarises the recommended capital expenditure
-- Identifies any items requiring immediate attention
-- Provides an overall assessment of the facade condition
-- Is 3-5 paragraphs, approximately 300-500 words
-- Is written in formal, authoritative prose suitable for property transaction due diligence
+STYLE RULES:
+- Be concise. Summarise what was done, what was found, and what needs to happen.
+- Use a brief opening paragraph (2-3 sentences) stating scope, then go straight to key findings as a numbered list.
+- Do not pad with generic statements about building envelopes or due diligence.
+- Only reference findings that come from the data provided.
 
-Use terminology consistent with Australian Standards and facade engineering practice.
-Return ONLY the executive summary text, nothing else.`,
+FORMAT:
+[1-3 sentence opening: who engaged AFC, what was assessed, when]
+
+[Optional 1 sentence overall condition statement]
+
+Key findings:
+1. [Finding — concise, specific]
+2. [Finding]
+...
+
+Major recommendations:
+1. [Action — concise]
+2. [Action]
+...
+
+EXAMPLE (from a real report):
+Angel Facade Consulting (AFC) assessed the building envelope of the Fox Sports Building at 4 Broadcast Way, Artarmon, over two occasions in 2025.
+
+The facade was found to be in generally good condition from a materials perspective.
+
+Key findings:
+1. We identified a total of 7 glass spandrel panels which are not engaged within the head glazing pocket; these require repositioning to maintain safety.
+2. The south elevation curtain wall has significant bowing of horizontal members (transoms, heads and sills) and vertical members (mullions).
+3. The tiled surfaces at Ground - Level 1 are adhered in position, and this is not compliant with Australian Standards.
+
+Major recommendations:
+1. Carry out urgent stabilisation (repositioning) works to the 7 glass spandrels.
+2. Stabilise (remove) the drummy tiles above Ground at the southeastern corner.
+
+Keep total length to 150-350 words. Only state facts from the data. Do not speculate.
+Return ONLY the executive summary text.${trainingExamples}`,
       },
       {
         role: "user",
         content: `Generate an executive summary for this assessment:\n\n${context}`,
       },
     ],
-    max_tokens: 1200,
-    temperature: 0.4,
+    max_tokens: 800,
+    temperature: 0.3,
   });
 
   return response.choices[0]?.message?.content?.trim() || "";
