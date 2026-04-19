@@ -24,7 +24,7 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList,
+  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList, Download,
 } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -340,6 +340,14 @@ export default function ProjectDetail() {
           >
             <FileText className="w-4 h-4 mr-2" />
             Export Word
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => window.open(`${API_BASE}/api/export/photos/${id}`, '_blank')}
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Download Photos
           </Button>
         </div>
       </div>

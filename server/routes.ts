@@ -897,6 +897,65 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === PHOTO EXPORT (ZIP) ===
+  app.get("/api/export/photos/:projectId", async (req, res) => {
+    try {
+      const projectId = Number(req.params.projectId);
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const allObservations = await storage.getObservationsByProject(projectId);
+      const systems = await storage.getSystemsByProject(projectId);
+
+      // Collect all photos: system photos + observation photos
+      const allPhotos: { photo: Photo; folder: string }[] = [];
+
+      for (const sys of systems) {
+        const sysPhotos = await storage.getPhotosBySystem(sys.id);
+        for (const p of sysPhotos) {
+          const safeName = sys.name.replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || `System-${sys.id}`;
+          allPhotos.push({ photo: p, folder: `Systems/${safeName}` });
+        }
+      }
+
+      for (const obs of allObservations) {
+        const obsPhotos = await storage.getPhotosByObservation(obs.id);
+        for (const p of obsPhotos) {
+          const safeId = obs.observationId.replace(/[^a-zA-Z0-9_\-.]/g, "") || `Obs-${obs.id}`;
+          allPhotos.push({ photo: p, folder: `Observations/${safeId}` });
+        }
+      }
+
+      if (allPhotos.length === 0) {
+        return res.status(404).json({ message: "No photos to download" });
+      }
+
+      const archiver = require("archiver");
+      const archive = archiver("zip", { zlib: { level: 5 } });
+      const safeProjName = (project.afcReference || project.name).replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeProjName}-Photos.zip"`);
+      archive.pipe(res);
+
+      for (const { photo, folder } of allPhotos) {
+        const filePath = path.join(uploadDir, photo.filename);
+        if (!fs.existsSync(filePath)) continue;
+        const ext = path.extname(photo.filename);
+        const displayName = photo.caption
+          ? `${photo.caption.replace(/[^a-zA-Z0-9_\- ]/g, "")}${ext}`
+          : photo.filename;
+        archive.file(filePath, { name: `${folder}/${displayName}` });
+      }
+
+      await archive.finalize();
+    } catch (err: any) {
+      console.error("Photo export error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ message: err.message || "Photo export failed" });
+      }
+    }
+  });
+
   // === WORD EXPORT ===
   app.get("/api/export/word/:projectId", async (req, res) => {
     try {
