@@ -104,9 +104,14 @@ export default function ObservationForm() {
     extent: "",
     fieldNote: "",
     aiNarrative: "",
+    gridDrop: "",
+    gridElevation: "",
+    gridLevel: "",
   });
 
   const [indicators, setIndicators] = useState<string[]>([]);
+  const [newIndicatorText, setNewIndicatorText] = useState("");
+  const [addingIndicator, setAddingIndicator] = useState(false);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [uploading, setUploading] = useState<string | null>(null);
   const [aiNarrativeLoading, setAiNarrativeLoading] = useState(false);
@@ -128,6 +133,11 @@ export default function ObservationForm() {
   // Fetch systems for this project
   const { data: systems } = useQuery<FacadeSystem[]>({
     queryKey: [`/api/projects/${projectId}/systems`],
+  });
+
+  // Fetch indicators (defaults + custom) for this project
+  const { data: indicatorData } = useQuery<{ defaults: string[]; custom: { id: number; name: string }[] }>({
+    queryKey: [`/api/projects/${projectId}/indicators`],
   });
 
   // Elevations and existing pin
@@ -233,6 +243,9 @@ export default function ObservationForm() {
         extent: existingObs.extent,
         fieldNote: existingObs.fieldNote || "",
         aiNarrative: existingObs.aiNarrative || "",
+        gridDrop: (existingObs as any).gridDrop || "",
+        gridElevation: (existingObs as any).gridElevation || "",
+        gridLevel: (existingObs as any).gridLevel || "",
       });
       try { setIndicators(JSON.parse(existingObs.indicators || "[]")); } catch { setIndicators([]); }
     }
@@ -387,6 +400,34 @@ export default function ObservationForm() {
     setShowRecForm(true);
   };
 
+  const addCustomIndicator = async () => {
+    const name = newIndicatorText.trim();
+    if (!name) return;
+    setAddingIndicator(true);
+    try {
+      const res = await apiRequest("POST", `/api/projects/${projectId}/indicators`, { name });
+      const created = await res.json();
+      setNewIndicatorText("");
+      setIndicators(prev => prev.includes(created.name) ? prev : [...prev, created.name]);
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/indicators`] });
+      toast({ title: "Custom indicator added" });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to add indicator", variant: "destructive" });
+    } finally {
+      setAddingIndicator(false);
+    }
+  };
+
+  const deleteCustomIndicator = async (indId: number) => {
+    try {
+      await apiRequest("DELETE", `/api/indicators/${indId}`);
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/indicators`] });
+      toast({ title: "Custom indicator removed" });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to remove indicator", variant: "destructive" });
+    }
+  };
+
   const toggleIndicator = (indicator: string) => {
     setIndicators(prev =>
       prev.includes(indicator)
@@ -453,6 +494,58 @@ export default function ObservationForm() {
             <span className="font-mono text-sm font-semibold text-primary">
               {form.observationId || "Select a system first"}
             </span>
+          </div>
+        </Card>
+
+        {/* Grid Location */}
+        <Card className="p-4 space-y-3">
+          <h3 className="text-sm font-medium">Grid Location</h3>
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <Label htmlFor="gridDrop" className="text-xs">Drop</Label>
+              <Input
+                id="gridDrop"
+                value={form.gridDrop}
+                onChange={(e) => setForm(prev => ({ ...prev, gridDrop: e.target.value.slice(0, 3) }))}
+                maxLength={3}
+                placeholder="01"
+                className="font-mono text-center"
+              />
+            </div>
+            <div>
+              <Label className="text-xs">Elevation</Label>
+              <Select
+                value={form.gridElevation}
+                onValueChange={(val) => setForm(prev => ({ ...prev, gridElevation: val }))}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="North">North</SelectItem>
+                  <SelectItem value="East">East</SelectItem>
+                  <SelectItem value="South">South</SelectItem>
+                  <SelectItem value="West">West</SelectItem>
+                  <SelectItem value="Roof">Roof</SelectItem>
+                  {(elevations || [])
+                    .filter(e => !["North","East","South","West","Roof"].includes(e.name))
+                    .map(e => (
+                      <SelectItem key={e.id} value={e.name}>{e.name}</SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="gridLevel" className="text-xs">Level</Label>
+              <Input
+                id="gridLevel"
+                value={form.gridLevel}
+                onChange={(e) => setForm(prev => ({ ...prev, gridLevel: e.target.value.slice(0, 4) }))}
+                maxLength={4}
+                placeholder="04"
+                className="font-mono text-center"
+              />
+            </div>
           </div>
         </Card>
 
@@ -616,7 +709,7 @@ export default function ObservationForm() {
         <Card className="p-4 space-y-3">
           <h3 className="text-sm font-medium">Indicators Observed</h3>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {INDICATORS.map((indicator) => (
+            {(indicatorData?.defaults || INDICATORS).map((indicator) => (
               <label key={indicator} className="flex items-center gap-2 text-sm cursor-pointer">
                 <Checkbox
                   checked={indicators.includes(indicator)}
@@ -625,6 +718,58 @@ export default function ObservationForm() {
                 {indicator}
               </label>
             ))}
+          </div>
+
+          {indicatorData?.custom && indicatorData.custom.length > 0 && (
+            <>
+              <div className="flex items-center gap-2 pt-2">
+                <div className="flex-1 h-px bg-border" />
+                <span className="text-xs text-muted-foreground">Project-specific</span>
+                <div className="flex-1 h-px bg-border" />
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {indicatorData.custom.map((c) => (
+                  <div key={c.id} className="flex items-center gap-2 text-sm group">
+                    <Checkbox
+                      checked={indicators.includes(c.name)}
+                      onCheckedChange={() => toggleIndicator(c.name)}
+                    />
+                    <span className="flex-1 truncate">{c.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => deleteCustomIndicator(c.id)}
+                      className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive"
+                      title="Remove"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div className="flex items-center gap-2 pt-2">
+            <Input
+              placeholder="Add new indicator..."
+              value={newIndicatorText}
+              onChange={(e) => setNewIndicatorText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addCustomIndicator();
+                }
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={addCustomIndicator}
+              disabled={addingIndicator || !newIndicatorText.trim()}
+            >
+              <Plus className="w-3.5 h-3.5 mr-1" /> Add
+            </Button>
           </div>
         </Card>
 

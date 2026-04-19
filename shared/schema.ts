@@ -20,6 +20,8 @@ export const projects = sqliteTable("projects", {
   limitations: text("limitations").default("[]"), // JSON array of limitation strings
   backgroundDocs: text("background_docs").default("[]"), // JSON array of {title, author, date}
   executiveSummary: text("executive_summary").default(""),
+  inspectionStatus: text("inspection_status").default("in_progress"),
+  observationGrouping: text("observation_grouping").default(""),
   createdAt: text("created_at").notNull(),
 });
 
@@ -54,6 +56,29 @@ export const observations = sqliteTable("observations", {
   aiNarrative: text("ai_narrative").default(""), // AI-generated detailed narrative
   sortOrder: integer("sort_order").default(0),
   elevationId: integer("elevation_id"), // which elevation this observation is pinned on
+  gridDrop: text("grid_drop").default(""),
+  gridElevation: text("grid_elevation").default(""),
+  gridLevel: text("grid_level").default(""),
+  groupId: integer("group_id"),
+  createdAt: text("created_at").notNull(),
+});
+
+// Observation groups (Layer 3.5 — grouping observations for combined narratives)
+export const observationGroups = sqliteTable("observation_groups", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  name: text("name").notNull(),
+  groupKey: text("group_key").notNull(),
+  sortOrder: integer("sort_order").default(0),
+  combinedNarrative: text("combined_narrative").default(""),
+  createdAt: text("created_at").notNull(),
+});
+
+// Custom indicators per project
+export const customIndicators = sqliteTable("custom_indicators", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  name: text("name").notNull(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -143,6 +168,8 @@ export const insertElevationPinSchema = createInsertSchema(elevationPins).omit({
 export const insertSettingSchema = createInsertSchema(settings);
 export const insertTrainingDataSchema = createInsertSchema(aiTrainingData).omit({ id: true });
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
+export const insertObservationGroupSchema = createInsertSchema(observationGroups).omit({ id: true });
+export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
 
 // Types
 export type Project = typeof projects.$inferSelect;
@@ -165,3 +192,7 @@ export type TrainingData = typeof aiTrainingData.$inferSelect;
 export type InsertTrainingData = z.infer<typeof insertTrainingDataSchema>;
 export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;
+export type ObservationGroup = typeof observationGroups.$inferSelect;
+export type InsertObservationGroup = z.infer<typeof insertObservationGroupSchema>;
+export type CustomIndicator = typeof customIndicators.$inferSelect;
+export type InsertCustomIndicator = z.infer<typeof insertCustomIndicatorSchema>;

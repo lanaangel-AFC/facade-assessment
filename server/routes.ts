@@ -14,6 +14,7 @@ import {
   generateObservationNarrative,
   generateRecommendation,
   generateExecutiveSummary,
+  generateGroupNarrative,
 } from "./ai";
 import multer from "multer";
 import path from "path";
@@ -672,6 +673,216 @@ export async function registerRoutes(
     res.send(jsonl);
   });
 
+  // === INSPECTION STATUS + GROUPS ===
+  app.patch("/api/projects/:id/status", async (req, res) => {
+    const { inspectionStatus, observationGrouping } = req.body as { inspectionStatus?: string; observationGrouping?: string };
+    const updates: any = {};
+    if (inspectionStatus !== undefined) updates.inspectionStatus = inspectionStatus;
+    if (observationGrouping !== undefined) updates.observationGrouping = observationGrouping;
+    const project = await storage.updateProject(Number(req.params.id), updates);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+    res.json(project);
+  });
+
+  // Build or rebuild observation groups for a project based on chosen grouping method
+  app.post("/api/projects/:id/observation-groups/rebuild", async (req, res) => {
+    const projectId = Number(req.params.id);
+    const project = await storage.getProject(projectId);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+
+    const grouping = (req.body.grouping as string) || project.observationGrouping || "by_type";
+    const obs = await storage.getObservationsByProject(projectId);
+
+    // Delete existing groups and clear groupId on observations so we can rebuild cleanly
+    await storage.deleteGroupsByProject(projectId);
+    for (const o of obs) {
+      if (o.groupId) await storage.updateObservation(o.id, { groupId: null } as any);
+    }
+
+    const keyFor = (o: typeof obs[number]) => {
+      if (grouping === "by_elevation") {
+        return (o.gridElevation || o.location || "Unassigned").trim() || "Unassigned";
+      }
+      return (o.defectCategory || "Unassigned").trim() || "Unassigned";
+    };
+
+    const groupedKeys: Record<string, typeof obs> = {};
+    for (const o of obs) {
+      const k = keyFor(o);
+      if (!groupedKeys[k]) groupedKeys[k] = [];
+      groupedKeys[k].push(o);
+    }
+
+    const createdAt = new Date().toISOString();
+    let sortOrder = 0;
+    const created: any[] = [];
+    for (const [key, list] of Object.entries(groupedKeys)) {
+      const group = await storage.createGroup({
+        projectId,
+        name: key,
+        groupKey: key,
+        sortOrder: sortOrder++,
+        combinedNarrative: "",
+        createdAt,
+      });
+      for (const o of list) {
+        await storage.updateObservation(o.id, { groupId: group.id } as any);
+      }
+      created.push(group);
+    }
+
+    await storage.updateProject(projectId, { observationGrouping: grouping } as any);
+    res.json({ groups: created });
+  });
+
+  app.get("/api/projects/:id/observation-groups", async (req, res) => {
+    const projectId = Number(req.params.id);
+    const groups = await storage.getGroupsByProject(projectId);
+    groups.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+    const allObs = await storage.getObservationsByProject(projectId);
+
+    const result = await Promise.all(groups.map(async (g) => {
+      const members = allObs.filter(o => o.groupId === g.id)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+      const memberDetails = await Promise.all(members.map(async (m) => {
+        const ps = await storage.getPhotosByObservation(m.id);
+        return { ...m, photos: ps };
+      }));
+      return { ...g, observations: memberDetails };
+    }));
+    res.json(result);
+  });
+
+  app.patch("/api/observation-groups/:id", async (req, res) => {
+    const updated = await storage.updateGroup(Number(req.params.id), req.body);
+    if (!updated) return res.status(404).json({ message: "Group not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/observation-groups/:id", async (req, res) => {
+    const groupId = Number(req.params.id);
+    // Unassign any observations referencing this group
+    const group = await storage.getGroup(groupId);
+    if (group) {
+      const obs = await storage.getObservationsByProject(group.projectId);
+      for (const o of obs) {
+        if (o.groupId === groupId) await storage.updateObservation(o.id, { groupId: null } as any);
+      }
+    }
+    await storage.deleteGroup(groupId);
+    res.status(204).end();
+  });
+
+  // Merge group source into target
+  app.post("/api/observation-groups/merge", async (req, res) => {
+    const { sourceId, targetId } = req.body as { sourceId: number; targetId: number };
+    if (!sourceId || !targetId) return res.status(400).json({ message: "sourceId and targetId required" });
+    const source = await storage.getGroup(Number(sourceId));
+    const target = await storage.getGroup(Number(targetId));
+    if (!source || !target) return res.status(404).json({ message: "Group not found" });
+    if (source.projectId !== target.projectId) return res.status(400).json({ message: "Groups must be in the same project" });
+    const obs = await storage.getObservationsByProject(source.projectId);
+    for (const o of obs) {
+      if (o.groupId === source.id) await storage.updateObservation(o.id, { groupId: target.id } as any);
+    }
+    await storage.deleteGroup(source.id);
+    res.json({ ok: true });
+  });
+
+  // Move observation to a different group
+  app.patch("/api/observations/:id/group", async (req, res) => {
+    const { groupId } = req.body as { groupId: number | null };
+    const updated = await storage.updateObservation(Number(req.params.id), { groupId: groupId ?? null } as any);
+    if (!updated) return res.status(404).json({ message: "Observation not found" });
+    res.json(updated);
+  });
+
+  // Generate AI combined narratives for all groups in a project
+  app.post("/api/projects/:id/observation-groups/generate", async (req, res) => {
+    try {
+      const projectId = Number(req.params.id);
+      const groups = await storage.getGroupsByProject(projectId);
+      const allObs = await storage.getObservationsByProject(projectId);
+
+      const results: { id: number; combinedNarrative: string }[] = [];
+      for (const g of groups) {
+        const members = allObs.filter(o => o.groupId === g.id);
+        if (members.length === 0) continue;
+        const obsPayload = members.map((m) => {
+          let ind: string[] = [];
+          try { ind = JSON.parse(m.indicators || "[]"); } catch {}
+          return {
+            observationId: m.observationId,
+            defectCategory: m.defectCategory,
+            location: m.location,
+            severity: m.severity,
+            extent: m.extent,
+            fieldNote: m.fieldNote || "",
+            indicators: ind,
+            aiNarrative: m.aiNarrative || "",
+          };
+        });
+        const photos: { observationId: string; caption: string }[] = [];
+        for (const m of members) {
+          const ps = await storage.getPhotosByObservation(m.id);
+          for (const p of ps) photos.push({ observationId: m.observationId, caption: p.caption || "" });
+        }
+        const narrative = await generateGroupNarrative(g.name, obsPayload, photos);
+        await storage.updateGroup(g.id, { combinedNarrative: narrative } as any);
+        results.push({ id: g.id, combinedNarrative: narrative });
+      }
+      res.json({ groups: results });
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Group narrative generation failed" });
+    }
+  });
+
+  // === CUSTOM INDICATORS ===
+  const DEFAULT_INDICATORS = [
+    "Water staining",
+    "Corrosion products",
+    "Displacement/movement",
+    "Cracking",
+    "Delamination",
+    "Biological growth",
+    "Efflorescence",
+    "Ponding water",
+    "Air leaks",
+    "Debris accumulation",
+    "Surface chalking",
+    "Loss of adhesion",
+    "Compression set",
+    "Discolouration",
+    "Missing material",
+  ];
+
+  app.get("/api/projects/:projectId/indicators", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const custom = await storage.getCustomIndicatorsByProject(projectId);
+    res.json({
+      defaults: DEFAULT_INDICATORS,
+      custom: custom.map(c => ({ id: c.id, name: c.name })),
+    });
+  });
+
+  app.post("/api/projects/:projectId/indicators", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const name = (req.body.name || "").trim();
+    if (!name) return res.status(400).json({ message: "name is required" });
+    const indicator = await storage.createCustomIndicator({
+      projectId,
+      name,
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(indicator);
+  });
+
+  app.delete("/api/indicators/:id", async (req, res) => {
+    await storage.deleteCustomIndicator(Number(req.params.id));
+    res.status(204).end();
+  });
+
   // === WORD EXPORT ===
   app.get("/api/export/word/:projectId", async (req, res) => {
     try {
@@ -1289,11 +1500,67 @@ export async function registerRoutes(
         spacing: { before: 300, after: 150 },
       }));
 
+      // Fetch groups for this project (if inspection is complete, we use grouped structure)
+      const projectGroups = await storage.getGroupsByProject(projectId);
+      projectGroups.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+      const useGroups = project.inspectionStatus === "complete" && projectGroups.length > 0;
+
       if (allObservations.length === 0) {
         obsChildren.push(new Paragraph({
           children: [new TextRun({ text: "No observations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
           spacing: { after: 150 },
         }));
+      } else if (useGroups) {
+        obsChildren.push(new Paragraph({
+          children: [new TextRun({ text: "The following sections detail the observations recorded during the facade inspection.", font: "Arial", size: 22 })],
+          spacing: { after: 150 },
+        }));
+
+        let sectionNum = 2;
+        for (const grp of projectGroups) {
+          const members = allObservations.filter(o => o.groupId === grp.id);
+          if (members.length === 0) continue;
+
+          obsChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: `4.${sectionNum} ${grp.name}`, font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            spacing: { before: 300, after: 150 },
+          }));
+          sectionNum++;
+
+          if (grp.combinedNarrative) {
+            const narrativeLines = grp.combinedNarrative.split("\n").filter(l => l.trim());
+            for (const line of narrativeLines) {
+              obsChildren.push(new Paragraph({
+                children: [new TextRun({ text: line, font: "Arial", size: 22 })],
+                spacing: { after: 100 },
+              }));
+            }
+          }
+
+          // Bookmarks for each observation in the group (so CAPEX links still resolve)
+          for (const obs of members) {
+            const bookmarkId = sanitizeBookmark(obs.observationId);
+            obsChildren.push(new Paragraph({
+              children: [
+                new BookmarkStart(bookmarkId, getBookmarkLinkId(obs.observationId)),
+                new TextRun({ text: `${obs.observationId}: ${obs.defectCategory}${obs.location ? " — " + obs.location : ""}`, font: "Arial", size: 20, italics: true, color: MUTED }),
+                new BookmarkEnd(getBookmarkLinkId(obs.observationId)),
+              ],
+              spacing: { after: 40 },
+            }));
+          }
+
+          // Embed all photos from observations in this group
+          const groupPhotos: Photo[] = [];
+          for (const obs of members) {
+            const ps = obsPhotosMap[obs.id] || [];
+            groupPhotos.push(...ps);
+          }
+          if (groupPhotos.length > 0) {
+            obsChildren.push(...buildPhotoRows(groupPhotos, figureCounter));
+          }
+        }
       } else {
         obsChildren.push(new Paragraph({
           children: [new TextRun({ text: "The following sections detail the observations recorded during the facade inspection.", font: "Arial", size: 22 })],

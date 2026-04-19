@@ -337,6 +337,78 @@ Respond ONLY with valid JSON:
   return JSON.parse(jsonMatch[0]);
 }
 
+export async function generateGroupNarrative(
+  groupName: string,
+  observations: Array<{ observationId: string; defectCategory: string; location: string; severity: string; extent: string; fieldNote: string; indicators: string[]; aiNarrative: string }>,
+  photos: Array<{ observationId: string; caption: string }>
+): Promise<string> {
+  const client = await getClient();
+
+  const obsContext = observations.map((o) => {
+    const photoCaptions = photos.filter(p => p.observationId === o.observationId).map(p => p.caption).filter(Boolean);
+    return `[${o.observationId}] ${o.defectCategory} at ${o.location}
+  Severity/Extent: ${o.severity} / ${o.extent}
+  Indicators: ${(o.indicators || []).join(", ") || "None"}
+  Field Note: ${o.fieldNote || "None"}
+  Existing narrative: ${o.aiNarrative || "None"}
+  Photos: ${photoCaptions.join("; ") || "None"}`;
+  }).join("\n\n");
+
+  const trainingExamples = await getTrainingExamples("group_narrative");
+
+  const response = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "system",
+        content: `You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+
+You will be given a group name (e.g. "Eastern Facade" or "Sealant Failure") and a set of related observations. Produce ONE combined narrative covering all of them, as a numbered list of defects with lettered sub-items.
+
+STYLE RULES:
+- Concise. Australian facade engineering terminology.
+- Do NOT restate the group name as a heading — the heading is already there.
+- Open with an optional short (1-2 sentence) overall statement about the group condition, then immediately go to the numbered list.
+- Each distinct defect type is one numbered item. Sub-items (a, b, c) carry detail: what was observed, likely cause, implication.
+- Do not invent details beyond what the input data provides.
+
+FORMAT:
+[Optional 1-2 sentence opening]
+
+1. [Defect type]:
+   a. [Observed detail]
+   b. [Likely cause or contributing factor]
+   c. [Implication if left unaddressed]
+
+2. [Next defect type]:
+   a. [Detail]
+   b. [Detail]
+
+EXAMPLE (from a real report, Section 4.4 Eastern Facade):
+1. Disengaged spandrel panels:
+   a. We identified 6 glass spandrel panels which are not engaged within the head glazing pocket.
+   b. All panels are at the Level 4 slab edge.
+   c. If left unaddressed, the gaps may result in air and water leaks.
+2. Misaligned curtain wall framing:
+   a. Significant bowing of horizontal and vertical members.
+   b. Likely caused by thermal cycling combined with construction tolerances.
+3. Gasket shortening:
+   a. Gaskets at mullion heads have shortened, exposing the glazing rebate.
+
+Return ONLY the narrative text.${trainingExamples}`,
+      },
+      {
+        role: "user",
+        content: `Group name: ${groupName}\n\nObservations in this group:\n\n${obsContext}`,
+      },
+    ],
+    max_tokens: 700,
+    temperature: 0.3,
+  });
+
+  return response.choices[0]?.message?.content?.trim() || "";
+}
+
 export async function generateExecutiveSummary(projectId: number): Promise<string> {
   const client = await getClient();
   const project = await storage.getProject(projectId);

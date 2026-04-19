@@ -24,7 +24,7 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload,
+  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList,
 } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -77,6 +77,30 @@ export default function ProjectDetail() {
   const { data: elevations } = useQuery<Elevation[]>({
     queryKey: [`/api/projects/${id}/elevations`],
   });
+
+  const [inspectionDialogOpen, setInspectionDialogOpen] = useState(false);
+  const [groupingChoice, setGroupingChoice] = useState<string>("by_type");
+  const [markingComplete, setMarkingComplete] = useState(false);
+
+  const markInspectionComplete = async () => {
+    setMarkingComplete(true);
+    try {
+      await apiRequest("PATCH", `/api/projects/${id}/status`, {
+        inspectionStatus: "complete",
+        observationGrouping: groupingChoice,
+      });
+      await apiRequest("POST", `/api/projects/${id}/observation-groups/rebuild`, { grouping: groupingChoice });
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id] });
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/observations`] });
+      setInspectionDialogOpen(false);
+      toast({ title: "Inspection marked complete — review groups" });
+      navigate(`/projects/${id}/groups`);
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to mark complete", variant: "destructive" });
+    } finally {
+      setMarkingComplete(false);
+    }
+  };
 
   const [elevationDialogOpen, setElevationDialogOpen] = useState(false);
   const [elevationFile, setElevationFile] = useState<File | null>(null);
@@ -279,16 +303,91 @@ export default function ProjectDetail() {
 
       <div className="flex items-center justify-between mb-1">
         <h1 className="text-xl font-semibold tracking-tight">{project.name}</h1>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => window.open(`${API_BASE}/api/export/word/${id}`, '_blank')}
-        >
-          <FileText className="w-4 h-4 mr-2" />
-          Export Word
-        </Button>
+        <div className="flex gap-2">
+          {project.inspectionStatus === "complete" ? (
+            <Link href={`/projects/${id}/groups`}>
+              <Button variant="outline" size="sm">
+                <ClipboardList className="w-4 h-4 mr-2" />
+                Review Groups
+              </Button>
+            </Link>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setInspectionDialogOpen(true)}
+              disabled={!observations || observations.length === 0}
+            >
+              <CheckCircle2 className="w-4 h-4 mr-2" />
+              Mark Inspection Complete
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => window.open(`${API_BASE}/api/export/word/${id}`, '_blank')}
+          >
+            <FileText className="w-4 h-4 mr-2" />
+            Export Word
+          </Button>
+        </div>
       </div>
-      <p className="text-sm text-muted-foreground mb-6">{project.address}</p>
+      <p className="text-sm text-muted-foreground mb-6">
+        {project.address}
+        {project.inspectionStatus === "complete" && (
+          <Badge variant="secondary" className="ml-2 bg-green-100 text-green-800">Inspection complete</Badge>
+        )}
+      </p>
+
+      {/* Mark Inspection Complete Dialog */}
+      <Dialog open={inspectionDialogOpen} onOpenChange={setInspectionDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Mark Inspection Complete</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              How should the observations be grouped for the final report?
+            </p>
+            <div className="space-y-2">
+              <label className="flex items-start gap-3 p-3 border rounded-md cursor-pointer hover:bg-accent/50">
+                <input
+                  type="radio"
+                  name="grouping"
+                  value="by_type"
+                  checked={groupingChoice === "by_type"}
+                  onChange={() => setGroupingChoice("by_type")}
+                  className="mt-1"
+                />
+                <div>
+                  <p className="font-medium text-sm">By Type of Observation</p>
+                  <p className="text-xs text-muted-foreground">Groups observations by defect category (e.g. Sealant Failure, Glazing Defect).</p>
+                </div>
+              </label>
+              <label className="flex items-start gap-3 p-3 border rounded-md cursor-pointer hover:bg-accent/50">
+                <input
+                  type="radio"
+                  name="grouping"
+                  value="by_elevation"
+                  checked={groupingChoice === "by_elevation"}
+                  onChange={() => setGroupingChoice("by_elevation")}
+                  className="mt-1"
+                />
+                <div>
+                  <p className="font-medium text-sm">By Elevation / Area</p>
+                  <p className="text-xs text-muted-foreground">Groups by grid elevation (North, East, etc.) or location area.</p>
+                </div>
+              </label>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setInspectionDialogOpen(false)} disabled={markingComplete}>Cancel</Button>
+            <Button onClick={markInspectionComplete} disabled={markingComplete}>
+              {markingComplete ? (<><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Grouping...</>) : "Continue"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Tabs defaultValue="overview">
         <TabsList className="mb-6">

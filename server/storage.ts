@@ -9,6 +9,8 @@ import {
   type TrainingData, type InsertTrainingData, aiTrainingData,
   type Elevation, type InsertElevation, elevations,
   type ElevationPin, type InsertElevationPin, elevationPins,
+  type ObservationGroup, type InsertObservationGroup, observationGroups,
+  type CustomIndicator, type InsertCustomIndicator, customIndicators,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -135,6 +137,21 @@ sqlite.exec(`
     y INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS observation_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    sort_order INTEGER DEFAULT 0,
+    combined_narrative TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS custom_indicators (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Add executive_summary column to projects if it doesn't exist
@@ -150,6 +167,16 @@ try {
 } catch (e) {
   // Column already exists — ignore
 }
+
+// Feature 1: grid location columns on observations
+try { sqlite.exec(`ALTER TABLE observations ADD COLUMN grid_drop TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE observations ADD COLUMN grid_elevation TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE observations ADD COLUMN grid_level TEXT DEFAULT ''`); } catch {}
+
+// Feature 2: inspection status + observation grouping
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN inspection_status TEXT DEFAULT 'in_progress'`); } catch {}
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN observation_grouping TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE observations ADD COLUMN group_id INTEGER DEFAULT NULL`); } catch {}
 
 export const db = drizzle(sqlite);
 export { dataDir };
@@ -423,6 +450,37 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteElevationPinByObservation(observationId: number): Promise<void> {
     db.delete(elevationPins).where(eq(elevationPins.observationId, observationId)).run();
+  }
+
+  // Observation Groups
+  async getGroupsByProject(projectId: number): Promise<ObservationGroup[]> {
+    return db.select().from(observationGroups).where(eq(observationGroups.projectId, projectId)).all();
+  }
+  async getGroup(id: number): Promise<ObservationGroup | undefined> {
+    return db.select().from(observationGroups).where(eq(observationGroups.id, id)).get();
+  }
+  async createGroup(data: InsertObservationGroup): Promise<ObservationGroup> {
+    return db.insert(observationGroups).values(data).returning().get();
+  }
+  async updateGroup(id: number, data: Partial<InsertObservationGroup>): Promise<ObservationGroup | undefined> {
+    return db.update(observationGroups).set(data).where(eq(observationGroups.id, id)).returning().get();
+  }
+  async deleteGroup(id: number): Promise<void> {
+    db.delete(observationGroups).where(eq(observationGroups.id, id)).run();
+  }
+  async deleteGroupsByProject(projectId: number): Promise<void> {
+    db.delete(observationGroups).where(eq(observationGroups.projectId, projectId)).run();
+  }
+
+  // Custom Indicators
+  async getCustomIndicatorsByProject(projectId: number): Promise<CustomIndicator[]> {
+    return db.select().from(customIndicators).where(eq(customIndicators.projectId, projectId)).all();
+  }
+  async createCustomIndicator(data: InsertCustomIndicator): Promise<CustomIndicator> {
+    return db.insert(customIndicators).values(data).returning().get();
+  }
+  async deleteCustomIndicator(id: number): Promise<void> {
+    db.delete(customIndicators).where(eq(customIndicators.id, id)).run();
   }
 }
 

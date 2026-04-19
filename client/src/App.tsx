@@ -10,6 +10,7 @@ import ProjectDetail from "@/pages/project-detail";
 import SystemForm from "@/pages/system-form";
 import ObservationForm from "@/pages/observation-form";
 import ElevationView from "@/pages/elevation-view";
+import ObservationGroupsPage from "@/pages/observation-groups";
 import Settings from "@/pages/settings";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
 
@@ -35,6 +36,7 @@ function AppRouter() {
       <Route path="/projects/:projectId/systems/:systemId" component={SystemFormKeyed} />
       <Route path="/projects/:projectId/observations/new" component={ObservationFormKeyed} />
       <Route path="/projects/:projectId/observations/:observationId" component={ObservationFormKeyed} />
+      <Route path="/projects/:id/groups" component={ObservationGroupsPage} />
       <Route path="/projects/:id/elevations/:elevationId" component={ElevationView} />
       <Route path="/settings" component={Settings} />
       <Route component={NotFound} />
