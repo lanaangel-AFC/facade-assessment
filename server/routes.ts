@@ -359,6 +359,20 @@ export async function registerRoutes(
     res.json(photo);
   });
 
+  // Download full-size photo (triggers save on mobile)
+  app.get("/api/photos/:id/download", async (req, res) => {
+    const photo = await storage.getPhoto(Number(req.params.id));
+    if (!photo) return res.status(404).json({ message: "Photo not found" });
+    const filePath = path.join(uploadDir, photo.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
+    const ext = path.extname(photo.filename).toLowerCase();
+    const downloadName = photo.caption
+      ? `${photo.caption.replace(/[^a-zA-Z0-9_\- ]/g, "")}${ext}`
+      : photo.filename;
+    res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+    res.sendFile(filePath);
+  });
+
   app.delete("/api/photos/:id", async (req, res) => {
     const photo = await storage.deletePhoto(Number(req.params.id));
     if (photo) {
