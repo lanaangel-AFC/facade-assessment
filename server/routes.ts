@@ -1364,11 +1364,38 @@ export async function registerRoutes(
             spacing: { before: 200, after: 100 },
           }));
 
-          if (sys.aiDescription) {
-            const descParas = sys.aiDescription.split("\n").filter(l => l.trim());
+          // System description — use AI description, or fall back to structured summary
+          const descText = sys.aiDescription || "";
+          if (descText.trim()) {
+            const descParas = descText.split("\n").filter((l: string) => l.trim());
             for (const p of descParas) {
               siteChildren.push(new Paragraph({
                 children: [new TextRun({ text: p, font: "Arial", size: 22 })],
+                spacing: { after: 100 },
+              }));
+            }
+          } else {
+            // Fallback: structured summary from system fields
+            const fallbackLines: string[] = [];
+            if (sys.systemType) fallbackLines.push(`System type: ${sys.systemType}`);
+            let mats: {name: string; detail: string}[] = [];
+            try { mats = JSON.parse(sys.materials || "[]"); } catch {}
+            if (mats.length > 0) {
+              fallbackLines.push(`Materials: ${mats.map((m: {name: string; detail: string}) => `${m.name} — ${m.detail}`).join("; ")}`);
+            }
+            let feats: string[] = [];
+            try { feats = JSON.parse(sys.keyFeatures || "[]"); } catch {}
+            if (feats.length > 0) fallbackLines.push(`Key features: ${feats.join(", ")}`);
+            if (sys.estimatedAge) fallbackLines.push(`Estimated age: ${sys.estimatedAge}`);
+            for (const line of fallbackLines) {
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: line, font: "Arial", size: 22 })],
+                spacing: { after: 80 },
+              }));
+            }
+            if (fallbackLines.length === 0) {
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: "Description not yet generated.", font: "Arial", size: 22, italics: true, color: "999999" })],
                 spacing: { after: 100 },
               }));
             }
