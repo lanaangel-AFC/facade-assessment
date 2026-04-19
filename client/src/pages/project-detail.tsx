@@ -16,13 +16,17 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar, Sparkles, Loader2,
+  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload,
 } from "lucide-react";
-import type { Project, FacadeSystem, Observation, Recommendation } from "@shared/schema";
+import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
@@ -68,6 +72,55 @@ export default function ProjectDetail() {
 
   const { data: allRecommendations } = useQuery<Recommendation[]>({
     queryKey: [`/api/projects/${id}/recommendations`],
+  });
+
+  const { data: elevations } = useQuery<Elevation[]>({
+    queryKey: [`/api/projects/${id}/elevations`],
+  });
+
+  const [elevationDialogOpen, setElevationDialogOpen] = useState(false);
+  const [elevationFile, setElevationFile] = useState<File | null>(null);
+  const [elevationName, setElevationName] = useState("");
+  const [elevationType, setElevationType] = useState("elevation");
+  const [elevationUploading, setElevationUploading] = useState(false);
+
+  const uploadElevation = async () => {
+    if (!elevationFile || !elevationName.trim()) {
+      toast({ title: "File and name are required", variant: "destructive" });
+      return;
+    }
+    setElevationUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", elevationFile);
+      fd.append("name", elevationName.trim());
+      fd.append("type", elevationType);
+      const res = await fetch(`${API_BASE}/api/projects/${id}/elevations`, { method: "POST", body: fd });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.message || "Upload failed");
+      }
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/elevations`] });
+      setElevationDialogOpen(false);
+      setElevationFile(null);
+      setElevationName("");
+      setElevationType("elevation");
+      toast({ title: "Elevation uploaded" });
+    } catch (err: any) {
+      toast({ title: err.message || "Upload failed", variant: "destructive" });
+    } finally {
+      setElevationUploading(false);
+    }
+  };
+
+  const deleteElevationMutation = useMutation({
+    mutationFn: async (elevationId: number) => {
+      await apiRequest("DELETE", `/api/elevations/${elevationId}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/elevations`] });
+      toast({ title: "Elevation deleted" });
+    },
   });
 
   // Editable project fields
@@ -246,6 +299,10 @@ export default function ProjectDetail() {
           <TabsTrigger value="systems" className="gap-1.5">
             <Layers className="w-4 h-4" />
             Systems
+          </TabsTrigger>
+          <TabsTrigger value="elevations" className="gap-1.5">
+            <ImageIcon className="w-4 h-4" />
+            Elevations
           </TabsTrigger>
           <TabsTrigger value="observations" className="gap-1.5">
             <Eye className="w-4 h-4" />
@@ -551,6 +608,126 @@ export default function ProjectDetail() {
               ))}
             </div>
           )}
+        </TabsContent>
+
+        {/* === ELEVATIONS TAB === */}
+        <TabsContent value="elevations">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-medium">Elevation Drawings</h2>
+            <Button onClick={() => setElevationDialogOpen(true)}>
+              <Upload className="w-4 h-4 mr-2" />
+              Upload Elevation
+            </Button>
+          </div>
+
+          {!elevations?.length ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <ImageIcon className="w-10 h-10 text-muted-foreground/40 mb-3" />
+              <p className="text-sm text-muted-foreground">No elevation drawings uploaded yet.</p>
+              <p className="text-xs text-muted-foreground mt-1">Upload elevations or roof plans (JPG, PNG, PDF) to mark observation locations.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              {elevations.map((elev) => {
+                const pinCount = (observations || []).filter(o => o.elevationId === elev.id).length;
+                return (
+                  <Card key={elev.id} className="group relative overflow-hidden">
+                    <Link href={`/projects/${id}/elevations/${elev.id}`}>
+                      <div className="cursor-pointer">
+                        <div className="aspect-video bg-muted flex items-center justify-center overflow-hidden">
+                          <img
+                            src={`${API_BASE}/api/elevations/${elev.id}/image`}
+                            alt={elev.name}
+                            className="w-full h-full object-contain"
+                          />
+                        </div>
+                        <div className="p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-medium truncate">{elev.name}</p>
+                            <Badge variant="secondary" className="text-xs shrink-0">
+                              {elev.type === "roof_plan" ? "Roof Plan" : "Elevation"}
+                            </Badge>
+                          </div>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {pinCount} pin{pinCount === 1 ? "" : "s"}
+                          </p>
+                        </div>
+                      </div>
+                    </Link>
+                    <button
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (confirm("Delete this elevation and all its pins?")) {
+                          deleteElevationMutation.mutate(elev.id);
+                        }
+                      }}
+                      className="absolute top-2 right-2 p-1.5 rounded-md bg-background/80 opacity-0 group-hover:opacity-100 hover:bg-destructive/10 hover:text-destructive transition-all"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+
+          <Dialog open={elevationDialogOpen} onOpenChange={setElevationDialogOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Upload Elevation</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div>
+                  <Label>Name</Label>
+                  <Input
+                    placeholder="e.g. North Elevation, Roof Plan"
+                    value={elevationName}
+                    onChange={(e) => setElevationName(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <Label>Type</Label>
+                  <Select value={elevationType} onValueChange={setElevationType}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="elevation">Elevation</SelectItem>
+                      <SelectItem value="roof_plan">Roof Plan</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label>File</Label>
+                  <Input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.webp,.pdf"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] || null;
+                      setElevationFile(f);
+                      if (f && !elevationName) {
+                        setElevationName(f.name.replace(/\.[^.]+$/, ""));
+                      }
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">Accepted: JPG, PNG, WebP, PDF (first page)</p>
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setElevationDialogOpen(false)} disabled={elevationUploading}>
+                  Cancel
+                </Button>
+                <Button onClick={uploadElevation} disabled={elevationUploading || !elevationFile || !elevationName.trim()}>
+                  {elevationUploading ? (
+                    <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Uploading...</>
+                  ) : (
+                    "Upload"
+                  )}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </TabsContent>
 
         {/* === OBSERVATIONS TAB === */}

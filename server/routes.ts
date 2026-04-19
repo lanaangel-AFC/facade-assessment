@@ -18,6 +18,9 @@ import {
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { execSync } from "child_process";
+import crypto from "crypto";
+import sharp from "sharp";
 import {
   Document,
   Packer,
@@ -48,6 +51,40 @@ import {
 const uploadDir = path.join(dataDir, "uploads");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const elevationDir = path.join(uploadDir, "elevations");
+if (!fs.existsSync(elevationDir)) {
+  fs.mkdirSync(elevationDir, { recursive: true });
+}
+
+const elevationUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, elevationDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const name = `${crypto.randomUUID()}${ext}`;
+      cb(null, name);
+    },
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = file.mimetype.startsWith("image/") || file.mimetype === "application/pdf";
+    if (ok) cb(null, true);
+    else cb(new Error("Only image or PDF files are allowed"));
+  },
+});
+
+function getImageDimensions(filePath: string): { width: number; height: number } {
+  try {
+    const out = execSync(`identify -format "%w %h" ${JSON.stringify(filePath)}`).toString().trim();
+    const [w, h] = out.split(/\s+/).map(Number);
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return { width: 0, height: 0 };
+    return { width: w, height: h };
+  } catch (e) {
+    console.warn("identify failed for", filePath, e);
+    return { width: 0, height: 0 };
+  }
 }
 
 const upload = multer({
@@ -323,6 +360,190 @@ export async function registerRoutes(
       const filePath = path.join(uploadDir, photo.filename);
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
+    res.status(204).end();
+  });
+
+  // === ELEVATIONS ===
+  app.get("/api/projects/:projectId/elevations", async (req, res) => {
+    const list = await storage.getElevationsByProject(Number(req.params.projectId));
+    list.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+    res.json(list);
+  });
+
+  app.get("/api/elevations/:id", async (req, res) => {
+    const elevation = await storage.getElevation(Number(req.params.id));
+    if (!elevation) return res.status(404).json({ message: "Elevation not found" });
+    res.json(elevation);
+  });
+
+  app.get("/api/elevations/:id/image", async (req, res) => {
+    const elevation = await storage.getElevation(Number(req.params.id));
+    if (!elevation) return res.status(404).json({ message: "Elevation not found" });
+    const filePath = path.join(elevationDir, elevation.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ message: "Image file not found" });
+    res.sendFile(filePath);
+  });
+
+  app.post("/api/projects/:projectId/elevations", elevationUpload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+      const projectId = Number(req.params.projectId);
+      const name = req.body.name || req.file.originalname;
+      const type = req.body.type || "elevation";
+      const originalFilename = req.file.originalname;
+      let storedFilename = req.file.filename;
+      const isPdf = req.file.mimetype === "application/pdf" || path.extname(req.file.originalname).toLowerCase() === ".pdf";
+
+      if (isPdf) {
+        // Convert first page to PNG using pdftoppm
+        const pdfPath = path.join(elevationDir, storedFilename);
+        const outBase = crypto.randomUUID();
+        const outPrefix = path.join(elevationDir, outBase);
+        try {
+          execSync(`pdftoppm -png -r 200 -singlefile ${JSON.stringify(pdfPath)} ${JSON.stringify(outPrefix)}`);
+          const pngPath = `${outPrefix}.png`;
+          if (!fs.existsSync(pngPath)) {
+            return res.status(500).json({ message: "PDF conversion produced no image" });
+          }
+          // Remove the original PDF
+          try { fs.unlinkSync(pdfPath); } catch {}
+          storedFilename = `${outBase}.png`;
+        } catch (err: any) {
+          console.error("pdftoppm failed:", err);
+          return res.status(500).json({ message: "Failed to convert PDF" });
+        }
+      }
+
+      const fullPath = path.join(elevationDir, storedFilename);
+      const { width, height } = getImageDimensions(fullPath);
+
+      const elevation = await storage.createElevation({
+        projectId,
+        name,
+        type,
+        filename: storedFilename,
+        originalFilename,
+        width,
+        height,
+        sortOrder: 0,
+        createdAt: new Date().toISOString(),
+      });
+      res.status(201).json(elevation);
+    } catch (err: any) {
+      console.error("Elevation upload error:", err);
+      res.status(500).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  app.patch("/api/elevations/:id", async (req, res) => {
+    const elevation = await storage.updateElevation(Number(req.params.id), req.body);
+    if (!elevation) return res.status(404).json({ message: "Elevation not found" });
+    res.json(elevation);
+  });
+
+  app.delete("/api/elevations/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    const elevation = await storage.deleteElevation(id);
+    if (elevation) {
+      const filePath = path.join(elevationDir, elevation.filename);
+      if (fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch {}
+      }
+    }
+    res.status(204).end();
+  });
+
+  // === ELEVATION PINS ===
+  app.get("/api/elevations/:id/pins", async (req, res) => {
+    const elevationId = Number(req.params.id);
+    const pins = await storage.getPinsByElevation(elevationId);
+    // Enrich with observation data
+    const enriched = await Promise.all(pins.map(async (pin) => {
+      const obs = await storage.getObservation(pin.observationId);
+      return {
+        ...pin,
+        observationIdText: obs?.observationId || "",
+        defectCategory: obs?.defectCategory || "",
+        severity: obs?.severity || "",
+        location: obs?.location || "",
+      };
+    }));
+    res.json(enriched);
+  });
+
+  app.post("/api/elevations/:id/pins", async (req, res) => {
+    const elevationId = Number(req.params.id);
+    const { observationId, x, y } = req.body;
+    if (!observationId || x === undefined || y === undefined) {
+      return res.status(400).json({ message: "observationId, x, y required" });
+    }
+    // Remove any existing pin for this observation
+    await storage.deleteElevationPinByObservation(Number(observationId));
+    const pin = await storage.createElevationPin({
+      elevationId,
+      observationId: Number(observationId),
+      x: Number(x),
+      y: Number(y),
+      createdAt: new Date().toISOString(),
+    });
+    // Also update observation.elevationId
+    await storage.updateObservation(Number(observationId), { elevationId } as any);
+    res.status(201).json(pin);
+  });
+
+  app.patch("/api/elevation-pins/:id", async (req, res) => {
+    const pin = await storage.updateElevationPin(Number(req.params.id), req.body);
+    if (!pin) return res.status(404).json({ message: "Pin not found" });
+    res.json(pin);
+  });
+
+  app.delete("/api/elevation-pins/:id", async (req, res) => {
+    const pin = await storage.getElevationPin(Number(req.params.id));
+    if (pin) {
+      await storage.updateObservation(pin.observationId, { elevationId: null } as any);
+    }
+    await storage.deleteElevationPin(Number(req.params.id));
+    res.status(204).end();
+  });
+
+  // === OBSERVATION PIN MANAGEMENT ===
+  app.get("/api/observations/:id/pin", async (req, res) => {
+    const pin = await storage.getPinByObservation(Number(req.params.id));
+    if (!pin) return res.json({ pin: null });
+    res.json(pin);
+  });
+
+  app.put("/api/observations/:id/pin", async (req, res) => {
+    const observationId = Number(req.params.id);
+    const { elevationId, x, y } = req.body;
+    if (!elevationId || x === undefined || y === undefined) {
+      return res.status(400).json({ message: "elevationId, x, y required" });
+    }
+    const existing = await storage.getPinByObservation(observationId);
+    let pin;
+    if (existing) {
+      pin = await storage.updateElevationPin(existing.id, {
+        elevationId: Number(elevationId),
+        x: Number(x),
+        y: Number(y),
+      });
+    } else {
+      pin = await storage.createElevationPin({
+        elevationId: Number(elevationId),
+        observationId,
+        x: Number(x),
+        y: Number(y),
+        createdAt: new Date().toISOString(),
+      });
+    }
+    await storage.updateObservation(observationId, { elevationId: Number(elevationId) } as any);
+    res.json(pin);
+  });
+
+  app.delete("/api/observations/:id/pin", async (req, res) => {
+    const observationId = Number(req.params.id);
+    await storage.deleteElevationPinByObservation(observationId);
+    await storage.updateObservation(observationId, { elevationId: null } as any);
     res.status(204).end();
   });
 
@@ -932,6 +1153,124 @@ export async function registerRoutes(
         });
       }
 
+      // 3.3 Elevation Drawings (with pinned observations)
+      const projectElevations = await storage.getElevationsByProject(projectId);
+      projectElevations.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+
+      if (projectElevations.length > 0) {
+        siteChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "3.3 Elevation Drawings", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        }));
+
+        for (const elev of projectElevations) {
+          const srcPath = path.join(elevationDir, elev.filename);
+          if (!fs.existsSync(srcPath)) continue;
+
+          const pins = await storage.getPinsByElevation(elev.id);
+          let annotatedBuffer: Buffer | null = null;
+          let annotatedWidth = elev.width || 1600;
+          let annotatedHeight = elev.height || 1200;
+
+          try {
+            const baseImg = sharp(srcPath);
+            const meta = await baseImg.metadata();
+            const W = meta.width || 1600;
+            const H = meta.height || 1200;
+            annotatedWidth = W;
+            annotatedHeight = H;
+
+            // Build SVG overlay with pins
+            const pinRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
+            const svgPins = pins.map((pin) => {
+              const obs = allObservations.find(o => o.id === pin.observationId);
+              if (!obs) return "";
+              const color = obs.severity === "Safety/Risk" ? "#EF4444"
+                : obs.severity === "Essential" ? "#F97316"
+                : obs.severity === "Desirable" ? "#EAB308"
+                : "#22C55E";
+              const cx = Math.round((pin.x / 10000) * W);
+              const cy = Math.round((pin.y / 10000) * H);
+              const label = (obs.observationId || "").replace(/[<>&"']/g, "");
+              const fontSize = Math.round(pinRadius * 0.75);
+              return `
+                <circle cx="${cx}" cy="${cy}" r="${pinRadius}" fill="${color}" stroke="white" stroke-width="3" />
+                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
+              `;
+            }).join("");
+
+            const svgOverlay = Buffer.from(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgPins}</svg>`
+            );
+
+            annotatedBuffer = await baseImg
+              .composite([{ input: svgOverlay, top: 0, left: 0 }])
+              .png()
+              .toBuffer();
+          } catch (err) {
+            console.warn("Failed to annotate elevation", elev.id, err);
+            try {
+              annotatedBuffer = fs.readFileSync(srcPath);
+            } catch {}
+          }
+
+          if (!annotatedBuffer) continue;
+
+          // Figure heading
+          siteChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_3,
+            children: [new TextRun({ text: `Figure ${figureCounter.n} \u2013 ${elev.name}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+            spacing: { before: 200, after: 100 },
+          }));
+          figureCounter.n++;
+
+          // Scale to fit page width ~500px target
+          const targetWidth = 500;
+          const aspect = annotatedHeight && annotatedWidth ? annotatedHeight / annotatedWidth : 0.75;
+          const targetHeight = Math.round(targetWidth * aspect);
+
+          siteChildren.push(new Paragraph({
+            children: [
+              new ImageRun({
+                data: annotatedBuffer,
+                transformation: { width: targetWidth, height: targetHeight },
+                type: "png",
+                altText: { title: elev.name, description: elev.name, name: elev.filename },
+              }),
+            ],
+            spacing: { after: 200 },
+          }));
+
+          // Legend / pin list
+          if (pins.length > 0) {
+            for (const pin of pins) {
+              const obs = allObservations.find(o => o.id === pin.observationId);
+              if (!obs) continue;
+              siteChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Pin ${obs.observationId}: `, font: "Arial", size: 20, bold: true, color: DARK_GRAY }),
+                  new TextRun({ text: `${obs.defectCategory} — ${obs.location} (${obs.severity})`, font: "Arial", size: 20, color: MUTED }),
+                ],
+                spacing: { after: 40 },
+              }));
+            }
+          }
+        }
+      }
+
+      // Build pin-to-elevation map for observation cross-references
+      const pinByObs: Record<number, { elevationName: string; observationId: string }> = {};
+      for (const elev of projectElevations) {
+        const ePins = await storage.getPinsByElevation(elev.id);
+        for (const pin of ePins) {
+          const obs = allObservations.find(o => o.id === pin.observationId);
+          if (obs) {
+            pinByObs[obs.id] = { elevationName: elev.name, observationId: obs.observationId };
+          }
+        }
+      }
+
       // === SECTION 4: OBSERVATIONS ===
       const obsChildren: Paragraph[] = [];
       obsChildren.push(new Paragraph({
@@ -999,6 +1338,16 @@ export async function registerRoutes(
               ],
               spacing: { after: 100 },
             }));
+
+            // Elevation reference
+            if (pinByObs[obs.id]) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Refer to ${pinByObs[obs.id].elevationName}, Pin ${pinByObs[obs.id].observationId}.`, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 100 },
+              }));
+            }
 
             // AI Narrative
             if (obs.aiNarrative) {
@@ -1074,6 +1423,15 @@ export async function registerRoutes(
               ],
               spacing: { after: 100 },
             }));
+
+            if (pinByObs[obs.id]) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Refer to ${pinByObs[obs.id].elevationName}, Pin ${pinByObs[obs.id].observationId}.`, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 100 },
+              }));
+            }
 
             if (obs.aiNarrative) {
               const narrativeParas = obs.aiNarrative.split("\n").filter(l => l.trim());

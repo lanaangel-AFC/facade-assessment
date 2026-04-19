@@ -7,6 +7,8 @@ import {
   type Photo, type InsertPhoto, photos,
   type Setting, settings,
   type TrainingData, type InsertTrainingData, aiTrainingData,
+  type Elevation, type InsertElevation, elevations,
+  type ElevationPin, type InsertElevationPin, elevationPins,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -113,11 +115,38 @@ sqlite.exec(`
     username TEXT NOT NULL UNIQUE,
     password TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS elevations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    width INTEGER DEFAULT 0,
+    height INTEGER DEFAULT 0,
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS elevation_pins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    elevation_id INTEGER NOT NULL,
+    observation_id INTEGER NOT NULL,
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Add executive_summary column to projects if it doesn't exist
 try {
   sqlite.exec(`ALTER TABLE projects ADD COLUMN executive_summary TEXT DEFAULT ''`);
+} catch (e) {
+  // Column already exists — ignore
+}
+
+// Add elevation_id column to observations if it doesn't exist
+try {
+  sqlite.exec(`ALTER TABLE observations ADD COLUMN elevation_id INTEGER DEFAULT NULL`);
 } catch (e) {
   // Column already exists — ignore
 }
@@ -233,6 +262,12 @@ export class DatabaseStorage implements IStorage {
     for (const sys of projectSystems) {
       db.delete(photos).where(eq(photos.systemId, sys.id)).run();
     }
+    // Delete elevation pins for elevations in this project
+    const projectElevations = db.select().from(elevations).where(eq(elevations.projectId, id)).all();
+    for (const elev of projectElevations) {
+      db.delete(elevationPins).where(eq(elevationPins.elevationId, elev.id)).run();
+    }
+    db.delete(elevations).where(eq(elevations.projectId, id)).run();
     db.delete(observations).where(eq(observations.projectId, id)).run();
     db.delete(recommendations).where(eq(recommendations.projectId, id)).run();
     db.delete(facadeSystems).where(eq(facadeSystems.projectId, id)).run();
@@ -272,9 +307,10 @@ export class DatabaseStorage implements IStorage {
     return db.update(observations).set(observation).where(eq(observations.id, id)).returning().get();
   }
   async deleteObservation(id: number): Promise<void> {
-    // Cascade: delete recommendations and photos for this observation
+    // Cascade: delete recommendations, photos, and elevation pins for this observation
     db.delete(recommendations).where(eq(recommendations.observationId, id)).run();
     db.delete(photos).where(eq(photos.observationId, id)).run();
+    db.delete(elevationPins).where(eq(elevationPins.observationId, id)).run();
     db.delete(observations).where(eq(observations.id, id)).run();
   }
 
@@ -343,6 +379,50 @@ export class DatabaseStorage implements IStorage {
       db.delete(photos).where(eq(photos.id, id)).run();
     }
     return photo;
+  }
+
+  // Elevations
+  async createElevation(data: InsertElevation): Promise<Elevation> {
+    return db.insert(elevations).values(data).returning().get();
+  }
+  async getElevation(id: number): Promise<Elevation | undefined> {
+    return db.select().from(elevations).where(eq(elevations.id, id)).get();
+  }
+  async getElevationsByProject(projectId: number): Promise<Elevation[]> {
+    return db.select().from(elevations).where(eq(elevations.projectId, projectId)).all();
+  }
+  async updateElevation(id: number, data: Partial<InsertElevation>): Promise<Elevation | undefined> {
+    return db.update(elevations).set(data).where(eq(elevations.id, id)).returning().get();
+  }
+  async deleteElevation(id: number): Promise<Elevation | undefined> {
+    const elevation = db.select().from(elevations).where(eq(elevations.id, id)).get();
+    if (!elevation) return undefined;
+    db.delete(elevationPins).where(eq(elevationPins.elevationId, id)).run();
+    db.delete(elevations).where(eq(elevations.id, id)).run();
+    return elevation;
+  }
+
+  // Elevation Pins
+  async createElevationPin(data: InsertElevationPin): Promise<ElevationPin> {
+    return db.insert(elevationPins).values(data).returning().get();
+  }
+  async getElevationPin(id: number): Promise<ElevationPin | undefined> {
+    return db.select().from(elevationPins).where(eq(elevationPins.id, id)).get();
+  }
+  async getPinsByElevation(elevationId: number): Promise<ElevationPin[]> {
+    return db.select().from(elevationPins).where(eq(elevationPins.elevationId, elevationId)).all();
+  }
+  async getPinByObservation(observationId: number): Promise<ElevationPin | undefined> {
+    return db.select().from(elevationPins).where(eq(elevationPins.observationId, observationId)).get();
+  }
+  async updateElevationPin(id: number, data: Partial<InsertElevationPin>): Promise<ElevationPin | undefined> {
+    return db.update(elevationPins).set(data).where(eq(elevationPins.id, id)).returning().get();
+  }
+  async deleteElevationPin(id: number): Promise<void> {
+    db.delete(elevationPins).where(eq(elevationPins.id, id)).run();
+  }
+  async deleteElevationPinByObservation(observationId: number): Promise<void> {
+    db.delete(elevationPins).where(eq(elevationPins.observationId, observationId)).run();
   }
 }
 

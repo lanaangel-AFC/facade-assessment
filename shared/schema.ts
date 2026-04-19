@@ -53,6 +53,31 @@ export const observations = sqliteTable("observations", {
   indicators: text("indicators").default("[]"), // JSON array of observed indicators
   aiNarrative: text("ai_narrative").default(""), // AI-generated detailed narrative
   sortOrder: integer("sort_order").default(0),
+  elevationId: integer("elevation_id"), // which elevation this observation is pinned on
+  createdAt: text("created_at").notNull(),
+});
+
+// Elevations (drawings / roof plans)
+export const elevations = sqliteTable("elevations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  name: text("name").notNull(),
+  type: text("type").notNull(), // "elevation" | "roof_plan"
+  filename: text("filename").notNull(),
+  originalFilename: text("original_filename").notNull(),
+  width: integer("width").default(0),
+  height: integer("height").default(0),
+  sortOrder: integer("sort_order").default(0),
+  createdAt: text("created_at").notNull(),
+});
+
+// Pins placed on elevation drawings linking observations to a location
+export const elevationPins = sqliteTable("elevation_pins", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  elevationId: integer("elevation_id").notNull(),
+  observationId: integer("observation_id").notNull(),
+  x: integer("x").notNull(), // percentage * 100 (0..10000)
+  y: integer("y").notNull(), // percentage * 100 (0..10000)
   createdAt: text("created_at").notNull(),
 });
 
@@ -113,6 +138,8 @@ export const insertFacadeSystemSchema = createInsertSchema(facadeSystems).omit({
 export const insertObservationSchema = createInsertSchema(observations).omit({ id: true });
 export const insertRecommendationSchema = createInsertSchema(recommendations).omit({ id: true });
 export const insertPhotoSchema = createInsertSchema(photos).omit({ id: true });
+export const insertElevationSchema = createInsertSchema(elevations).omit({ id: true });
+export const insertElevationPinSchema = createInsertSchema(elevationPins).omit({ id: true });
 export const insertSettingSchema = createInsertSchema(settings);
 export const insertTrainingDataSchema = createInsertSchema(aiTrainingData).omit({ id: true });
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
@@ -128,6 +155,10 @@ export type Recommendation = typeof recommendations.$inferSelect;
 export type InsertRecommendation = z.infer<typeof insertRecommendationSchema>;
 export type Photo = typeof photos.$inferSelect;
 export type InsertPhoto = z.infer<typeof insertPhotoSchema>;
+export type Elevation = typeof elevations.$inferSelect;
+export type InsertElevation = z.infer<typeof insertElevationSchema>;
+export type ElevationPin = typeof elevationPins.$inferSelect;
+export type InsertElevationPin = z.infer<typeof insertElevationPinSchema>;
 export type Setting = typeof settings.$inferSelect;
 export type InsertSetting = z.infer<typeof insertSettingSchema>;
 export type TrainingData = typeof aiTrainingData.$inferSelect;

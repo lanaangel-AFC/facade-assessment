@@ -13,7 +13,7 @@ import { DictationButton } from "@/components/DictationButton";
 import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2,
 } from "lucide-react";
-import type { FacadeSystem, Observation, Photo, Recommendation } from "@shared/schema";
+import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
@@ -129,6 +129,61 @@ export default function ObservationForm() {
   const { data: systems } = useQuery<FacadeSystem[]>({
     queryKey: [`/api/projects/${projectId}/systems`],
   });
+
+  // Elevations and existing pin
+  const { data: elevations } = useQuery<Elevation[]>({
+    queryKey: [`/api/projects/${projectId}/elevations`],
+  });
+  const { data: existingPin } = useQuery<ElevationPin | { pin: null }>({
+    queryKey: [`/api/observations/${obsIdParam}/pin`],
+    enabled: isEdit,
+  });
+  const [selectedElevationId, setSelectedElevationId] = useState<string>("");
+  const [pinPos, setPinPos] = useState<{ x: number; y: number } | null>(null);
+  const miniPreviewRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (existingPin && "id" in existingPin) {
+      setSelectedElevationId(String(existingPin.elevationId));
+      setPinPos({ x: existingPin.x, y: existingPin.y });
+    }
+  }, [existingPin]);
+
+  const savePin = async (elevationIdNum: number, x: number, y: number) => {
+    if (!obsIdParam) return;
+    try {
+      await apiRequest("PUT", `/api/observations/${obsIdParam}/pin`, {
+        elevationId: elevationIdNum, x, y,
+      });
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/pin`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/elevations/${elevationIdNum}/pins`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to save pin", variant: "destructive" });
+    }
+  };
+
+  const removePin = async () => {
+    if (!obsIdParam) return;
+    try {
+      await apiRequest("DELETE", `/api/observations/${obsIdParam}/pin`);
+      setPinPos(null);
+      setSelectedElevationId("");
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/pin`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to remove pin", variant: "destructive" });
+    }
+  };
+
+  const onPreviewClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!selectedElevationId || !miniPreviewRef.current) return;
+    const rect = miniPreviewRef.current.getBoundingClientRect();
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * 10000);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * 10000);
+    setPinPos({ x, y });
+    savePin(Number(selectedElevationId), x, y);
+  };
 
   // Fetch existing observation if editing
   const { data: existingObs } = useQuery<Observation>({
@@ -417,6 +472,83 @@ export default function ObservationForm() {
             required
           />
         </div>
+
+        {/* Location on Elevation */}
+        <Card className="p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-medium">Location on Elevation</h3>
+            {pinPos && selectedElevationId && (
+              <Button type="button" variant="outline" size="sm" onClick={removePin}>
+                <X className="w-3.5 h-3.5 mr-1" />
+                Remove Pin
+              </Button>
+            )}
+          </div>
+          {!isEdit ? (
+            <p className="text-xs text-muted-foreground">Save the observation first to place it on an elevation.</p>
+          ) : !elevations || elevations.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No elevation drawings uploaded yet.{" "}
+              <Link href={`/projects/${projectId}`}>
+                <span className="text-primary underline">Upload an elevation</span>
+              </Link>{" "}
+              to mark locations.
+            </p>
+          ) : (
+            <>
+              <div>
+                <Label>Elevation</Label>
+                <Select
+                  value={selectedElevationId}
+                  onValueChange={(val) => {
+                    setSelectedElevationId(val);
+                    // If already had a pin, move it to this elevation at existing position
+                    if (pinPos) savePin(Number(val), pinPos.x, pinPos.y);
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select an elevation drawing" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {elevations.map((e) => (
+                      <SelectItem key={e.id} value={String(e.id)}>
+                        {e.name} ({e.type === "roof_plan" ? "Roof Plan" : "Elevation"})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {selectedElevationId && (
+                <div
+                  ref={miniPreviewRef}
+                  className="relative w-full bg-muted/30 border rounded-md overflow-hidden cursor-crosshair"
+                  style={{ aspectRatio: "16 / 9" }}
+                  onClick={onPreviewClick}
+                >
+                  <img
+                    src={`${API_BASE}/api/elevations/${selectedElevationId}/image`}
+                    alt="Elevation preview"
+                    className="w-full h-full object-contain pointer-events-none"
+                    draggable={false}
+                  />
+                  {pinPos && (
+                    <div
+                      className="absolute w-6 h-6 -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500 border-2 border-white shadow-md pointer-events-none flex items-center justify-center"
+                      style={{ left: `${pinPos.x / 100}%`, top: `${pinPos.y / 100}%` }}
+                    >
+                      <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                    </div>
+                  )}
+                </div>
+              )}
+              {selectedElevationId && (
+                <p className="text-xs text-muted-foreground">
+                  {pinPos ? "Tap the preview to move the pin." : "Tap the preview to drop a pin at the observation location."}
+                </p>
+              )}
+            </>
+          )}
+        </Card>
 
         {/* Defect Category */}
         <div>
