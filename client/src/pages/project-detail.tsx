@@ -152,6 +152,8 @@ export default function ProjectDetail() {
   const [inspectionDates, setInspectionDates] = useState<string[]>([]);
   const [limitations, setLimitations] = useState<string[]>([]);
   const [backgroundDocs, setBackgroundDocs] = useState<{ title: string; author: string; date: string }[]>([]);
+  const [projectElevations, setProjectElevations] = useState<string[]>([]);
+  const [newElevationLabel, setNewElevationLabel] = useState("");
   const saveTimer = useRef<NodeJS.Timeout | null>(null);
   const [aiSummaryLoading, setAiSummaryLoading] = useState(false);
   const [originalAiSummary, setOriginalAiSummary] = useState<string | null>(null);
@@ -162,6 +164,10 @@ export default function ProjectDetail() {
       try { setInspectionDates(JSON.parse(project.inspectionDates || "[]")); } catch { setInspectionDates([]); }
       try { setLimitations(JSON.parse(project.limitations || "[]")); } catch { setLimitations([]); }
       try { setBackgroundDocs(JSON.parse(project.backgroundDocs || "[]")); } catch { setBackgroundDocs([]); }
+      try {
+        const elev = JSON.parse(project.projectElevations || "[]");
+        setProjectElevations(elev.length > 0 ? elev : ["North", "East", "South", "West", "Roof"]);
+      } catch { setProjectElevations(["North", "East", "South", "West", "Roof"]); }
     }
   }, [project]);
 
@@ -201,6 +207,11 @@ export default function ProjectDetail() {
   const saveDocs = (docs: { title: string; author: string; date: string }[]) => {
     setBackgroundDocs(docs);
     autoSave({ backgroundDocs: JSON.stringify(docs) } as any);
+  };
+
+  const saveProjectElevations = (elevs: string[]) => {
+    setProjectElevations(elevs);
+    autoSave({ projectElevations: JSON.stringify(elevs) } as any);
   };
 
   const deleteSystemMutation = useMutation({
@@ -512,6 +523,60 @@ export default function ProjectDetail() {
                   rows={2}
                   placeholder="Scope of facade inspection..."
                 />
+              </div>
+            </Card>
+
+            {/* Building Elevations */}
+            <Card className="p-4 space-y-3">
+              <h3 className="text-sm font-medium">Building Elevations</h3>
+              <p className="text-xs text-muted-foreground">Define which elevations/areas apply to this building. These appear in observation forms.</p>
+              <div className="flex flex-wrap gap-2">
+                {projectElevations.map((elev, idx) => (
+                  <div key={idx} className="flex items-center gap-1 bg-accent/40 border rounded-full pl-3 pr-1 py-1 text-sm">
+                    <span>{elev}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5 rounded-full hover:bg-destructive/20"
+                      onClick={() => saveProjectElevations(projectElevations.filter((_, i) => i !== idx))}
+                    >
+                      <X className="w-3 h-3" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  value={newElevationLabel}
+                  onChange={e => setNewElevationLabel(e.target.value)}
+                  placeholder="e.g. Northeast, Podium, Area 1..."
+                  className="max-w-[250px]"
+                  onKeyDown={e => {
+                    if (e.key === "Enter" && newElevationLabel.trim()) {
+                      e.preventDefault();
+                      if (!projectElevations.includes(newElevationLabel.trim())) {
+                        saveProjectElevations([...projectElevations, newElevationLabel.trim()]);
+                      }
+                      setNewElevationLabel("");
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={!newElevationLabel.trim()}
+                  onClick={() => {
+                    if (newElevationLabel.trim() && !projectElevations.includes(newElevationLabel.trim())) {
+                      saveProjectElevations([...projectElevations, newElevationLabel.trim()]);
+                    }
+                    setNewElevationLabel("");
+                  }}
+                >
+                  <Plus className="w-4 h-4 mr-1" />
+                  Add
+                </Button>
               </div>
             </Card>
 

@@ -22,6 +22,7 @@ export const projects = sqliteTable("projects", {
   executiveSummary: text("executive_summary").default(""),
   inspectionStatus: text("inspection_status").default("in_progress"),
   observationGrouping: text("observation_grouping").default(""),
+  projectElevations: text("project_elevations").default("[]"), // JSON array of elevation label strings for this building
   createdAt: text("created_at").notNull(),
 });
 

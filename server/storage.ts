@@ -176,6 +176,7 @@ try { sqlite.exec(`ALTER TABLE observations ADD COLUMN grid_level TEXT DEFAULT '
 // Feature 2: inspection status + observation grouping
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN inspection_status TEXT DEFAULT 'in_progress'`); } catch {}
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN observation_grouping TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN project_elevations TEXT DEFAULT '[]'`); } catch {}
 try { sqlite.exec(`ALTER TABLE observations ADD COLUMN group_id INTEGER DEFAULT NULL`); } catch {}
 
 export const db = drizzle(sqlite);

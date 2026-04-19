@@ -13,7 +13,7 @@ import { DictationButton } from "@/components/DictationButton";
 import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2,
 } from "lucide-react";
-import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin } from "@shared/schema";
+import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin, Project } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
@@ -131,6 +131,14 @@ export default function ObservationForm() {
   const [editingRecId, setEditingRecId] = useState<number | null>(null);
 
   // Fetch systems for this project
+  const { data: projectData } = useQuery<Project>({
+    queryKey: ["/api/projects", projectId],
+    queryFn: async () => {
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}`);
+      return res.json();
+    },
+  });
+
   const { data: systems } = useQuery<FacadeSystem[]>({
     queryKey: [`/api/projects/${projectId}/systems`],
   });
@@ -522,16 +530,17 @@ export default function ObservationForm() {
                   <SelectValue placeholder="Select" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="North">North</SelectItem>
-                  <SelectItem value="East">East</SelectItem>
-                  <SelectItem value="South">South</SelectItem>
-                  <SelectItem value="West">West</SelectItem>
-                  <SelectItem value="Roof">Roof</SelectItem>
-                  {(elevations || [])
-                    .filter(e => !["North","East","South","West","Roof"].includes(e.name))
-                    .map(e => (
-                      <SelectItem key={e.id} value={e.name}>{e.name}</SelectItem>
-                    ))}
+                  {(() => {
+                    let labels: string[] = [];
+                    try { labels = JSON.parse(projectData?.projectElevations || "[]"); } catch {}
+                    if (!labels.length) labels = ["North", "East", "South", "West", "Roof"];
+                    // Also add any uploaded elevation drawing names not already in the list
+                    const drawingNames = (elevations || []).map(e => e.name).filter(n => !labels.includes(n));
+                    const all = [...labels, ...drawingNames];
+                    return all.map(label => (
+                      <SelectItem key={label} value={label}>{label}</SelectItem>
+                    ));
+                  })()}
                 </SelectContent>
               </Select>
             </div>
