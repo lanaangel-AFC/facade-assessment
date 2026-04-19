@@ -114,18 +114,33 @@ Estimated Age: ${system.estimatedAge || "Not specified"}
 Related Systems: ${system.relatedSystems || "None noted"}
   `.trim();
 
+  // Fetch system photos for vision analysis
+  const uploadDir = path.join(dataDir, "uploads");
+  const systemPhotos = await storage.getPhotosBySystem(systemId);
+  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  for (const photo of systemPhotos) {
+    const filePath = path.join(uploadDir, photo.filename);
+    if (!fs.existsSync(filePath)) continue;
+    try {
+      const imageData = fs.readFileSync(filePath);
+      const base64 = imageData.toString("base64");
+      const ext = path.extname(photo.filename).toLowerCase();
+      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      imageParts.push({
+        type: "image_url",
+        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
+      });
+    } catch {}
+  }
+
   const trainingExamples = await getTrainingExamples("system_description");
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+  const hasPhotos = imageParts.length > 0;
+  const systemPrompt = `You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
 STYLE RULES:
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
-- Be concise. Only elaborate on the information provided — do not invent details.
+- Be concise. Elaborate on the information provided by the user, and${hasPhotos ? " use the photos to identify additional details about the system (glazing type, retention method, frame finish, cladding material, jointing, etc.)." : " do not invent details not supported by the data."}
 - Use Australian facade engineering terminology.
 
 FORMAT — follow this exact structure:
@@ -152,15 +167,22 @@ b. Floor to ceiling glazing assembly comprising three panels: spandrel/vision/sp
    iii. Vision panes are insulated glazing units (IGUs).
 c. Frames are aluminium with a powdercoated finish.
 
-Keep it to 3-6 lettered items. Only include information that was provided or can be directly inferred from the system data. Do not add boilerplate about standards compliance or expected performance.
-Return ONLY the description text.${trainingExamples}`,
-      },
-      {
-        role: "user",
-        content: `Generate a facade system description based on these details:\n\n${context}`,
-      },
+Keep it to 3-6 lettered items.${hasPhotos ? " Use the photos to supplement the user-provided data — identify visible details like glass type, retention method, frame colour/material, joint types, cladding profiles, etc. that the user may not have noted." : ""} Do not add boilerplate about standards compliance or expected performance.
+Return ONLY the description text.${trainingExamples}`;
+
+  // Build the user message content with text and optional photos
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    { type: "text", text: `Generate a facade system description based on these details:\n\n${context}${hasPhotos ? "\n\nPhotos of this facade system are attached. Use them to identify additional details not covered in the text above." : ""}` },
+    ...imageParts,
+  ];
+
+  const response = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
     ],
-    max_tokens: 400,
+    max_tokens: 600,
     temperature: 0.3,
   });
 
