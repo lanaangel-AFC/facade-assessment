@@ -75,16 +75,20 @@ const elevationUpload = multer({
   },
 });
 
-function getImageDimensions(filePath: string): { width: number; height: number } {
+async function getImageDimensions(filePath: string): Promise<{ width: number; height: number }> {
+  // Try sharp first (always available), fall back to identify
+  try {
+    const metadata = await sharp(filePath).metadata();
+    if (metadata.width && metadata.height) {
+      return { width: metadata.width, height: metadata.height };
+    }
+  } catch {}
   try {
     const out = execSync(`identify -format "%w %h" ${JSON.stringify(filePath)}`).toString().trim();
     const [w, h] = out.split(/\s+/).map(Number);
-    if (!Number.isFinite(w) || !Number.isFinite(h)) return { width: 0, height: 0 };
-    return { width: w, height: h };
-  } catch (e) {
-    console.warn("identify failed for", filePath, e);
-    return { width: 0, height: 0 };
-  }
+    if (Number.isFinite(w) && Number.isFinite(h)) return { width: w, height: h };
+  } catch {}
+  return { width: 0, height: 0 };
 }
 
 const upload = multer({
@@ -415,7 +419,7 @@ export async function registerRoutes(
       }
 
       const fullPath = path.join(elevationDir, storedFilename);
-      const { width, height } = getImageDimensions(fullPath);
+      const { width, height } = await getImageDimensions(fullPath);
 
       const elevation = await storage.createElevation({
         projectId,
