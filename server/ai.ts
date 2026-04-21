@@ -189,7 +189,7 @@ Return ONLY the description text.${trainingExamples}`;
   return response.choices[0]?.message?.content?.trim() || "";
 }
 
-export async function generateObservationNarrative(observationId: number): Promise<string> {
+export async function generateObservationNarrative(observationId: number, existingNarrative: string = ""): Promise<string> {
   const client = await getClient();
   const observation = await storage.getObservation(observationId);
   if (!observation) throw new Error("Observation not found.");
@@ -218,21 +218,39 @@ Field Note: ${observation.fieldNote || "None"}
 Indicators Observed: ${indicators.join(", ") || "None specified"}
   `.trim();
 
+  // Fetch observation photos for vision analysis
+  const uploadDir = path.join(dataDir, "uploads");
+  const obsPhotos = await storage.getPhotosByObservation(observationId);
+  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  for (const photo of obsPhotos) {
+    const filePath = path.join(uploadDir, photo.filename);
+    if (!fs.existsSync(filePath)) continue;
+    try {
+      const imageData = fs.readFileSync(filePath);
+      const base64 = imageData.toString("base64");
+      const ext = path.extname(photo.filename).toLowerCase();
+      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      imageParts.push({
+        type: "image_url",
+        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
+      });
+    } catch {}
+  }
+
+  const hasPhotos = imageParts.length > 0;
+  const hasExisting = existingNarrative.trim().length > 0;
+
   const trainingExamples = await getTrainingExamples("observation_narrative");
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
 STYLE RULES:
-- Be concise. Only elaborate on the information provided in the field data.
 - Use numbered points with lettered sub-items (a, b, c) for details.
-- State what was observed, the likely cause, and the implication — nothing more.
-- Do not pad with generic information about standards or typical design life unless directly relevant to the defect.
+- State what was observed, the likely cause, and the implication.
+- Use your expertise as a facade engineer to provide professional analysis: explain WHY defects occur, what mechanisms are at play (e.g. UV degradation, thermal cycling, moisture ingress), and what the consequences are if unaddressed.
 - Use Australian facade engineering terminology.
+${hasPhotos ? "- Analyse the attached photos to identify visible defects, their severity, and any additional details not captured in the field notes (e.g. extent of cracking, staining patterns, gasket condition, sealant failure mode)." : ""}
+${hasExisting ? "- The user has written an existing narrative. Incorporate their observations and commentary into the output — preserve their specific details, measurements, and wording where appropriate, while enriching with your technical analysis." : ""}
 
 FORMAT — follow this structure:
 Start with a brief opening line about the system condition, then numbered observations:
@@ -261,22 +279,36 @@ ANOTHER EXAMPLE:
    c. If left unaddressed, the gaps may result in air and water leaks.
    d. There is an unlikely, though non-zero chance that the glass may become disengaged entirely and fall from the building.
 
-Keep it short — typically 30-120 words. Only describe what was found and its significance.
-Return ONLY the narrative text.${trainingExamples}`,
-      },
-      {
-        role: "user",
-        content: `Generate an observation narrative based on these field data:\n\n${context}`,
-      },
+Return ONLY the narrative text.${trainingExamples}`;
+
+  // Build user message with text, optional existing narrative, and optional photos
+  let userText = `Generate an observation narrative based on these field data:\n\n${context}`;
+  if (hasExisting) {
+    userText += `\n\nExisting narrative written by the inspector (incorporate and build upon this):\n${existingNarrative.trim()}`;
+  }
+  if (hasPhotos) {
+    userText += `\n\nPhotos of the defect are attached. Analyse them to identify additional visible details about the defect condition, extent, and severity.`;
+  }
+
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    { type: "text", text: userText },
+    ...imageParts,
+  ];
+
+  const response = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
     ],
-    max_tokens: 400,
+    max_tokens: 800,
     temperature: 0.3,
   });
 
   return response.choices[0]?.message?.content?.trim() || "";
 }
 
-export async function generateRecommendation(observationId: number): Promise<{
+export async function generateRecommendation(observationId: number, conservativeness: string = "medium"): Promise<{
   action: string;
   timeframe: string;
   category: string;
@@ -320,17 +352,32 @@ Indicators: ${indicators.join(", ") || "None specified"}
         role: "system",
         content: `You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 
+CONSERVATIVENESS LEVEL: ${conservativeness.toUpperCase()}
+${conservativeness === "high" ? `HIGH conservativeness:
+- Recommend comprehensive repairs, full replacement where appropriate
+- Aim for "near new" outcome and long-term longevity (10-25 years)
+- Include invasive investigation/probing (IBP) where warranted
+- Higher budget expectations, thorough remedial approach
+- Timeframes should reflect urgency — prefer "Immediate" or "3 months" for Essential items
+- Example: "Strip and replace all sealant joints to the full curtain wall system. All sealant to be Class 20-25LM silicone. Independent hold-point inspection required."
+- Example: "Remove and replace full membrane system. Introduce falls (min 1:80) and re-level all drains. IBP to 10% of area to confirm substrate condition prior to specification."` : conservativeness === "low" ? `LOW conservativeness:
+- Recommend temporary repairs, maintenance-level fixes
+- Short-term longevity expected (1-2 years), treating symptoms rather than root cause
+- Minimal invasiveness, lowest practical cost
+- Timeframes can be more relaxed — "1 year" to "2 years" unless safety-critical
+- Example: "Apply sealant patch repair to failed joints as a temporary measure. Monitor for recurrence."
+- Example: "Clean and re-seal affected areas. Localised repair only — no full system replacement at this stage."` : `MEDIUM conservativeness:
+- Moderate repair approach, balancing cost with 3-5 year longevity
+- Targeted replacement of failed elements without full system overhaul
+- Moderate invasiveness
+- Example: "Replace all external PU with new sealant. Compatibility with glazing weather seals must be considered."
+- Example: "Identify and repair all developing spalls and failing repair patches. Technical specification by remedial engineer to suit concrete characteristics."`}
+
 STYLE RULES:
 - The "action" field should be concise and direct — what needs to be done, in 1-3 sentences max.
 - Do not pad with generic advice. Be specific to the defect described.
+- Scale the scope, budget, and timeframe to match the conservativeness level above.
 - Use Australian facade engineering terminology.
-
-EXAMPLES of good action text:
-- "Replace all external PU with new sealant. Compatibility with glazing weather seals must be considered."
-- "Identify and repair all developing spalls and failing repair patches. Technical specification by remedial engineer to suit concrete characteristics."
-- "Install steel plates in areas of high wear. Repair the BMU slab surface in all other areas."
-- "Replace existing membrane system with new. Introduce falls (min 1:100) and re-level drains as part of the process."
-- "Carry out urgent stabilisation (repositioning) works to the 7 glass spandrels."
 
 Timeframe options: "Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"
 Category options: "Essential", "Desirable", "Monitor"

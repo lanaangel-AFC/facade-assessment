@@ -613,9 +613,9 @@ export async function registerRoutes(
 
   app.post("/api/ai/generate-observation-narrative", async (req, res) => {
     try {
-      const { observationId } = req.body;
+      const { observationId, existingNarrative } = req.body;
       if (!observationId) return res.status(400).json({ message: "observationId is required" });
-      const narrative = await generateObservationNarrative(Number(observationId));
+      const narrative = await generateObservationNarrative(Number(observationId), existingNarrative || "");
       res.json({ narrative });
     } catch (err: any) {
       const status = err.message?.includes("API key") ? 400 : 500;
@@ -625,9 +625,9 @@ export async function registerRoutes(
 
   app.post("/api/ai/generate-recommendation", async (req, res) => {
     try {
-      const { observationId } = req.body;
+      const { observationId, conservativeness } = req.body;
       if (!observationId) return res.status(400).json({ message: "observationId is required" });
-      const result = await generateRecommendation(Number(observationId));
+      const result = await generateRecommendation(Number(observationId), conservativeness || "medium");
       res.json(result);
     } catch (err: any) {
       const status = err.message?.includes("API key") ? 400 : 500;

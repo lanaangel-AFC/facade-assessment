@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { DictationButton } from "@/components/DictationButton";
 import {
@@ -116,6 +117,7 @@ export default function ObservationForm() {
   const [uploading, setUploading] = useState<string | null>(null);
   const [aiNarrativeLoading, setAiNarrativeLoading] = useState(false);
   const [aiRecLoading, setAiRecLoading] = useState(false);
+  const [showConservativenessDialog, setShowConservativenessDialog] = useState(false);
   const [originalAiNarrative, setOriginalAiNarrative] = useState<string | null>(null);
 
   // Recommendations state
@@ -709,8 +711,20 @@ export default function ObservationForm() {
             id="fieldNote"
             placeholder="Brief description of what was observed..."
             value={form.fieldNote}
-            onChange={set("fieldNote")}
-            rows={3}
+            onChange={(e) => {
+              set("fieldNote")(e);
+              // Auto-expand: reset height then set to scrollHeight
+              e.target.style.height = "auto";
+              e.target.style.height = e.target.scrollHeight + "px";
+            }}
+            rows={2}
+            className="min-h-[60px] overflow-hidden resize-none"
+            ref={(el) => {
+              // Auto-expand on initial render if there's existing content
+              if (el && el.scrollHeight > el.clientHeight) {
+                el.style.height = el.scrollHeight + "px";
+              }
+            }}
           />
         </div>
 
@@ -884,7 +898,10 @@ export default function ObservationForm() {
                 onClick={async () => {
                   setAiNarrativeLoading(true);
                   try {
-                    const res = await aiRequest("/api/ai/generate-observation-narrative", { observationId: Number(obsIdParam) });
+                    const res = await aiRequest("/api/ai/generate-observation-narrative", {
+                      observationId: Number(obsIdParam),
+                      existingNarrative: form.aiNarrative || "",
+                    });
                     const data = await res.json();
                     setForm(prev => ({ ...prev, aiNarrative: data.narrative }));
                     setOriginalAiNarrative(data.narrative);
@@ -935,27 +952,7 @@ export default function ObservationForm() {
                 variant="outline"
                 size="sm"
                 disabled={aiRecLoading}
-                onClick={async () => {
-                  setAiRecLoading(true);
-                  try {
-                    const res = await aiRequest("/api/ai/generate-recommendation", { observationId: Number(obsIdParam) });
-                    const data = await res.json();
-                    setEditingRecId(null);
-                    setRecForm({
-                      action: data.action || "",
-                      timeframe: data.timeframe || "",
-                      category: data.category || "",
-                      budgetEstimate: data.budgetEstimate || "",
-                      budgetBasis: data.budgetBasis || "",
-                    });
-                    setShowRecForm(true);
-                    toast({ title: "Recommendation generated — review and save" });
-                  } catch (err: any) {
-                    toast({ title: err.message || "Recommendation generation failed", variant: "destructive" });
-                  } finally {
-                    setAiRecLoading(false);
-                  }
-                }}
+                onClick={() => setShowConservativenessDialog(true)}
               >
                 {aiRecLoading ? (
                   <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
@@ -1117,6 +1114,57 @@ export default function ObservationForm() {
           )}
         </div>
       )}
+
+      {/* Conservativeness Level Dialog */}
+      <Dialog open={showConservativenessDialog} onOpenChange={setShowConservativenessDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Recommendation Approach</DialogTitle>
+            <DialogDescription>Select the level of conservativeness for this recommendation.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 mt-2">
+            {[
+              { value: "high", label: "High", desc: "Comprehensive repairs, IBP, high invasiveness, aiming for near-new outcome, 10-25 year longevity" },
+              { value: "medium", label: "Medium", desc: "Moderate repair approach, targeted replacement, 3-5 year longevity" },
+              { value: "low", label: "Low", desc: "Temporary repair, maintenance item, minimal invasiveness, 1-2 year longevity" },
+            ].map(opt => (
+              <button
+                key={opt.value}
+                type="button"
+                className="w-full text-left p-3 rounded-lg border hover:border-primary hover:bg-accent/30 transition-colors"
+                onClick={async () => {
+                  setShowConservativenessDialog(false);
+                  setAiRecLoading(true);
+                  try {
+                    const res = await aiRequest("/api/ai/generate-recommendation", {
+                      observationId: Number(obsIdParam),
+                      conservativeness: opt.value,
+                    });
+                    const data = await res.json();
+                    setEditingRecId(null);
+                    setRecForm({
+                      action: data.action || "",
+                      timeframe: data.timeframe || "",
+                      category: data.category || "",
+                      budgetEstimate: data.budgetEstimate || "",
+                      budgetBasis: data.budgetBasis || "",
+                    });
+                    setShowRecForm(true);
+                    toast({ title: `Recommendation generated (${opt.label} conservativeness) — review and save` });
+                  } catch (err: any) {
+                    toast({ title: err.message || "Recommendation generation failed", variant: "destructive" });
+                  } finally {
+                    setAiRecLoading(false);
+                  }
+                }}
+              >
+                <div className="font-medium text-sm">{opt.label}</div>
+                <div className="text-xs text-muted-foreground mt-0.5">{opt.desc}</div>
+              </button>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
