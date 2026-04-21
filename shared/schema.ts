@@ -23,6 +23,18 @@ export const projects = sqliteTable("projects", {
   inspectionStatus: text("inspection_status").default("in_progress"),
   observationGrouping: text("observation_grouping").default(""),
   projectElevations: text("project_elevations").default("[]"), // JSON array of elevation label strings for this building
+  roofPlanImagePath: text("roof_plan_image_path").default(""),
+  roofPlanOriginalName: text("roof_plan_original_name").default(""),
+  createdAt: text("created_at").notNull(),
+});
+
+// Drops placed on the project roof plan (purely visual markers, not linked to observations)
+export const drops = sqliteTable("drops", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  dropNumber: text("drop_number").notNull(),
+  x: integer("x").notNull(), // percentage * 100 (0..10000)
+  y: integer("y").notNull(), // percentage * 100 (0..10000)
   createdAt: text("created_at").notNull(),
 });
 
@@ -171,6 +183,7 @@ export const insertTrainingDataSchema = createInsertSchema(aiTrainingData).omit(
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
 export const insertObservationGroupSchema = createInsertSchema(observationGroups).omit({ id: true });
 export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
+export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 
 // Types
 export type Project = typeof projects.$inferSelect;
@@ -197,3 +210,5 @@ export type ObservationGroup = typeof observationGroups.$inferSelect;
 export type InsertObservationGroup = z.infer<typeof insertObservationGroupSchema>;
 export type CustomIndicator = typeof customIndicators.$inferSelect;
 export type InsertCustomIndicator = z.infer<typeof insertCustomIndicatorSchema>;
+export type Drop = typeof drops.$inferSelect;
+export type InsertDrop = z.infer<typeof insertDropSchema>;

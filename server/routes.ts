@@ -59,6 +59,28 @@ if (!fs.existsSync(elevationDir)) {
   fs.mkdirSync(elevationDir, { recursive: true });
 }
 
+const roofPlanDir = path.join(uploadDir, "roofplans");
+if (!fs.existsSync(roofPlanDir)) {
+  fs.mkdirSync(roofPlanDir, { recursive: true });
+}
+
+const roofPlanUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, roofPlanDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const name = `${crypto.randomUUID()}${ext}`;
+      cb(null, name);
+    },
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = file.mimetype.startsWith("image/") || file.mimetype === "application/pdf";
+    if (ok) cb(null, true);
+    else cb(new Error("Only image or PDF files are allowed"));
+  },
+});
+
 const elevationUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, elevationDir),
@@ -563,6 +585,122 @@ export async function registerRoutes(
     const observationId = Number(req.params.id);
     await storage.deleteElevationPinByObservation(observationId);
     await storage.updateObservation(observationId, { elevationId: null } as any);
+    res.status(204).end();
+  });
+
+  // === ROOF PLAN ===
+  // Serve roof plan image
+  app.get("/api/projects/:projectId/roof-plan/image", async (req, res) => {
+    const project = await storage.getProject(Number(req.params.projectId));
+    if (!project || !project.roofPlanImagePath) {
+      return res.status(404).json({ message: "Roof plan not found" });
+    }
+    const filename = path.basename(project.roofPlanImagePath);
+    const filePath = path.join(roofPlanDir, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ message: "Image file not found" });
+    res.sendFile(filePath);
+  });
+
+  app.post("/api/projects/:projectId/roof-plan", roofPlanUpload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+      const projectId = Number(req.params.projectId);
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const originalFilename = req.file.originalname;
+      let storedFilename = req.file.filename;
+      const isPdf = req.file.mimetype === "application/pdf" || path.extname(originalFilename).toLowerCase() === ".pdf";
+
+      if (isPdf) {
+        const pdfPath = path.join(roofPlanDir, storedFilename);
+        const outBase = crypto.randomUUID();
+        const outPrefix = path.join(roofPlanDir, outBase);
+        try {
+          execSync(`pdftoppm -png -r 200 -singlefile ${JSON.stringify(pdfPath)} ${JSON.stringify(outPrefix)}`);
+          const pngPath = `${outPrefix}.png`;
+          if (!fs.existsSync(pngPath)) {
+            return res.status(500).json({ message: "PDF conversion produced no image" });
+          }
+          try { fs.unlinkSync(pdfPath); } catch {}
+          storedFilename = `${outBase}.png`;
+        } catch (err: any) {
+          console.error("pdftoppm failed:", err);
+          return res.status(500).json({ message: "Failed to convert PDF" });
+        }
+      }
+
+      // If project already had a roof plan, delete the old file
+      if (project.roofPlanImagePath) {
+        const oldFilename = path.basename(project.roofPlanImagePath);
+        const oldFilePath = path.join(roofPlanDir, oldFilename);
+        if (fs.existsSync(oldFilePath)) {
+          try { fs.unlinkSync(oldFilePath); } catch {}
+        }
+      }
+
+      const imagePath = `/uploads/roofplans/${storedFilename}`;
+      const updated = await storage.updateProjectRoofPlan(projectId, imagePath, originalFilename);
+      res.status(201).json(updated);
+    } catch (err: any) {
+      console.error("Roof plan upload error:", err);
+      res.status(500).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  app.delete("/api/projects/:projectId/roof-plan", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const project = await storage.getProject(projectId);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+
+    if (project.roofPlanImagePath) {
+      const filename = path.basename(project.roofPlanImagePath);
+      const filePath = path.join(roofPlanDir, filename);
+      if (fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch {}
+      }
+    }
+    await storage.deleteDropsByProject(projectId);
+    const updated = await storage.clearProjectRoofPlan(projectId);
+    res.json(updated);
+  });
+
+  // === DROPS ===
+  app.get("/api/projects/:projectId/drops", async (req, res) => {
+    const drops = await storage.getDropsByProject(Number(req.params.projectId));
+    drops.sort((a, b) => a.id - b.id);
+    res.json(drops);
+  });
+
+  app.post("/api/projects/:projectId/drops", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const { dropNumber, x, y } = req.body;
+    if (!dropNumber || x === undefined || y === undefined) {
+      return res.status(400).json({ message: "dropNumber, x, y required" });
+    }
+    const drop = await storage.createDrop({
+      projectId,
+      dropNumber: String(dropNumber),
+      x: Number(x),
+      y: Number(y),
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(drop);
+  });
+
+  app.patch("/api/drops/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    const patch: any = {};
+    if (req.body.dropNumber !== undefined) patch.dropNumber = String(req.body.dropNumber);
+    if (req.body.x !== undefined) patch.x = Number(req.body.x);
+    if (req.body.y !== undefined) patch.y = Number(req.body.y);
+    const drop = await storage.updateDrop(id, patch);
+    if (!drop) return res.status(404).json({ message: "Drop not found" });
+    res.json(drop);
+  });
+
+  app.delete("/api/drops/:id", async (req, res) => {
+    await storage.deleteDrop(Number(req.params.id));
     res.status(204).end();
   });
 
@@ -1568,6 +1706,101 @@ export async function registerRoutes(
                   new TextRun({ text: `${obs.defectCategory} — ${obs.location} (${obs.severity})`, font: "Arial", size: 20, color: MUTED }),
                 ],
                 spacing: { after: 40 },
+              }));
+            }
+          }
+        }
+      }
+
+      // 3.4 Roof Plan and Drop Locations
+      if (project.roofPlanImagePath) {
+        const roofPlanFilename = path.basename(project.roofPlanImagePath);
+        const roofPlanPath = path.join(roofPlanDir, roofPlanFilename);
+        const projectDrops = await storage.getDropsByProject(projectId);
+        projectDrops.sort((a, b) => a.id - b.id);
+
+        if (fs.existsSync(roofPlanPath)) {
+          siteChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: "3.4 Roof Plan and Drop Locations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            spacing: { before: 300, after: 150 },
+          }));
+
+          let annotatedBuffer: Buffer | null = null;
+          let W = 1600;
+          let H = 1200;
+
+          try {
+            const baseImg = sharp(roofPlanPath);
+            const meta = await baseImg.metadata();
+            W = meta.width || 1600;
+            H = meta.height || 1200;
+
+            const markerRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
+            const svgMarkers = projectDrops.map((drop) => {
+              const cx = Math.round((drop.x / 10000) * W);
+              const cy = Math.round((drop.y / 10000) * H);
+              const label = (drop.dropNumber || "").replace(/[<>&"']/g, "");
+              const fontSize = Math.round(markerRadius * 0.7);
+              return `
+                <circle cx="${cx}" cy="${cy}" r="${markerRadius}" fill="#00B5B8" stroke="white" stroke-width="3" />
+                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
+              `;
+            }).join("");
+
+            const svgOverlay = Buffer.from(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgMarkers}</svg>`
+            );
+
+            annotatedBuffer = await baseImg
+              .composite([{ input: svgOverlay, top: 0, left: 0 }])
+              .png()
+              .toBuffer();
+          } catch (err) {
+            console.warn("Failed to annotate roof plan", err);
+            try {
+              annotatedBuffer = fs.readFileSync(roofPlanPath);
+            } catch {}
+          }
+
+          if (annotatedBuffer) {
+            siteChildren.push(new Paragraph({
+              heading: HeadingLevel.HEADING_3,
+              children: [new TextRun({ text: `Figure ${figureCounter.n} – Roof Plan with Drop Locations`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+              spacing: { before: 200, after: 100 },
+            }));
+            figureCounter.n++;
+
+            const targetWidth = 500;
+            const aspect = H && W ? H / W : 0.75;
+            const targetHeight = Math.round(targetWidth * aspect);
+
+            siteChildren.push(new Paragraph({
+              children: [
+                new ImageRun({
+                  data: annotatedBuffer,
+                  transformation: { width: targetWidth, height: targetHeight },
+                  type: "png",
+                  altText: { title: "Roof Plan", description: "Roof plan with drop locations", name: roofPlanFilename },
+                }),
+              ],
+              spacing: { after: 200 },
+            }));
+
+            if (projectDrops.length > 0) {
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: `${projectDrops.length} drop${projectDrops.length === 1 ? "" : "s"} annotated:`, font: "Arial", size: 20, italics: true, color: MUTED })],
+                spacing: { after: 60 },
+              }));
+              const dropLabels = projectDrops.map(d => d.dropNumber).join(", ");
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: dropLabels, font: "Arial", size: 20, color: DARK_GRAY })],
+                spacing: { after: 150 },
+              }));
+            } else {
+              siteChildren.push(new Paragraph({
+                children: [new TextRun({ text: "No drops annotated on the roof plan.", font: "Arial", size: 20, italics: true, color: MUTED })],
+                spacing: { after: 150 },
               }));
             }
           }

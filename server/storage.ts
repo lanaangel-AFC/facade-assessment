@@ -11,6 +11,7 @@ import {
   type ElevationPin, type InsertElevationPin, elevationPins,
   type ObservationGroup, type InsertObservationGroup, observationGroups,
   type CustomIndicator, type InsertCustomIndicator, customIndicators,
+  type Drop, type InsertDrop, drops,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -152,6 +153,14 @@ sqlite.exec(`
     name TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS drops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    drop_number TEXT NOT NULL,
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Add executive_summary column to projects if it doesn't exist
@@ -178,6 +187,10 @@ try { sqlite.exec(`ALTER TABLE projects ADD COLUMN inspection_status TEXT DEFAUL
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN observation_grouping TEXT DEFAULT ''`); } catch {}
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN project_elevations TEXT DEFAULT '[]'`); } catch {}
 try { sqlite.exec(`ALTER TABLE observations ADD COLUMN group_id INTEGER DEFAULT NULL`); } catch {}
+
+// Roof plan feature columns on projects
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_image_path TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_original_name TEXT DEFAULT ''`); } catch {}
 
 export const db = drizzle(sqlite);
 export { dataDir };
@@ -299,6 +312,7 @@ export class DatabaseStorage implements IStorage {
     db.delete(observations).where(eq(observations.projectId, id)).run();
     db.delete(recommendations).where(eq(recommendations.projectId, id)).run();
     db.delete(facadeSystems).where(eq(facadeSystems.projectId, id)).run();
+    db.delete(drops).where(eq(drops.projectId, id)).run();
     db.delete(projects).where(eq(projects.id, id)).run();
   }
 
@@ -482,6 +496,42 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteCustomIndicator(id: number): Promise<void> {
     db.delete(customIndicators).where(eq(customIndicators.id, id)).run();
+  }
+
+  // Drops (roof plan markers)
+  async getDropsByProject(projectId: number): Promise<Drop[]> {
+    return db.select().from(drops).where(eq(drops.projectId, projectId)).all();
+  }
+  async getDrop(id: number): Promise<Drop | undefined> {
+    return db.select().from(drops).where(eq(drops.id, id)).get();
+  }
+  async createDrop(data: InsertDrop): Promise<Drop> {
+    return db.insert(drops).values(data).returning().get();
+  }
+  async updateDrop(id: number, data: Partial<InsertDrop>): Promise<Drop | undefined> {
+    return db.update(drops).set(data).where(eq(drops.id, id)).returning().get();
+  }
+  async deleteDrop(id: number): Promise<void> {
+    db.delete(drops).where(eq(drops.id, id)).run();
+  }
+  async deleteDropsByProject(projectId: number): Promise<void> {
+    db.delete(drops).where(eq(drops.projectId, projectId)).run();
+  }
+
+  // Project roof plan
+  async updateProjectRoofPlan(projectId: number, imagePath: string, originalName: string): Promise<Project | undefined> {
+    return db.update(projects)
+      .set({ roofPlanImagePath: imagePath, roofPlanOriginalName: originalName } as any)
+      .where(eq(projects.id, projectId))
+      .returning()
+      .get();
+  }
+  async clearProjectRoofPlan(projectId: number): Promise<Project | undefined> {
+    return db.update(projects)
+      .set({ roofPlanImagePath: "", roofPlanOriginalName: "" } as any)
+      .where(eq(projects.id, projectId))
+      .returning()
+      .get();
   }
 }
 

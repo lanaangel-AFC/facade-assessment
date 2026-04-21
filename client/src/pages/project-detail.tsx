@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
+import RoofPlanMarkup from "@/components/roof-plan-markup";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -724,6 +725,9 @@ export default function ProjectDetail() {
                 Add Document
               </Button>
             </Card>
+
+            {/* Roof Plan */}
+            {project && <RoofPlanMarkup project={project} />}
           </div>
         </TabsContent>
 
