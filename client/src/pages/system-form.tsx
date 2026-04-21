@@ -72,6 +72,8 @@ export default function SystemForm() {
     aiDescription: "",
   });
 
+  const [systemTypeSelect, setSystemTypeSelect] = useState("");
+  const [customSystemType, setCustomSystemType] = useState("");
   const [materials, setMaterials] = useState<{ name: string; detail: string }[]>([]);
   const [keyFeatures, setKeyFeatures] = useState<string[]>([]);
   const [featureInput, setFeatureInput] = useState("");
@@ -104,6 +106,15 @@ export default function SystemForm() {
         relatedSystems: existingSystem.relatedSystems || "",
         aiDescription: existingSystem.aiDescription || "",
       });
+      const saved = existingSystem.systemType || "";
+      const isStandard = SYSTEM_TYPES.includes(saved) && saved !== "Other";
+      if (saved && !isStandard) {
+        setSystemTypeSelect("Other");
+        setCustomSystemType(saved);
+      } else {
+        setSystemTypeSelect(saved);
+        setCustomSystemType("");
+      }
       try { setMaterials(JSON.parse(existingSystem.materials || "[]")); } catch { setMaterials([]); }
       try { setKeyFeatures(JSON.parse(existingSystem.keyFeatures || "[]")); } catch { setKeyFeatures([]); }
     }
@@ -119,8 +130,11 @@ export default function SystemForm() {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      const resolvedSystemType =
+        systemTypeSelect === "Other" ? customSystemType.trim() : systemTypeSelect;
       const payload = {
         ...form,
+        systemType: resolvedSystemType,
         materials: JSON.stringify(materials),
         keyFeatures: JSON.stringify(keyFeatures),
         createdAt: new Date().toISOString(),
@@ -241,6 +255,10 @@ export default function SystemForm() {
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (systemTypeSelect === "Other" && !customSystemType.trim()) {
+            toast({ title: "Please specify a system type", variant: "destructive" });
+            return;
+          }
           saveMutation.mutate();
         }}
         className="space-y-6"
@@ -270,7 +288,18 @@ export default function SystemForm() {
 
         <div>
           <Label htmlFor="systemType">System Type</Label>
-          <Select value={form.systemType} onValueChange={(val) => setForm({ ...form, systemType: val })}>
+          <Select
+            value={systemTypeSelect}
+            onValueChange={(val) => {
+              setSystemTypeSelect(val);
+              if (val !== "Other") {
+                setForm((prev) => ({ ...prev, systemType: val }));
+                setCustomSystemType("");
+              } else {
+                setForm((prev) => ({ ...prev, systemType: customSystemType }));
+              }
+            }}
+          >
             <SelectTrigger>
               <SelectValue placeholder="Select system type" />
             </SelectTrigger>
@@ -280,6 +309,19 @@ export default function SystemForm() {
               ))}
             </SelectContent>
           </Select>
+          {systemTypeSelect === "Other" && (
+            <div className="mt-2">
+              <Input
+                id="customSystemType"
+                placeholder="Specify system type"
+                value={customSystemType}
+                onChange={(e) => {
+                  setCustomSystemType(e.target.value);
+                  setForm((prev) => ({ ...prev, systemType: e.target.value }));
+                }}
+              />
+            </div>
+          )}
         </div>
 
         {/* Materials */}
@@ -397,6 +439,16 @@ export default function SystemForm() {
                       systemType: data.systemType || prev.systemType,
                       estimatedAge: data.estimatedAge || prev.estimatedAge,
                     }));
+                    if (data.systemType) {
+                      const isStandard = SYSTEM_TYPES.includes(data.systemType) && data.systemType !== "Other";
+                      if (isStandard) {
+                        setSystemTypeSelect(data.systemType);
+                        setCustomSystemType("");
+                      } else {
+                        setSystemTypeSelect("Other");
+                        setCustomSystemType(data.systemType);
+                      }
+                    }
                     if (data.materials?.length) setMaterials(data.materials);
                     if (data.keyFeatures?.length) setKeyFeatures(data.keyFeatures);
                     
