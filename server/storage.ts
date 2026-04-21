@@ -11,11 +11,12 @@ import {
   type ElevationPin, type InsertElevationPin, elevationPins,
   type ObservationGroup, type InsertObservationGroup, observationGroups,
   type CustomIndicator, type InsertCustomIndicator, customIndicators,
+  type CustomRoofType, type InsertCustomRoofType, customRoofTypes,
   type Drop, type InsertDrop, drops,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc, and, asc } from "drizzle-orm";
 import path from "path";
 import fs from "fs";
 
@@ -161,6 +162,11 @@ sqlite.exec(`
     y INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS custom_roof_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Add executive_summary column to projects if it doesn't exist
@@ -191,6 +197,9 @@ try { sqlite.exec(`ALTER TABLE observations ADD COLUMN group_id INTEGER DEFAULT 
 // Roof plan feature columns on projects
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_image_path TEXT DEFAULT ''`); } catch {}
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_original_name TEXT DEFAULT ''`); } catch {}
+
+// Roof types column on facade_systems
+try { sqlite.exec(`ALTER TABLE facade_systems ADD COLUMN roof_types TEXT DEFAULT '[]'`); } catch {}
 
 export const db = drizzle(sqlite);
 export { dataDir };
@@ -496,6 +505,22 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteCustomIndicator(id: number): Promise<void> {
     db.delete(customIndicators).where(eq(customIndicators.id, id)).run();
+  }
+
+  // Custom Roof Types (GLOBAL)
+  async getCustomRoofTypes(): Promise<CustomRoofType[]> {
+    return db.select().from(customRoofTypes).orderBy(asc(customRoofTypes.name)).all();
+  }
+  async createCustomRoofType(data: InsertCustomRoofType): Promise<CustomRoofType> {
+    const trimmed = data.name.trim();
+    // Case-insensitive dedupe: return existing if present
+    const existing = db.select().from(customRoofTypes).all()
+      .find(r => r.name.toLowerCase() === trimmed.toLowerCase());
+    if (existing) return existing;
+    return db.insert(customRoofTypes).values({ ...data, name: trimmed }).returning().get();
+  }
+  async deleteCustomRoofType(id: number): Promise<void> {
+    db.delete(customRoofTypes).where(eq(customRoofTypes.id, id)).run();
   }
 
   // Drops (roof plan markers)

@@ -1035,6 +1035,27 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === CUSTOM ROOF TYPES (global, reusable across projects) ===
+  app.get("/api/custom-roof-types", async (_req, res) => {
+    const types = await storage.getCustomRoofTypes();
+    res.json(types);
+  });
+
+  app.post("/api/custom-roof-types", async (req, res) => {
+    const name = (req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ message: "name is required" });
+    const type = await storage.createCustomRoofType({
+      name,
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(type);
+  });
+
+  app.delete("/api/custom-roof-types/:id", async (req, res) => {
+    await storage.deleteCustomRoofType(Number(req.params.id));
+    res.status(204).end();
+  });
+
   // === PHOTO EXPORT (ZIP) ===
   app.get("/api/export/photos/:projectId", async (req, res) => {
     try {
@@ -1596,6 +1617,19 @@ export async function registerRoutes(
                 spacing: { after: 100 },
               }));
             }
+          }
+
+          // Roof Types — for Roof systems, list the selected roof types
+          let roofTypesList: string[] = [];
+          try { roofTypesList = JSON.parse((sys as any).roofTypes || "[]"); } catch {}
+          if (roofTypesList.length > 0) {
+            siteChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Roof Types: ", font: "Arial", size: 22, bold: true, color: TEAL }),
+                new TextRun({ text: roofTypesList.join("; "), font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 100 },
+            }));
           }
 
           // System photos

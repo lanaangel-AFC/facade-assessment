@@ -101,13 +101,19 @@ export async function generateSystemDescription(systemId: number): Promise<strin
 
   let materials: { name: string; detail: string }[] = [];
   let keyFeatures: string[] = [];
+  let roofTypes: string[] = [];
   try { materials = JSON.parse(system.materials || "[]"); } catch {}
   try { keyFeatures = JSON.parse(system.keyFeatures || "[]"); } catch {}
+  try { roofTypes = JSON.parse((system as any).roofTypes || "[]"); } catch {}
+
+  const roofTypesLine = roofTypes.length > 0
+    ? `\nRoof Types (as selected by engineer): ${roofTypes.join("; ")}`
+    : "";
 
   const context = `
 System Name: ${system.name}
 Location on Building: ${system.location}
-System Type: ${system.systemType}
+System Type: ${system.systemType}${roofTypesLine}
 Materials: ${materials.map(m => `${m.name}: ${m.detail}`).join("; ") || "Not specified"}
 Key Features: ${keyFeatures.join(", ") || "Not specified"}
 Estimated Age: ${system.estimatedAge || "Not specified"}

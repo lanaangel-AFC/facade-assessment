@@ -50,6 +50,7 @@ export const facadeSystems = sqliteTable("facade_systems", {
   estimatedAge: text("estimated_age").default(""),
   relatedSystems: text("related_systems").default(""), // Free text referencing other systems
   aiDescription: text("ai_description").default(""), // AI-generated prose description
+  roofTypes: text("roof_types").default("[]"), // JSON array of roof type strings (used when system is Roof)
   sortOrder: integer("sort_order").default(0),
   createdAt: text("created_at").notNull(),
 });
@@ -92,6 +93,13 @@ export const customIndicators = sqliteTable("custom_indicators", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   projectId: integer("project_id").notNull(),
   name: text("name").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+// Custom roof types — GLOBAL (not project-scoped), reusable across projects
+export const customRoofTypes = sqliteTable("custom_roof_types", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull().unique(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -183,6 +191,7 @@ export const insertTrainingDataSchema = createInsertSchema(aiTrainingData).omit(
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
 export const insertObservationGroupSchema = createInsertSchema(observationGroups).omit({ id: true });
 export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
+export const insertCustomRoofTypeSchema = createInsertSchema(customRoofTypes).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 
 // Types
@@ -210,5 +219,7 @@ export type ObservationGroup = typeof observationGroups.$inferSelect;
 export type InsertObservationGroup = z.infer<typeof insertObservationGroupSchema>;
 export type CustomIndicator = typeof customIndicators.$inferSelect;
 export type InsertCustomIndicator = z.infer<typeof insertCustomIndicatorSchema>;
+export type CustomRoofType = typeof customRoofTypes.$inferSelect;
+export type InsertCustomRoofType = z.infer<typeof insertCustomRoofTypeSchema>;
 export type Drop = typeof drops.$inferSelect;
 export type InsertDrop = z.infer<typeof insertDropSchema>;

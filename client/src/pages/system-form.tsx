@@ -7,9 +7,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, Sparkles, Loader2 } from "lucide-react";
-import type { FacadeSystem, Photo } from "@shared/schema";
+import type { FacadeSystem, Photo, CustomRoofType } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
@@ -46,6 +47,21 @@ const SYSTEM_TYPES = [
   "Other",
 ];
 
+const DEFAULT_ROOF_TYPES = [
+  "Bitumen sheet system",
+  "PVC sheet system",
+  "Liquid applied membrane",
+  "Ballast covering",
+  "Profile metal roof sheeting",
+  "Fibre cement sheet",
+  "Exposed structural concrete",
+  "Concrete topping slab",
+  "Mineral-chip wearing surface",
+];
+
+const isRoofSystemType = (type: string) =>
+  !!type && type.toLowerCase().includes("roof");
+
 const PHOTO_SLOTS = [
   { key: "context1", label: "Context 1" },
   { key: "context2", label: "Context 2" },
@@ -77,6 +93,10 @@ export default function SystemForm() {
   const [materials, setMaterials] = useState<{ name: string; detail: string }[]>([]);
   const [keyFeatures, setKeyFeatures] = useState<string[]>([]);
   const [featureInput, setFeatureInput] = useState("");
+  const [roofTypes, setRoofTypes] = useState<string[]>([]);
+  const [otherRoofOpen, setOtherRoofOpen] = useState(false);
+  const [otherRoofInput, setOtherRoofInput] = useState("");
+  const [savingOtherRoof, setSavingOtherRoof] = useState(false);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [uploading, setUploading] = useState<string | null>(null);
   const [aiIdentifying, setAiIdentifying] = useState(false);
@@ -94,6 +114,11 @@ export default function SystemForm() {
   const { data: existingPhotos } = useQuery<Photo[]>({
     queryKey: [`/api/systems/${systemId}/photos`],
     enabled: isEdit,
+  });
+
+  // Fetch GLOBAL custom roof types (reusable across all projects)
+  const { data: customRoofTypes = [] } = useQuery<CustomRoofType[]>({
+    queryKey: ["/api/custom-roof-types"],
   });
 
   useEffect(() => {
@@ -117,6 +142,7 @@ export default function SystemForm() {
       }
       try { setMaterials(JSON.parse(existingSystem.materials || "[]")); } catch { setMaterials([]); }
       try { setKeyFeatures(JSON.parse(existingSystem.keyFeatures || "[]")); } catch { setKeyFeatures([]); }
+      try { setRoofTypes(JSON.parse((existingSystem as any).roofTypes || "[]")); } catch { setRoofTypes([]); }
     }
   }, [existingSystem]);
 
@@ -137,6 +163,7 @@ export default function SystemForm() {
         systemType: resolvedSystemType,
         materials: JSON.stringify(materials),
         keyFeatures: JSON.stringify(keyFeatures),
+        roofTypes: JSON.stringify(isRoofSystemType(resolvedSystemType) ? roofTypes : []),
         createdAt: new Date().toISOString(),
       };
       if (isEdit) {
@@ -323,6 +350,172 @@ export default function SystemForm() {
             </div>
           )}
         </div>
+
+        {/* Roof Types (only visible for Roof systems) */}
+        {isRoofSystemType(
+          systemTypeSelect === "Other" ? customSystemType : systemTypeSelect
+        ) && (
+          <Card className="p-4 space-y-3">
+            <h3 className="text-sm font-medium">Roof Types</h3>
+            <p className="text-xs text-muted-foreground">
+              Select all that apply — a roof often combines several types.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {DEFAULT_ROOF_TYPES.map((rt) => (
+                <label key={rt} className="flex items-center gap-2 text-sm cursor-pointer">
+                  <Checkbox
+                    checked={roofTypes.includes(rt)}
+                    onCheckedChange={() => {
+                      setRoofTypes((prev) =>
+                        prev.includes(rt) ? prev.filter((x) => x !== rt) : [...prev, rt]
+                      );
+                    }}
+                  />
+                  {rt}
+                </label>
+              ))}
+            </div>
+
+            {customRoofTypes.length > 0 && (
+              <>
+                <div className="flex items-center gap-2 pt-2">
+                  <div className="flex-1 h-px bg-border" />
+                  <span className="text-xs text-muted-foreground">Custom (saved for all projects)</span>
+                  <div className="flex-1 h-px bg-border" />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {customRoofTypes.map((c) => (
+                    <div key={c.id} className="flex items-center gap-2 text-sm group">
+                      <Checkbox
+                        checked={roofTypes.includes(c.name)}
+                        onCheckedChange={() => {
+                          setRoofTypes((prev) =>
+                            prev.includes(c.name) ? prev.filter((x) => x !== c.name) : [...prev, c.name]
+                          );
+                        }}
+                      />
+                      <span className="flex-1 truncate">{c.name}</span>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!window.confirm(`Delete custom roof type "${c.name}"? It will be removed for all projects.`)) return;
+                          try {
+                            await apiRequest("DELETE", `/api/custom-roof-types/${c.id}`);
+                            queryClient.invalidateQueries({ queryKey: ["/api/custom-roof-types"] });
+                            setRoofTypes((prev) => prev.filter((x) => x !== c.name));
+                          } catch {
+                            toast({ title: "Failed to delete", variant: "destructive" });
+                          }
+                        }}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive"
+                        title="Remove"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {/* Fallback: any selected roof type that isn't in defaults or customs (e.g. legacy value) — keep it visible */}
+            {roofTypes
+              .filter((rt) => !DEFAULT_ROOF_TYPES.includes(rt) && !customRoofTypes.some((c) => c.name === rt))
+              .map((rt) => (
+                <label key={rt} className="flex items-center gap-2 text-sm cursor-pointer">
+                  <Checkbox
+                    checked={true}
+                    onCheckedChange={() => setRoofTypes((prev) => prev.filter((x) => x !== rt))}
+                  />
+                  <span className="italic">{rt}</span>
+                </label>
+              ))}
+
+            {otherRoofOpen ? (
+              <div className="flex items-center gap-2 pt-1">
+                <Input
+                  placeholder="Specify roof type..."
+                  value={otherRoofInput}
+                  onChange={(e) => setOtherRoofInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      (document.getElementById("save-other-roof") as HTMLButtonElement)?.click();
+                    }
+                  }}
+                  autoFocus
+                />
+                <Button
+                  id="save-other-roof"
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={savingOtherRoof || !otherRoofInput.trim()}
+                  onClick={async () => {
+                    const trimmed = otherRoofInput.trim();
+                    if (!trimmed) return;
+
+                    // Client-side case-insensitive dedupe: if it already exists (default or custom), just select it.
+                    const matchDefault = DEFAULT_ROOF_TYPES.find(
+                      (d) => d.toLowerCase() === trimmed.toLowerCase()
+                    );
+                    const matchCustom = customRoofTypes.find(
+                      (c) => c.name.toLowerCase() === trimmed.toLowerCase()
+                    );
+                    if (matchDefault) {
+                      setRoofTypes((prev) => prev.includes(matchDefault) ? prev : [...prev, matchDefault]);
+                      setOtherRoofInput("");
+                      setOtherRoofOpen(false);
+                      return;
+                    }
+                    if (matchCustom) {
+                      setRoofTypes((prev) => prev.includes(matchCustom.name) ? prev : [...prev, matchCustom.name]);
+                      setOtherRoofInput("");
+                      setOtherRoofOpen(false);
+                      return;
+                    }
+
+                    setSavingOtherRoof(true);
+                    try {
+                      const res = await apiRequest("POST", "/api/custom-roof-types", { name: trimmed });
+                      const created: CustomRoofType = await res.json();
+                      queryClient.invalidateQueries({ queryKey: ["/api/custom-roof-types"] });
+                      setRoofTypes((prev) => prev.includes(created.name) ? prev : [...prev, created.name]);
+                      setOtherRoofInput("");
+                      setOtherRoofOpen(false);
+                    } catch (err: any) {
+                      toast({ title: err.message || "Failed to save", variant: "destructive" });
+                    } finally {
+                      setSavingOtherRoof(false);
+                    }
+                  }}
+                >
+                  {savingOtherRoof ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Save"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setOtherRoofOpen(false);
+                    setOtherRoofInput("");
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setOtherRoofOpen(true)}
+              >
+                <Plus className="w-3.5 h-3.5 mr-1" /> Add Other
+              </Button>
+            )}
+          </Card>
+        )}
 
         {/* Materials */}
         <Card className="p-4 space-y-3">
