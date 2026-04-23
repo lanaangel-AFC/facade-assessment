@@ -54,10 +54,40 @@ const COMMON_LIMITATIONS = [
   "Heritage listing constraints limit intrusive investigation",
 ];
 
+const VALID_TABS = ["overview", "systems", "elevations", "observations", "capex"] as const;
+type TabValue = typeof VALID_TABS[number];
+
+const readTabFromUrl = (): TabValue => {
+  if (typeof window === "undefined") return "overview";
+  const params = new URLSearchParams(window.location.search);
+  const t = params.get("tab");
+  return (VALID_TABS as readonly string[]).includes(t || "") ? (t as TabValue) : "overview";
+};
+
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
-  const [, navigate] = useLocation();
+  const [location, navigate] = useLocation();
   const { toast } = useToast();
+  const [activeTab, setActiveTab] = useState<TabValue>(() => readTabFromUrl());
+
+  // Keep activeTab in sync when the route/search changes (e.g. navigating from
+  // the observation form with ?tab=observations, or browser back/forward).
+  useEffect(() => {
+    setActiveTab(readTabFromUrl());
+  }, [location]);
+
+  const handleTabChange = (val: string) => {
+    const next = (VALID_TABS as readonly string[]).includes(val) ? (val as TabValue) : "overview";
+    setActiveTab(next);
+    const params = new URLSearchParams(window.location.search);
+    if (next === "overview") {
+      params.delete("tab");
+    } else {
+      params.set("tab", next);
+    }
+    const qs = params.toString();
+    navigate(`/projects/${id}${qs ? `?${qs}` : ""}`, { replace: true });
+  };
 
   const { data: project, isLoading: projectLoading } = useQuery<Project>({
     queryKey: ["/api/projects", id],
@@ -409,7 +439,7 @@ export default function ProjectDetail() {
         </DialogContent>
       </Dialog>
 
-      <Tabs defaultValue="overview">
+      <Tabs value={activeTab} onValueChange={handleTabChange}>
         <TabsList className="mb-6">
           <TabsTrigger value="overview" className="gap-1.5">
             <FileText className="w-4 h-4" />

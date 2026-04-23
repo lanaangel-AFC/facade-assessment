@@ -92,6 +92,8 @@ export default function ObservationForm() {
   const { projectId, observationId: obsIdParam } = useParams<{ projectId: string; observationId?: string }>();
   const [, navigate] = useLocation();
   const { toast } = useToast();
+  const projectObservationsHref = `/projects/${projectId}?tab=observations`;
+  const goToProjectObservations = () => navigate(projectObservationsHref);
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const cameraInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const isEdit = !!obsIdParam;
@@ -307,9 +309,7 @@ export default function ObservationForm() {
         setOriginalAiNarrative(null);
       }
       
-      if (!isEdit) {
-        navigate(`/projects/${projectId}/observations/${data.id}`, { replace: true });
-      }
+      goToProjectObservations();
     },
     onError: (err: Error) => {
       toast({ title: err.message || "Failed to save", variant: "destructive" });
@@ -451,12 +451,14 @@ export default function ObservationForm() {
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-6 pb-24">
-      <Link href={`/projects/${projectId}`}>
-        <button className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-4">
-          <ArrowLeft className="w-4 h-4" />
-          Back to Project
-        </button>
-      </Link>
+      <button
+        type="button"
+        onClick={goToProjectObservations}
+        className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-4"
+      >
+        <ArrowLeft className="w-4 h-4" />
+        Back to Observations
+      </button>
 
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-semibold tracking-tight">
@@ -593,7 +595,7 @@ export default function ObservationForm() {
           ) : !elevations || elevations.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               No elevation drawings uploaded yet.{" "}
-              <Link href={`/projects/${projectId}`}>
+              <Link href={`/projects/${projectId}?tab=elevations`}>
                 <span className="text-primary underline">Upload an elevation</span>
               </Link>{" "}
               to mark locations.
