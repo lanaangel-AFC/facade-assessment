@@ -278,24 +278,29 @@ export default function ObservationForm() {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const payload = {
+      const basePayload = {
         ...form,
         systemId: form.systemId ? Number(form.systemId) : null,
         indicators: JSON.stringify(indicators),
-        createdAt: new Date().toISOString(),
       };
       if (isEdit) {
-        const res = await apiRequest("PATCH", `/api/observations/${obsIdParam}`, payload);
+        const res = await apiRequest("PATCH", `/api/observations/${obsIdParam}`, basePayload);
         return res.json();
       } else {
-        const res = await apiRequest("POST", `/api/projects/${projectId}/observations`, payload);
+        const res = await apiRequest("POST", `/api/projects/${projectId}/observations`, {
+          ...basePayload,
+          createdAt: new Date().toISOString(),
+        });
         return res.json();
       }
     },
     onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
+      if (isEdit && obsIdParam) {
+        queryClient.invalidateQueries({ queryKey: ["/api/observations", obsIdParam] });
+      }
       toast({ title: isEdit ? "Observation updated" : "Observation created" });
-      
+
       // Save training data if AI narrative was used
       if (originalAiNarrative) {
         try {
@@ -309,7 +314,7 @@ export default function ObservationForm() {
         } catch {}
         setOriginalAiNarrative(null);
       }
-      
+
       goToProjectObservations();
     },
     onError: (err: Error) => {
