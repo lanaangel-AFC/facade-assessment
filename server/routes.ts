@@ -1056,6 +1056,140 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === REPORT LIBRARY (RAG) ===
+  const reportsDir = path.join(uploadDir, "reports");
+  if (!fs.existsSync(reportsDir)) {
+    fs.mkdirSync(reportsDir, { recursive: true });
+  }
+
+  const reportUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, reportsDir),
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        cb(null, `${crypto.randomUUID()}${ext}`);
+      },
+    }),
+    limits: { fileSize: 100 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const ok =
+        file.mimetype === "application/pdf" ||
+        file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+        /\.(pdf|docx)$/i.test(file.originalname);
+      if (ok) cb(null, true);
+      else cb(new Error("Only PDF or DOCX files are allowed"));
+    },
+  });
+
+  async function processReportDocument(documentId: string) {
+    const { extractPassages } = await import("./reportExtraction");
+    const { embedBatch } = await import("./embeddings");
+
+    try {
+      await storage.updateReportDocument(documentId, { extractionStatus: "processing" });
+      const doc = await storage.getReportDocument(documentId);
+      if (!doc) return;
+
+      const extracted = await extractPassages(doc.filePath, doc.mimeType || "");
+
+      // Create passage records without embeddings first
+      const createdPassages = [] as { id: string; text: string }[];
+      for (const p of extracted) {
+        const passage = await storage.createPassage({
+          id: crypto.randomUUID(),
+          documentId,
+          category: p.category,
+          text: p.text,
+          embedding: null,
+          sourceSection: p.sourceSection,
+          createdAt: new Date().toISOString(),
+        });
+        createdPassages.push({ id: passage.id, text: passage.text });
+      }
+
+      // Embed in batches of 10
+      for (let i = 0; i < createdPassages.length; i += 10) {
+        const batch = createdPassages.slice(i, i + 10);
+        try {
+          const embeddings = await embedBatch(batch.map((b) => b.text));
+          for (let j = 0; j < batch.length; j++) {
+            await storage.updatePassage(batch[j].id, {
+              embedding: JSON.stringify(embeddings[j]),
+            });
+          }
+        } catch (err: any) {
+          console.warn(`Embedding batch failed, skipping:`, err?.message || err);
+        }
+      }
+
+      await storage.updateReportDocument(documentId, { extractionStatus: "complete" });
+    } catch (err: any) {
+      console.error("Report processing failed:", err);
+      await storage.updateReportDocument(documentId, {
+        extractionStatus: "error",
+        extractionError: err?.message || String(err),
+      });
+    }
+  }
+
+  app.post("/api/report-library/upload", reportUpload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+      const id = crypto.randomUUID();
+      const doc = await storage.createReportDocument({
+        id,
+        originalName: req.file.originalname,
+        filePath: req.file.path,
+        mimeType: req.file.mimetype || "",
+        fileSize: req.file.size || 0,
+        uploadedAt: new Date().toISOString(),
+        extractionStatus: "pending",
+        extractionError: "",
+      });
+      // Fire and forget
+      processReportDocument(id).catch((err) => console.error("Background processing error:", err));
+      res.status(201).json(doc);
+    } catch (err: any) {
+      console.error("Report upload error:", err);
+      res.status(500).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  app.get("/api/report-library/documents", async (_req, res) => {
+    const docs = await storage.getReportDocuments();
+    const enriched = await Promise.all(docs.map(async (d) => {
+      const passages = await storage.getPassagesByDocument(d.id);
+      return { ...d, passageCount: passages.length };
+    }));
+    res.json(enriched);
+  });
+
+  app.get("/api/report-library/documents/:id/passages", async (req, res) => {
+    const passages = await storage.getPassagesByDocument(req.params.id);
+    res.json(passages);
+  });
+
+  app.delete("/api/report-library/documents/:id", async (req, res) => {
+    await storage.deleteReportDocument(req.params.id);
+    res.status(204).end();
+  });
+
+  app.delete("/api/report-library/passages/:id", async (req, res) => {
+    await storage.deletePassage(req.params.id);
+    res.status(204).end();
+  });
+
+  app.get("/api/report-library/status/:id", async (req, res) => {
+    const doc = await storage.getReportDocument(req.params.id);
+    if (!doc) return res.status(404).json({ message: "Document not found" });
+    const passages = await storage.getPassagesByDocument(req.params.id);
+    res.json({
+      status: doc.extractionStatus,
+      passageCount: passages.length,
+      error: doc.extractionError || null,
+    });
+  });
+
   // === PHOTO EXPORT (ZIP) ===
   app.get("/api/export/photos/:projectId", async (req, res) => {
     try {

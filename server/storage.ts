@@ -13,6 +13,8 @@ import {
   type CustomIndicator, type InsertCustomIndicator, customIndicators,
   type CustomRoofType, type InsertCustomRoofType, customRoofTypes,
   type Drop, type InsertDrop, drops,
+  type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
+  type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -167,7 +169,30 @@ sqlite.exec(`
     name TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS report_library_documents (
+    id TEXT PRIMARY KEY,
+    original_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    mime_type TEXT DEFAULT '',
+    file_size INTEGER DEFAULT 0,
+    uploaded_at TEXT NOT NULL,
+    extraction_status TEXT DEFAULT 'pending',
+    extraction_error TEXT DEFAULT ''
+  );
+  CREATE TABLE IF NOT EXISTS report_library_passages (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    text TEXT NOT NULL,
+    embedding TEXT,
+    source_section TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+  );
 `);
+
+// Report library tables — ALTER TABLE for defensive future migrations
+try { sqlite.exec(`ALTER TABLE report_library_documents ADD COLUMN extraction_error TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE report_library_passages ADD COLUMN source_section TEXT DEFAULT ''`); } catch {}
 
 // Add executive_summary column to projects if it doesn't exist
 try {
@@ -557,6 +582,50 @@ export class DatabaseStorage implements IStorage {
       .where(eq(projects.id, projectId))
       .returning()
       .get();
+  }
+
+  // === Report Library (RAG) ===
+  async getReportDocuments(): Promise<ReportLibraryDocument[]> {
+    return db.select().from(reportLibraryDocuments).orderBy(desc(reportLibraryDocuments.uploadedAt)).all();
+  }
+  async getReportDocument(id: string): Promise<ReportLibraryDocument | undefined> {
+    return db.select().from(reportLibraryDocuments).where(eq(reportLibraryDocuments.id, id)).get();
+  }
+  async createReportDocument(data: InsertReportLibraryDocument): Promise<ReportLibraryDocument> {
+    return db.insert(reportLibraryDocuments).values(data).returning().get();
+  }
+  async updateReportDocument(id: string, patch: Partial<InsertReportLibraryDocument>): Promise<ReportLibraryDocument> {
+    return db.update(reportLibraryDocuments).set(patch).where(eq(reportLibraryDocuments.id, id)).returning().get();
+  }
+  async deleteReportDocument(id: string): Promise<void> {
+    const doc = db.select().from(reportLibraryDocuments).where(eq(reportLibraryDocuments.id, id)).get();
+    // Cascade passages
+    db.delete(reportLibraryPassages).where(eq(reportLibraryPassages.documentId, id)).run();
+    db.delete(reportLibraryDocuments).where(eq(reportLibraryDocuments.id, id)).run();
+    // Delete file from disk
+    if (doc && doc.filePath) {
+      try {
+        if (fs.existsSync(doc.filePath)) fs.unlinkSync(doc.filePath);
+      } catch {}
+    }
+  }
+  async getPassagesByDocument(documentId: string): Promise<ReportLibraryPassage[]> {
+    return db.select().from(reportLibraryPassages).where(eq(reportLibraryPassages.documentId, documentId)).all();
+  }
+  async getAllPassages(): Promise<ReportLibraryPassage[]> {
+    return db.select().from(reportLibraryPassages).all();
+  }
+  async getPassagesByCategory(category: string): Promise<ReportLibraryPassage[]> {
+    return db.select().from(reportLibraryPassages).where(eq(reportLibraryPassages.category, category)).all();
+  }
+  async createPassage(data: InsertReportLibraryPassage): Promise<ReportLibraryPassage> {
+    return db.insert(reportLibraryPassages).values(data).returning().get();
+  }
+  async updatePassage(id: string, patch: Partial<InsertReportLibraryPassage>): Promise<ReportLibraryPassage> {
+    return db.update(reportLibraryPassages).set(patch).where(eq(reportLibraryPassages.id, id)).returning().get();
+  }
+  async deletePassage(id: string): Promise<void> {
+    db.delete(reportLibraryPassages).where(eq(reportLibraryPassages.id, id)).run();
   }
 }
 

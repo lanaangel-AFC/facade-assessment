@@ -2,6 +2,26 @@ import OpenAI from "openai";
 import { storage, dataDir } from "./storage";
 import fs from "fs";
 import path from "path";
+import { findSimilarPassages } from "./embeddings";
+
+/**
+ * Retrieve style exemplars from the user's past AFC reports (RAG).
+ * Returns a formatted block to prepend to the system prompt, or "" if library is empty.
+ */
+async function getStyleExamples(query: string, category: string, topK: number = 2): Promise<string> {
+  try {
+    const passages = await findSimilarPassages(query, category, topK);
+    if (passages.length === 0) return "";
+
+    const numbered = passages
+      .map((p, idx) => `${idx + 1}. ${p.text.trim()}`)
+      .join("\n\n");
+
+    return `\n\nSTYLE EXEMPLARS from past AFC reports (match this voice, tone, sentence structure, and phrasing. Do not copy verbatim — mimic style only):\n\n${numbered}\n\n---\n`;
+  } catch {
+    return "";
+  }
+}
 
 async function getClient(): Promise<OpenAI> {
   const apiKey = await storage.getSetting("openai_api_key");
@@ -140,9 +160,11 @@ Related Systems: ${system.relatedSystems || "None noted"}
   }
 
   const trainingExamples = await getTrainingExamples("system_description");
+  const styleQuery = `${system.systemType} ${materials.map(m => m.name + " " + m.detail).join(" ")} ${keyFeatures.join(" ")}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "description", 2);
 
   const hasPhotos = imageParts.length > 0;
-  const systemPrompt = `You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+  const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
 STYLE RULES:
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
@@ -247,8 +269,10 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}
   const hasExisting = existingNarrative.trim().length > 0;
 
   const trainingExamples = await getTrainingExamples("observation_narrative");
+  const styleQuery = `${observation.defectCategory} ${observation.fieldNote || ""} ${indicators.join(" ")} ${existingNarrative || ""}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
 
-  const systemPrompt = `You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
 STYLE RULES:
 - Use numbered points with lettered sub-items (a, b, c) for details.
@@ -350,13 +374,15 @@ Indicators: ${indicators.join(", ") || "None specified"}
   `.trim();
 
   const trainingExamples = await getTrainingExamples("recommendation");
+  const styleQuery = `${observation.defectCategory} ${observation.aiNarrative || observation.fieldNote || ""} ${indicators.join(" ")}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "recommendation", 2);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+        content: `${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 
 CONSERVATIVENESS LEVEL: ${conservativeness.toUpperCase()}
 ${conservativeness === "high" ? `HIGH conservativeness:
@@ -430,13 +456,15 @@ export async function generateGroupNarrative(
   }).join("\n\n");
 
   const trainingExamples = await getTrainingExamples("group_narrative");
+  const styleQuery = `${groupName} ${observations.slice(0, 3).map(o => `${o.defectCategory} ${o.fieldNote}`).join(" ")}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+        content: `${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
 
 You will be given a group name (e.g. "Eastern Facade" or "Sealant Failure") and a set of related observations. Produce ONE combined narrative covering all of them, as a numbered list of defects with lettered sub-items.
 
@@ -534,13 +562,15 @@ Summary Statistics:
   `.trim();
 
   const trainingExamples = await getTrainingExamples("executive_summary");
+  const styleQuery = `${project.name} ${project.address} ${project.buildingUse || ""} ${systems.map(s => s.systemType).join(" ")}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "general", 2);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
+        content: `${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
 
 STYLE RULES:
 - Be concise. Summarise what was done, what was found, and what needs to happen.

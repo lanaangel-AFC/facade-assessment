@@ -171,6 +171,29 @@ export const aiTrainingData = sqliteTable("ai_training_data", {
   createdAt: text("created_at").notNull(),
 });
 
+// Report Library Documents (Global RAG source documents — past AFC reports)
+export const reportLibraryDocuments = sqliteTable("report_library_documents", {
+  id: text("id").primaryKey(),
+  originalName: text("original_name").notNull(),
+  filePath: text("file_path").notNull(),
+  mimeType: text("mime_type").default(""),
+  fileSize: integer("file_size").default(0),
+  uploadedAt: text("uploaded_at").notNull(),
+  extractionStatus: text("extraction_status").default("pending"), // pending | processing | complete | error
+  extractionError: text("extraction_error").default(""),
+});
+
+// Report Library Passages (extracted chunks of past AFC reports for RAG retrieval)
+export const reportLibraryPassages = sqliteTable("report_library_passages", {
+  id: text("id").primaryKey(),
+  documentId: text("document_id").notNull(),
+  category: text("category").notNull(), // description | narrative | recommendation | risk | general
+  text: text("text").notNull(),
+  embedding: text("embedding"), // JSON-serialized float32[]
+  sourceSection: text("source_section").default(""),
+  createdAt: text("created_at").notNull(),
+});
+
 // Users (kept from template)
 export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -193,6 +216,8 @@ export const insertObservationGroupSchema = createInsertSchema(observationGroups
 export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
 export const insertCustomRoofTypeSchema = createInsertSchema(customRoofTypes).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
+export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
+export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
 
 // Types
 export type Project = typeof projects.$inferSelect;
@@ -223,3 +248,7 @@ export type CustomRoofType = typeof customRoofTypes.$inferSelect;
 export type InsertCustomRoofType = z.infer<typeof insertCustomRoofTypeSchema>;
 export type Drop = typeof drops.$inferSelect;
 export type InsertDrop = z.infer<typeof insertDropSchema>;
+export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;
+export type InsertReportLibraryDocument = z.infer<typeof insertReportLibraryDocumentSchema>;
+export type ReportLibraryPassage = typeof reportLibraryPassages.$inferSelect;
+export type InsertReportLibraryPassage = z.infer<typeof insertReportLibraryPassageSchema>;
