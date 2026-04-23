@@ -11,6 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { DictationButton } from "@/components/DictationButton";
+import { PhotoCaptionInput } from "@/components/PhotoCaptionInput";
 import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2, Download,
 } from "lucide-react";
@@ -808,31 +809,40 @@ export default function ObservationForm() {
                 <div key={slot.key} className="space-y-1">
                   <Label className="text-xs">{slot.label}</Label>
                   {photo ? (
-                    <div className="relative group">
-                      <img
-                        src={`${API_BASE}/api/uploads/${photo.filename}`}
-                        alt={slot.label}
-                        className="w-full h-24 object-cover rounded-lg border cursor-pointer"
-                        onClick={() => window.open(`${API_BASE}/api/uploads/${photo.filename}`, '_blank')}
-                      />
-                      <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <a
-                          href={`${API_BASE}/api/photos/${photo.id}/download`}
-                          download={photo.caption ? `${photo.caption}.${photo.filename.split('.').pop()}` : photo.filename}
-                          className="p-1 rounded-full bg-background/80 hover:bg-background"
-                          title="Save to device"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <Download className="w-3 h-3" />
-                        </a>
-                        <button
-                          type="button"
-                          onClick={() => handleDeletePhoto(photo.id)}
-                          className="p-1 rounded-full bg-background/80 hover:bg-background"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
+                    <div className="space-y-1">
+                      <div className="relative group">
+                        <img
+                          src={`${API_BASE}/api/uploads/${photo.filename}`}
+                          alt={slot.label}
+                          className="w-full h-24 object-cover rounded-lg border cursor-pointer"
+                          onClick={() => window.open(`${API_BASE}/api/uploads/${photo.filename}`, '_blank')}
+                        />
+                        <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <a
+                            href={`${API_BASE}/api/photos/${photo.id}/download`}
+                            download={photo.caption ? `${photo.caption}.${photo.filename.split('.').pop()}` : photo.filename}
+                            className="p-1 rounded-full bg-background/80 hover:bg-background"
+                            title="Save to device"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <Download className="w-3 h-3" />
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => handleDeletePhoto(photo.id)}
+                            className="p-1 rounded-full bg-background/80 hover:bg-background"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
                       </div>
+                      <PhotoCaptionInput
+                        photoId={photo.id}
+                        initial={photo.caption || ""}
+                        onSaved={(caption) => {
+                          setPhotos((prev) => prev.map((p) => (p.id === photo.id ? { ...p, caption } : p)));
+                        }}
+                      />
                     </div>
                   ) : (
                     <div className="h-24 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-1 text-muted-foreground">

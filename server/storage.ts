@@ -226,6 +226,9 @@ try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_original_name TEXT 
 // Roof types column on facade_systems
 try { sqlite.exec(`ALTER TABLE facade_systems ADD COLUMN roof_types TEXT DEFAULT '[]'`); } catch {}
 
+// Photo caption column (defensive — already declared in CREATE TABLE above, but add for legacy DBs)
+try { sqlite.exec(`ALTER TABLE photos ADD COLUMN caption TEXT DEFAULT ''`); } catch {}
+
 export const db = drizzle(sqlite);
 export { dataDir };
 

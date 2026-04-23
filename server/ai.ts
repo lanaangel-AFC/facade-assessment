@@ -31,6 +31,40 @@ async function getClient(): Promise<OpenAI> {
   return new OpenAI({ apiKey });
 }
 
+/**
+ * Build caption+image content-part pairs for OpenAI vision.
+ * Each photo gets a "Photo caption: ..." text block IMMEDIATELY BEFORE its image,
+ * so the model associates the engineer's on-site context with the correct image.
+ */
+function buildCaptionedImageParts(
+  photos: { filename: string; caption?: string | null }[]
+): OpenAI.Chat.Completions.ChatCompletionContentPart[] {
+  const uploadDir = path.join(dataDir, "uploads");
+  const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  for (const photo of photos) {
+    const filePath = path.join(uploadDir, photo.filename);
+    if (!fs.existsSync(filePath)) continue;
+    try {
+      const imageData = fs.readFileSync(filePath);
+      const base64 = imageData.toString("base64");
+      const ext = path.extname(photo.filename).toLowerCase();
+      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      const caption = (photo.caption || "").trim();
+      parts.push({
+        type: "text",
+        text: `Photo caption: ${caption || "(no caption provided)"}`,
+      });
+      parts.push({
+        type: "image_url",
+        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
+      });
+    } catch {}
+  }
+  return parts;
+}
+
+const CAPTION_GUIDANCE = `Each image is preceded by its caption (provided by the engineer on-site). Read captions as authoritative context — they describe what the engineer observed that may not be visually obvious.`;
+
 // Load training data for style calibration
 async function getTrainingExamples(outputType: string, limit: number = 3): Promise<string> {
   try {
@@ -54,25 +88,16 @@ export async function identifySystem(photoIds: number[]): Promise<{
   visibleConcerns: string[];
 }> {
   const client = await getClient();
-  const uploadDir = path.join(dataDir, "uploads");
 
-  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  const photosToSend: { filename: string; caption?: string | null }[] = [];
   for (const photoId of photoIds) {
     const photo = await storage.getPhoto(photoId);
     if (!photo) continue;
-    const filePath = path.join(uploadDir, photo.filename);
-    if (!fs.existsSync(filePath)) continue;
-    const imageData = fs.readFileSync(filePath);
-    const base64 = imageData.toString("base64");
-    const ext = path.extname(photo.filename).toLowerCase();
-    const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-    imageParts.push({
-      type: "image_url",
-      image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
-    });
+    photosToSend.push(photo);
   }
+  const captionedParts = buildCaptionedImageParts(photosToSend);
 
-  if (imageParts.length === 0) {
+  if (captionedParts.length === 0) {
     throw new Error("No valid photos found for analysis.");
   }
 
@@ -82,6 +107,8 @@ export async function identifySystem(photoIds: number[]): Promise<{
       {
         role: "system",
         content: `You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
+
+${CAPTION_GUIDANCE}
 
 Report only what is visible. Do not speculate or pad. Use Australian facade engineering terminology.
 
@@ -99,8 +126,8 @@ Keep each field brief. Materials: list only what you can see. Key features: 2-4 
       {
         role: "user",
         content: [
-          { type: "text", text: "Identify the facade system in these photos:" },
-          ...imageParts,
+          { type: "text", text: "Identify the facade system in these photos. Each image below is preceded by its caption from the engineer:" },
+          ...captionedParts,
         ],
       },
     ],
@@ -141,23 +168,8 @@ Related Systems: ${system.relatedSystems || "None noted"}
   `.trim();
 
   // Fetch system photos for vision analysis
-  const uploadDir = path.join(dataDir, "uploads");
   const systemPhotos = await storage.getPhotosBySystem(systemId);
-  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
-  for (const photo of systemPhotos) {
-    const filePath = path.join(uploadDir, photo.filename);
-    if (!fs.existsSync(filePath)) continue;
-    try {
-      const imageData = fs.readFileSync(filePath);
-      const base64 = imageData.toString("base64");
-      const ext = path.extname(photo.filename).toLowerCase();
-      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-      imageParts.push({
-        type: "image_url",
-        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
-      });
-    } catch {}
-  }
+  const imageParts = buildCaptionedImageParts(systemPhotos);
 
   const trainingExamples = await getTrainingExamples("system_description");
   const styleQuery = `${system.systemType} ${materials.map(m => m.name + " " + m.detail).join(" ")} ${keyFeatures.join(" ")}`.trim();
@@ -166,9 +178,9 @@ Related Systems: ${system.relatedSystems || "None noted"}
   const hasPhotos = imageParts.length > 0;
   const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
-STYLE RULES:
+${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
-- Be concise. Elaborate on the information provided by the user, and${hasPhotos ? " use the photos to identify additional details about the system (glazing type, retention method, frame finish, cladding material, jointing, etc.)." : " do not invent details not supported by the data."}
+- Be concise. Elaborate on the information provided by the user, and${hasPhotos ? " use the photos (and the caption accompanying each) to identify additional details about the system (glazing type, retention method, frame finish, cladding material, jointing, etc.)." : " do not invent details not supported by the data."}
 - Use Australian facade engineering terminology.
 
 FORMAT — follow this exact structure:
@@ -247,23 +259,8 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}
   `.trim();
 
   // Fetch observation photos for vision analysis
-  const uploadDir = path.join(dataDir, "uploads");
   const obsPhotos = await storage.getPhotosByObservation(observationId);
-  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
-  for (const photo of obsPhotos) {
-    const filePath = path.join(uploadDir, photo.filename);
-    if (!fs.existsSync(filePath)) continue;
-    try {
-      const imageData = fs.readFileSync(filePath);
-      const base64 = imageData.toString("base64");
-      const ext = path.extname(photo.filename).toLowerCase();
-      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-      imageParts.push({
-        type: "image_url",
-        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
-      });
-    } catch {}
-  }
+  const imageParts = buildCaptionedImageParts(obsPhotos);
 
   const hasPhotos = imageParts.length > 0;
   const hasExisting = existingNarrative.trim().length > 0;
@@ -274,12 +271,12 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}
 
   const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
-STYLE RULES:
+${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use numbered points with lettered sub-items (a, b, c) for details.
 - State what was observed, the likely cause, and the implication.
 - Use your expertise as a facade engineer to provide professional analysis: explain WHY defects occur, what mechanisms are at play (e.g. UV degradation, thermal cycling, moisture ingress), and what the consequences are if unaddressed.
 - Use Australian facade engineering terminology.
-${hasPhotos ? "- Analyse the attached photos to identify visible defects, their severity, and any additional details not captured in the field notes (e.g. extent of cracking, staining patterns, gasket condition, sealant failure mode)." : ""}
+${hasPhotos ? "- Analyse the attached photos (each preceded by its engineer-provided caption) to identify visible defects, their severity, and any additional details not captured in the field notes (e.g. extent of cracking, staining patterns, gasket condition, sealant failure mode). Treat captions as authoritative context." : ""}
 ${hasExisting ? "- The user has written an existing narrative. Incorporate their observations and commentary into the output — preserve their specific details, measurements, and wording where appropriate, while enriching with your technical analysis." : ""}
 
 FORMAT — follow this structure:
@@ -377,12 +374,26 @@ Indicators: ${indicators.join(", ") || "None specified"}
   const styleQuery = `${observation.defectCategory} ${observation.aiNarrative || observation.fieldNote || ""} ${indicators.join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "recommendation", 2);
 
+  // Include observation photos with captions so recommendations can reflect visible severity
+  const obsPhotos = await storage.getPhotosByObservation(observationId);
+  const imageParts = buildCaptionedImageParts(obsPhotos);
+  const hasPhotos = imageParts.length > 0;
+
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    {
+      type: "text",
+      text: `Generate a recommendation for this observation:\n\n${context}${hasPhotos ? "\n\nPhotos of the defect are attached below, each preceded by its engineer-provided caption." : ""}`,
+    },
+    ...imageParts,
+  ];
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
         content: `${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 CONSERVATIVENESS LEVEL: ${conservativeness.toUpperCase()}
 ${conservativeness === "high" ? `HIGH conservativeness:
@@ -425,7 +436,7 @@ Respond ONLY with valid JSON:
       },
       {
         role: "user",
-        content: `Generate a recommendation for this observation:\n\n${context}`,
+        content: userContent,
       },
     ],
     max_tokens: 300,
@@ -441,7 +452,7 @@ Respond ONLY with valid JSON:
 export async function generateGroupNarrative(
   groupName: string,
   observations: Array<{ observationId: string; defectCategory: string; location: string; severity: string; extent: string; fieldNote: string; indicators: string[]; aiNarrative: string }>,
-  photos: Array<{ observationId: string; caption: string }>
+  photos: Array<{ observationId: string; caption: string; filename?: string }>
 ): Promise<string> {
   const client = await getClient();
 
@@ -459,12 +470,43 @@ export async function generateGroupNarrative(
   const styleQuery = `${groupName} ${observations.slice(0, 3).map(o => `${o.defectCategory} ${o.fieldNote}`).join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
 
+  // Build vision input: for each photo that has a filename, include its caption + image
+  const photosWithFiles = photos.filter(p => p.filename) as { observationId: string; caption: string; filename: string }[];
+  const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  const uploadDir = path.join(dataDir, "uploads");
+  for (const p of photosWithFiles) {
+    const filePath = path.join(uploadDir, p.filename);
+    if (!fs.existsSync(filePath)) continue;
+    try {
+      const imageData = fs.readFileSync(filePath);
+      const base64 = imageData.toString("base64");
+      const ext = path.extname(p.filename).toLowerCase();
+      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      const caption = (p.caption || "").trim();
+      imageParts.push({
+        type: "text",
+        text: `Photo for observation ${p.observationId} — caption: ${caption || "(no caption provided)"}`,
+      });
+      imageParts.push({
+        type: "image_url",
+        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
+      });
+    } catch {}
+  }
+  const hasPhotos = imageParts.length > 0;
+
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    { type: "text", text: `Group name: ${groupName}\n\nObservations in this group:\n\n${obsContext}${hasPhotos ? "\n\nPhotos (each preceded by its engineer-provided caption and observation ID) follow below." : ""}` },
+    ...imageParts,
+  ];
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
         content: `${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 You will be given a group name (e.g. "Eastern Facade" or "Sealant Failure") and a set of related observations. Produce ONE combined narrative covering all of them, as a numbered list of defects with lettered sub-items.
 
@@ -502,7 +544,7 @@ Return ONLY the narrative text.${trainingExamples}`,
       },
       {
         role: "user",
-        content: `Group name: ${groupName}\n\nObservations in this group:\n\n${obsContext}`,
+        content: userContent,
       },
     ],
     max_tokens: 700,

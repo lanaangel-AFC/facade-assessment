@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, Sparkles, Loader2 } from "lucide-react";
+import { PhotoCaptionInput } from "@/components/PhotoCaptionInput";
 import type { FacadeSystem, Photo, CustomRoofType } from "@shared/schema";
 import { useState, useRef, useEffect, useCallback } from "react";
 
@@ -669,19 +670,28 @@ export default function SystemForm() {
                 <div key={slot.key} className="space-y-2">
                   <Label className="text-xs">{slot.label}</Label>
                   {photo ? (
-                    <div className="relative group">
-                      <img
-                        src={`${API_BASE}/api/uploads/${photo.filename}`}
-                        alt={slot.label}
-                        className="w-full h-32 object-cover rounded-lg border"
+                    <div className="space-y-1">
+                      <div className="relative group">
+                        <img
+                          src={`${API_BASE}/api/uploads/${photo.filename}`}
+                          alt={slot.label}
+                          className="w-full h-32 object-cover rounded-lg border"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleDeletePhoto(photo.id)}
+                          className="absolute top-1 right-1 p-1 rounded-full bg-background/80 opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <PhotoCaptionInput
+                        photoId={photo.id}
+                        initial={photo.caption || ""}
+                        onSaved={(caption) => {
+                          setPhotos((prev) => prev.map((p) => (p.id === photo.id ? { ...p, caption } : p)));
+                        }}
                       />
-                      <button
-                        type="button"
-                        onClick={() => handleDeletePhoto(photo.id)}
-                        className="absolute top-1 right-1 p-1 rounded-full bg-background/80 opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
                     </div>
                   ) : (
                     <div className="h-32 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-2 text-muted-foreground">

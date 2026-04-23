@@ -974,10 +974,10 @@ export async function registerRoutes(
             aiNarrative: m.aiNarrative || "",
           };
         });
-        const photos: { observationId: string; caption: string }[] = [];
+        const photos: { observationId: string; caption: string; filename: string }[] = [];
         for (const m of members) {
           const ps = await storage.getPhotosByObservation(m.id);
-          for (const p of ps) photos.push({ observationId: m.observationId, caption: p.caption || "" });
+          for (const p of ps) photos.push({ observationId: m.observationId, caption: p.caption || "", filename: p.filename });
         }
         const narrative = await generateGroupNarrative(g.name, obsPayload, photos);
         await storage.updateGroup(g.id, { combinedNarrative: narrative } as any);
