@@ -25,6 +25,7 @@ export const projects = sqliteTable("projects", {
   projectElevations: text("project_elevations").default("[]"), // JSON array of elevation label strings for this building
   roofPlanImagePath: text("roof_plan_image_path").default(""),
   roofPlanOriginalName: text("roof_plan_original_name").default(""),
+  projectContext: text("project_context").default(""),
   createdAt: text("created_at").notNull(),
 });
 

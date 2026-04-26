@@ -65,6 +65,37 @@ function buildCaptionedImageParts(
 
 const CAPTION_GUIDANCE = `Each image is preceded by its caption (provided by the engineer on-site). Read captions as authoritative context — they describe what the engineer observed that may not be visually obvious.`;
 
+/**
+ * Build a PROJECT CONTEXT block to inject into AI prompts.
+ * Returns "" if no context is configured for the project.
+ */
+function buildProjectContextBlock(projectContext: string | null | undefined): string {
+  if (!projectContext || !projectContext.trim()) return "";
+  return `PROJECT CONTEXT (provided by the engineer — read carefully and weigh when forming recommendations and analysis):
+
+${projectContext.trim()}
+
+When relevant, factor this PROJECT CONTEXT into recommendations and analysis. For example, if context mentions imminent works in a particular area, recommend that adjacent or related items be addressed within that scope where reasonable. Do not invent context — only use what is explicitly provided.
+
+---
+
+`;
+}
+
+/**
+ * Resolve the project context for a given project id. Returns "" if not set
+ * or if the lookup fails — callers should be defensive.
+ */
+async function getProjectContextById(projectId: number | null | undefined): Promise<string> {
+  if (!projectId) return "";
+  try {
+    const project = await storage.getProject(projectId);
+    return ((project as any)?.projectContext || "") as string;
+  } catch {
+    return "";
+  }
+}
+
 // Load training data for style calibration
 async function getTrainingExamples(outputType: string, limit: number = 3): Promise<string> {
   try {
@@ -80,7 +111,7 @@ async function getTrainingExamples(outputType: string, limit: number = 3): Promi
   }
 }
 
-export async function identifySystem(photoIds: number[]): Promise<{
+export async function identifySystem(photoIds: number[], projectContext: string = ""): Promise<{
   systemType: string;
   materials: { name: string; detail: string }[];
   keyFeatures: string[];
@@ -90,10 +121,14 @@ export async function identifySystem(photoIds: number[]): Promise<{
   const client = await getClient();
 
   const photosToSend: { filename: string; caption?: string | null }[] = [];
+  let resolvedContext = projectContext;
   for (const photoId of photoIds) {
     const photo = await storage.getPhoto(photoId);
     if (!photo) continue;
     photosToSend.push(photo);
+    if (!resolvedContext) {
+      resolvedContext = await getProjectContextById((photo as any).projectId);
+    }
   }
   const captionedParts = buildCaptionedImageParts(photosToSend);
 
@@ -101,12 +136,14 @@ export async function identifySystem(photoIds: number[]): Promise<{
     throw new Error("No valid photos found for analysis.");
   }
 
+  const contextBlock = buildProjectContextBlock(resolvedContext);
+
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
+        content: `${contextBlock}You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
 
 ${CAPTION_GUIDANCE}
 
@@ -174,9 +211,11 @@ Related Systems: ${system.relatedSystems || "None noted"}
   const trainingExamples = await getTrainingExamples("system_description");
   const styleQuery = `${system.systemType} ${materials.map(m => m.name + " " + m.detail).join(" ")} ${keyFeatures.join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "description", 2);
+  const projectContext = await getProjectContextById(system.projectId);
+  const contextBlock = buildProjectContextBlock(projectContext);
 
   const hasPhotos = imageParts.length > 0;
-  const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
 ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
@@ -268,8 +307,10 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}
   const trainingExamples = await getTrainingExamples("observation_narrative");
   const styleQuery = `${observation.defectCategory} ${observation.fieldNote || ""} ${indicators.join(" ")} ${existingNarrative || ""}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
+  const projectContext = await getProjectContextById(observation.projectId);
+  const contextBlock = buildProjectContextBlock(projectContext);
 
-  const systemPrompt = `${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
 ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use numbered points with lettered sub-items (a, b, c) for details.
@@ -373,6 +414,8 @@ Indicators: ${indicators.join(", ") || "None specified"}
   const trainingExamples = await getTrainingExamples("recommendation");
   const styleQuery = `${observation.defectCategory} ${observation.aiNarrative || observation.fieldNote || ""} ${indicators.join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "recommendation", 2);
+  const projectContext = await getProjectContextById(observation.projectId);
+  const contextBlock = buildProjectContextBlock(projectContext);
 
   // Include observation photos with captions so recommendations can reflect visible severity
   const obsPhotos = await storage.getPhotosByObservation(observationId);
@@ -392,7 +435,7 @@ Indicators: ${indicators.join(", ") || "None specified"}
     messages: [
       {
         role: "system",
-        content: `${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 CONSERVATIVENESS LEVEL: ${conservativeness.toUpperCase()}
@@ -452,7 +495,8 @@ Respond ONLY with valid JSON:
 export async function generateGroupNarrative(
   groupName: string,
   observations: Array<{ observationId: string; defectCategory: string; location: string; severity: string; extent: string; fieldNote: string; indicators: string[]; aiNarrative: string }>,
-  photos: Array<{ observationId: string; caption: string; filename?: string }>
+  photos: Array<{ observationId: string; caption: string; filename?: string }>,
+  projectId?: number
 ): Promise<string> {
   const client = await getClient();
 
@@ -469,6 +513,8 @@ export async function generateGroupNarrative(
   const trainingExamples = await getTrainingExamples("group_narrative");
   const styleQuery = `${groupName} ${observations.slice(0, 3).map(o => `${o.defectCategory} ${o.fieldNote}`).join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
+  const projectContext = await getProjectContextById(projectId);
+  const contextBlock = buildProjectContextBlock(projectContext);
 
   // Build vision input: for each photo that has a filename, include its caption + image
   const photosWithFiles = photos.filter(p => p.filename) as { observationId: string; caption: string; filename: string }[];
@@ -505,7 +551,7 @@ export async function generateGroupNarrative(
     messages: [
       {
         role: "system",
-        content: `${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 You will be given a group name (e.g. "Eastern Facade" or "Sealant Failure") and a set of related observations. Produce ONE combined narrative covering all of them, as a numbered list of defects with lettered sub-items.
@@ -606,13 +652,14 @@ Summary Statistics:
   const trainingExamples = await getTrainingExamples("executive_summary");
   const styleQuery = `${project.name} ${project.address} ${project.buildingUse || ""} ${systems.map(s => s.systemType).join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "general", 2);
+  const contextBlock = buildProjectContextBlock((project as any).projectContext);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
+        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
 
 STYLE RULES:
 - Be concise. Summarise what was done, what was found, and what needs to happen.

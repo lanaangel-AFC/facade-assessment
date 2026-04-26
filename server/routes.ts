@@ -979,7 +979,7 @@ export async function registerRoutes(
           const ps = await storage.getPhotosByObservation(m.id);
           for (const p of ps) photos.push({ observationId: m.observationId, caption: p.caption || "", filename: p.filename });
         }
-        const narrative = await generateGroupNarrative(g.name, obsPayload, photos);
+        const narrative = await generateGroupNarrative(g.name, obsPayload, photos, projectId);
         await storage.updateGroup(g.id, { combinedNarrative: narrative } as any);
         results.push({ id: g.id, combinedNarrative: narrative });
       }

@@ -223,6 +223,9 @@ try { sqlite.exec(`ALTER TABLE observations ADD COLUMN group_id INTEGER DEFAULT 
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_image_path TEXT DEFAULT ''`); } catch {}
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_original_name TEXT DEFAULT ''`); } catch {}
 
+// Project Context — free-form notes fed into AI generation prompts
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN project_context TEXT DEFAULT ''`); } catch {}
+
 // Roof types column on facade_systems
 try { sqlite.exec(`ALTER TABLE facade_systems ADD COLUMN roof_types TEXT DEFAULT '[]'`); } catch {}
 

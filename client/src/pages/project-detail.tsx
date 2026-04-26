@@ -565,6 +565,42 @@ export default function ProjectDetail() {
               </div>
             </Card>
 
+            {/* Project Context — free-form notes fed into all AI generation prompts */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-primary" />
+                    Project Context (read by AI)
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Free-form notes about the building, ongoing or imminent works, client priorities, occupancy,
+                    sensitivities, or anything else the AI should know when generating text. Recommendations,
+                    narratives, and the executive summary will reference this context.
+                  </p>
+                </div>
+                <span className="text-xs text-muted-foreground whitespace-nowrap ml-3">
+                  {updateMutation.isPending ? "Saving..." : (editForm.projectContext ? "Saved" : "")}
+                </span>
+              </div>
+              <Textarea
+                value={editForm.projectContext || ""}
+                onChange={e => {
+                  updateField("projectContext", e.target.value);
+                  e.target.style.height = "auto";
+                  e.target.style.height = e.target.scrollHeight + "px";
+                }}
+                rows={6}
+                className="min-h-[140px] overflow-hidden resize-none"
+                placeholder="e.g. Lobby, ground level forecourt and several roof and facade elements adjacent to the lobby are being replaced in a large upgrade due to commence in Q3. Recommendations for items in this area can reasonably be added to that scope. Building is occupied by tenants on Levels 2-12 — restrict invasive work outside business hours. Client priority: minimise temporary scaffolding."
+                ref={(el) => {
+                  if (el && el.scrollHeight > el.clientHeight) {
+                    el.style.height = el.scrollHeight + "px";
+                  }
+                }}
+              />
+            </Card>
+
             {/* Building Elevations */}
             <Card className="p-4 space-y-3">
               <h3 className="text-sm font-medium">Building Elevations</h3>
