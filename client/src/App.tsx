@@ -11,6 +11,7 @@ import SystemForm from "@/pages/system-form";
 import ObservationForm from "@/pages/observation-form";
 import ElevationView from "@/pages/elevation-view";
 import ObservationGroupsPage from "@/pages/observation-groups";
+import CapexPage from "@/pages/capex";
 import Settings from "@/pages/settings";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
 
@@ -27,6 +28,11 @@ function SystemFormKeyed() {
   return <SystemForm key={systemId || "new"} />;
 }
 
+function CapexPageKeyed() {
+  const { projectId } = useParams<{ projectId?: string }>();
+  return <CapexPage key={projectId || "none"} />;
+}
+
 function AppRouter() {
   return (
     <Switch>
@@ -37,6 +43,7 @@ function AppRouter() {
       <Route path="/projects/:projectId/observations/new" component={ObservationFormKeyed} />
       <Route path="/projects/:projectId/observations/:observationId" component={ObservationFormKeyed} />
       <Route path="/projects/:id/groups" component={ObservationGroupsPage} />
+      <Route path="/projects/:projectId/capex" component={CapexPageKeyed} />
       <Route path="/projects/:id/elevations/:elevationId" component={ElevationView} />
       <Route path="/settings" component={Settings} />
       <Route component={NotFound} />

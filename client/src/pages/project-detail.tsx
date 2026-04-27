@@ -364,6 +364,12 @@ export default function ProjectDetail() {
               Mark Inspection Complete
             </Button>
           )}
+          <Link href={`/projects/${id}/capex`}>
+            <Button variant="outline" size="sm">
+              <DollarSign className="w-4 h-4 mr-2" />
+              Edit CAPEX
+            </Button>
+          </Link>
           <Button
             variant="outline"
             size="sm"
@@ -1078,7 +1084,15 @@ export default function ProjectDetail() {
 
         {/* === CAPEX TAB === */}
         <TabsContent value="capex">
-          <h2 className="text-lg font-medium mb-4">Capital Expenditure Summary</h2>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-medium">Capital Expenditure Summary</h2>
+            <Link href={`/projects/${id}/capex`}>
+              <Button size="sm" variant="outline">
+                <DollarSign className="w-4 h-4 mr-2" />
+                Open editable schedule
+              </Button>
+            </Link>
+          </div>
           {!capexRows.length ? (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <DollarSign className="w-10 h-10 text-muted-foreground/40 mb-3" />
