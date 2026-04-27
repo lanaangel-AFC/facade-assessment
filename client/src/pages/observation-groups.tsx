@@ -10,9 +10,9 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { ArrowLeft, ChevronDown, ChevronRight, Sparkles, Loader2, Edit, Merge, Trash2, Save, Undo2 } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, Sparkles, Loader2, Edit, Merge, Trash2, Save, Undo2, Plus, ArrowUp, ArrowDown } from "lucide-react";
 import type { Project, Photo } from "@shared/schema";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -35,6 +35,8 @@ type GroupWithObs = {
   projectId: number;
   name: string;
   groupKey: string;
+  groupingCriterion?: string | null;
+  displayOrder?: number | null;
   sortOrder: number | null;
   combinedNarrative: string | null;
   observations: GroupedObservation[];
@@ -50,13 +52,33 @@ const severityColor = (s: string) => {
   }
 };
 
+const SUGGESTED_CRITERIA = ["Type", "Location", "System", "Elevation", "Level", "Severity"];
+
+// Deterministic muted color per criterion for visual differentiation
+const criterionColor = (criterion: string): string => {
+  const palette = [
+    "bg-blue-50 text-blue-700 border-blue-200",
+    "bg-emerald-50 text-emerald-700 border-emerald-200",
+    "bg-purple-50 text-purple-700 border-purple-200",
+    "bg-amber-50 text-amber-700 border-amber-200",
+    "bg-rose-50 text-rose-700 border-rose-200",
+    "bg-teal-50 text-teal-700 border-teal-200",
+    "bg-indigo-50 text-indigo-700 border-indigo-200",
+    "bg-orange-50 text-orange-700 border-orange-200",
+  ];
+  if (!criterion) return "bg-gray-50 text-gray-600 border-gray-200";
+  let h = 0;
+  for (let i = 0; i < criterion.length; i++) h = (h * 31 + criterion.charCodeAt(i)) >>> 0;
+  return palette[h % palette.length];
+};
+
 export default function ObservationGroupsPage() {
   const { id } = useParams<{ id: string }>();
   const [, navigate] = useLocation();
   const { toast } = useToast();
 
   const { data: project } = useQuery<Project>({ queryKey: ["/api/projects", id] });
-  const { data: groups, refetch } = useQuery<GroupWithObs[]>({
+  const { data: groups } = useQuery<GroupWithObs[]>({
     queryKey: [`/api/projects/${id}/observation-groups`],
   });
 
@@ -64,6 +86,9 @@ export default function ObservationGroupsPage() {
   const [narratives, setNarratives] = useState<Record<number, string>>({});
   const [renameId, setRenameId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [renameCriterion, setRenameCriterion] = useState("");
+  const [renameCustomCriterion, setRenameCustomCriterion] = useState("");
+  const [renameUseCustom, setRenameUseCustom] = useState(false);
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
   const [mergeSource, setMergeSource] = useState<number | null>(null);
   const [mergeTarget, setMergeTarget] = useState<string>("");
@@ -72,7 +97,25 @@ export default function ObservationGroupsPage() {
   const [moveTarget, setMoveTarget] = useState<string>("");
   const [generating, setGenerating] = useState(false);
 
+  // Create-group dialog state
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createDescription, setCreateDescription] = useState("");
+  const [createCriterion, setCreateCriterion] = useState<string>("Type");
+  const [createCustomCriterion, setCreateCustomCriterion] = useState("");
+  const [createUseCustom, setCreateUseCustom] = useState(false);
+
   const toggle = (gid: number) => setExpanded(prev => ({ ...prev, [gid]: !prev[gid] }));
+
+  const projectCriteria = useMemo(() => {
+    const seen = new Set<string>();
+    (groups || []).forEach(g => {
+      const c = (g.groupingCriterion || "").trim();
+      if (c) seen.add(c);
+    });
+    SUGGESTED_CRITERIA.forEach(c => seen.add(c));
+    return Array.from(seen);
+  }, [groups]);
 
   const rebuildMutation = useMutation({
     mutationFn: async (grouping: string) => {
@@ -98,14 +141,32 @@ export default function ObservationGroupsPage() {
 
   const renameGroup = async () => {
     if (!renameId || !renameValue.trim()) return;
+    const criterion = renameUseCustom ? renameCustomCriterion.trim() : renameCriterion;
     try {
-      await apiRequest("PATCH", `/api/observation-groups/${renameId}`, { name: renameValue.trim() });
+      await apiRequest("PATCH", `/api/observation-groups/${renameId}`, {
+        name: renameValue.trim(),
+        groupingCriterion: criterion,
+      });
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/observation-groups`] });
       setRenameId(null);
       setRenameValue("");
-      toast({ title: "Group renamed" });
+      setRenameCriterion("");
+      setRenameCustomCriterion("");
+      setRenameUseCustom(false);
+      toast({ title: "Group updated" });
     } catch (err: any) {
-      toast({ title: err.message || "Rename failed", variant: "destructive" });
+      toast({ title: err.message || "Update failed", variant: "destructive" });
+    }
+  };
+
+  const deleteGroup = async (gid: number) => {
+    if (!confirm("Delete this group? Observations will be unassigned (not deleted).")) return;
+    try {
+      await apiRequest("DELETE", `/api/observation-groups/${gid}`, undefined);
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/observation-groups`] });
+      toast({ title: "Group deleted" });
+    } catch (err: any) {
+      toast({ title: err.message || "Delete failed", variant: "destructive" });
     }
   };
 
@@ -175,10 +236,52 @@ export default function ObservationGroupsPage() {
     }
   };
 
+  const createGroup = async () => {
+    const name = createName.trim();
+    if (!name) return;
+    const criterion = createUseCustom ? createCustomCriterion.trim() : createCriterion;
+    try {
+      await apiRequest("POST", `/api/projects/${id}/observation-groups`, {
+        name,
+        groupingCriterion: criterion,
+        combinedNarrative: createDescription.trim(),
+      });
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/observation-groups`] });
+      setCreateOpen(false);
+      setCreateName("");
+      setCreateDescription("");
+      setCreateCriterion("Type");
+      setCreateCustomCriterion("");
+      setCreateUseCustom(false);
+      toast({ title: "Group created" });
+    } catch (err: any) {
+      toast({ title: err.message || "Create failed", variant: "destructive" });
+    }
+  };
+
+  const reorder = async (gid: number, direction: -1 | 1) => {
+    if (!groups) return;
+    const ids = groups.map(g => g.id);
+    const idx = ids.indexOf(gid);
+    if (idx === -1) return;
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= ids.length) return;
+    const reordered = [...ids];
+    [reordered[idx], reordered[newIdx]] = [reordered[newIdx], reordered[idx]];
+    try {
+      await apiRequest("POST", `/api/projects/${id}/groups/reorder`, { orderedIds: reordered });
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${id}/observation-groups`] });
+    } catch (err: any) {
+      toast({ title: err.message || "Reorder failed", variant: "destructive" });
+    }
+  };
+
   const groupingLabel = project?.observationGrouping === "by_elevation"
     ? "By Elevation / Area"
     : project?.observationGrouping === "by_type"
     ? "By Type of Observation"
+    : project?.observationGrouping
+    ? "Mixed criteria"
     : "";
 
   return (
@@ -203,7 +306,7 @@ export default function ObservationGroupsPage() {
         </div>
       </div>
 
-      <div className="flex gap-2 mb-4">
+      <div className="flex gap-2 mb-4 flex-wrap">
         <Button
           variant="outline"
           size="sm"
@@ -220,30 +323,73 @@ export default function ObservationGroupsPage() {
         >
           Rebuild by Elevation
         </Button>
+        <Button
+          variant="default"
+          size="sm"
+          onClick={() => setCreateOpen(true)}
+        >
+          <Plus className="w-4 h-4 mr-1" /> New Group
+        </Button>
       </div>
+
+      <p className="text-xs text-muted-foreground mb-4">
+        You can mix grouping criteria — some groups can be by Type, others by Location or any custom criterion you define.
+      </p>
 
       {(!groups || groups.length === 0) ? (
         <div className="text-sm text-muted-foreground text-center py-12">
-          No groups yet. Choose a grouping method above to rebuild.
+          No groups yet. Choose a grouping method above, or create groups manually.
         </div>
       ) : (
         <div className="space-y-4">
-          {groups.map((g) => {
+          {groups.map((g, idx) => {
             const isOpen = !!expanded[g.id];
+            const criterion = (g.groupingCriterion || "").trim();
             return (
               <Card key={g.id} className="overflow-hidden">
                 <div className="flex items-center justify-between p-4 bg-accent/30 cursor-pointer" onClick={() => toggle(g.id)}>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                     <h3 className="font-medium">{g.name}</h3>
+                    {criterion && (
+                      <Badge variant="outline" className={`text-xs border ${criterionColor(criterion)}`}>
+                        {criterion}
+                      </Badge>
+                    )}
                     <Badge variant="secondary">{g.observations.length}</Badge>
                   </div>
                   <div className="flex gap-1 items-center" onClick={(e) => e.stopPropagation()}>
-                    <Button type="button" variant="ghost" size="sm" onClick={() => { setRenameId(g.id); setRenameValue(g.name); }}>
-                      <Edit className="w-3.5 h-3.5 mr-1" /> Rename
+                    <Button type="button" variant="ghost" size="icon" className="h-8 w-8" onClick={() => reorder(g.id, -1)} disabled={idx === 0} title="Move up">
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </Button>
+                    <Button type="button" variant="ghost" size="icon" className="h-8 w-8" onClick={() => reorder(g.id, 1)} disabled={idx === (groups.length - 1)} title="Move down">
+                      <ArrowDown className="w-3.5 h-3.5" />
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => {
+                      setRenameId(g.id);
+                      setRenameValue(g.name);
+                      const c = (g.groupingCriterion || "").trim();
+                      if (c && SUGGESTED_CRITERIA.includes(c)) {
+                        setRenameCriterion(c);
+                        setRenameUseCustom(false);
+                        setRenameCustomCriterion("");
+                      } else if (c) {
+                        setRenameUseCustom(true);
+                        setRenameCustomCriterion(c);
+                        setRenameCriterion("");
+                      } else {
+                        setRenameCriterion("Type");
+                        setRenameUseCustom(false);
+                        setRenameCustomCriterion("");
+                      }
+                    }}>
+                      <Edit className="w-3.5 h-3.5 mr-1" /> Edit
                     </Button>
                     <Button type="button" variant="ghost" size="sm" onClick={() => { setMergeSource(g.id); setMergeDialogOpen(true); }}>
                       <Merge className="w-3.5 h-3.5 mr-1" /> Merge
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => deleteGroup(g.id)} title="Delete group">
+                      <Trash2 className="w-3.5 h-3.5" />
                     </Button>
                   </div>
                 </div>
@@ -318,15 +464,130 @@ export default function ObservationGroupsPage() {
         </div>
       </div>
 
-      {/* Rename dialog */}
+      {/* Create group dialog */}
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>New Observation Group</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label>Group name</Label>
+              <Input
+                value={createName}
+                onChange={(e) => setCreateName(e.target.value)}
+                placeholder="e.g. Sealant defects on north elevation"
+              />
+            </div>
+            <div>
+              <Label>Grouping criterion</Label>
+              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                {Array.from(new Set([...SUGGESTED_CRITERIA, ...projectCriteria])).map(c => (
+                  <button
+                    type="button"
+                    key={c}
+                    onClick={() => { setCreateCriterion(c); setCreateUseCustom(false); }}
+                    className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                      !createUseCustom && createCriterion === c
+                        ? `${criterionColor(c)} ring-1 ring-offset-1 ring-current`
+                        : "bg-background hover:bg-accent"
+                    }`}
+                  >
+                    {c}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setCreateUseCustom(true)}
+                  className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                    createUseCustom
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background hover:bg-accent"
+                  }`}
+                >
+                  + New criterion
+                </button>
+              </div>
+              {createUseCustom && (
+                <Input
+                  className="mt-2"
+                  value={createCustomCriterion}
+                  onChange={(e) => setCreateCustomCriterion(e.target.value)}
+                  placeholder="Type a custom criterion (e.g. Trade, Phase, Priority)"
+                />
+              )}
+            </div>
+            <div>
+              <Label>Description / narrative (optional)</Label>
+              <Textarea
+                rows={3}
+                value={createDescription}
+                onChange={(e) => setCreateDescription(e.target.value)}
+                placeholder="Optional starter notes — AI can expand on this later."
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button>
+            <Button
+              onClick={createGroup}
+              disabled={!createName.trim() || (createUseCustom && !createCustomCriterion.trim())}
+            >
+              Create Group
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit (rename + criterion) dialog */}
       <Dialog open={renameId !== null} onOpenChange={(open) => { if (!open) setRenameId(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Rename Group</DialogTitle>
+            <DialogTitle>Edit Group</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
-            <Label>Name</Label>
-            <Input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} />
+            <div>
+              <Label>Name</Label>
+              <Input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} />
+            </div>
+            <div>
+              <Label>Grouping criterion</Label>
+              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                {Array.from(new Set([...SUGGESTED_CRITERIA, ...projectCriteria])).map(c => (
+                  <button
+                    type="button"
+                    key={c}
+                    onClick={() => { setRenameCriterion(c); setRenameUseCustom(false); }}
+                    className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                      !renameUseCustom && renameCriterion === c
+                        ? `${criterionColor(c)} ring-1 ring-offset-1 ring-current`
+                        : "bg-background hover:bg-accent"
+                    }`}
+                  >
+                    {c}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setRenameUseCustom(true)}
+                  className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                    renameUseCustom
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background hover:bg-accent"
+                  }`}
+                >
+                  + New criterion
+                </button>
+              </div>
+              {renameUseCustom && (
+                <Input
+                  className="mt-2"
+                  value={renameCustomCriterion}
+                  onChange={(e) => setRenameCustomCriterion(e.target.value)}
+                  placeholder="Type a custom criterion"
+                />
+              )}
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setRenameId(null)}>Cancel</Button>

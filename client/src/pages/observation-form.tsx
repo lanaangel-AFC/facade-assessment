@@ -16,7 +16,7 @@ import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2, Download,
 } from "lucide-react";
 import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin, Project } from "@shared/schema";
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -152,6 +152,52 @@ export default function ObservationForm() {
   const { data: indicatorData } = useQuery<{ defaults: string[]; custom: { id: number; name: string }[] }>({
     queryKey: [`/api/projects/${projectId}/indicators`],
   });
+
+  // Fetch project-scoped custom defect categories
+  const { data: customDefectCategories } = useQuery<{ id: number; name: string }[]>({
+    queryKey: [`/api/projects/${projectId}/custom-defect-categories`],
+  });
+
+  // "Other" custom defect category UI state
+  const [showCustomCategoryInput, setShowCustomCategoryInput] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [savingCategory, setSavingCategory] = useState(false);
+
+  const builtInCategorySet = useMemo(() => new Set(DEFECT_CATEGORIES.filter(c => c !== "Other")), []);
+  const allCategoryOptions = useMemo(() => {
+    const builtIns = DEFECT_CATEGORIES.filter(c => c !== "Other");
+    return { builtIns, customs: (customDefectCategories || []).filter(c => !builtInCategorySet.has(c.name)) };
+  }, [customDefectCategories, builtInCategorySet]);
+
+  const saveCustomCategory = async () => {
+    const name = newCategoryName.trim();
+    if (!name) return;
+    setSavingCategory(true);
+    try {
+      const res = await apiRequest("POST", `/api/projects/${projectId}/custom-defect-categories`, { name });
+      const data = await res.json();
+      await queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/custom-defect-categories`] });
+      setForm(prev => ({ ...prev, defectCategory: data.name }));
+      setShowCustomCategoryInput(false);
+      setNewCategoryName("");
+      toast({ title: "Category added" });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to add category", variant: "destructive" });
+    } finally {
+      setSavingCategory(false);
+    }
+  };
+
+  const deleteCustomCategory = async (id: number, name: string) => {
+    if (!confirm(`Delete custom category "${name}"? This will not change observations already saved with this category.`)) return;
+    try {
+      await apiRequest("DELETE", `/api/custom-defect-categories/${id}`, undefined);
+      queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/custom-defect-categories`] });
+      toast({ title: "Category removed" });
+    } catch (err: any) {
+      toast({ title: err.message || "Delete failed", variant: "destructive" });
+    }
+  };
 
   // Elevations and existing pin
   const { data: elevations } = useQuery<Elevation[]>({
@@ -665,16 +711,63 @@ export default function ObservationForm() {
         {/* Defect Category */}
         <div>
           <Label>Defect Category</Label>
-          <Select value={form.defectCategory} onValueChange={(val) => setForm({ ...form, defectCategory: val })}>
+          <Select
+            value={form.defectCategory}
+            onValueChange={(val) => {
+              if (val === "__OTHER__") {
+                setShowCustomCategoryInput(true);
+              } else {
+                setShowCustomCategoryInput(false);
+                setForm({ ...form, defectCategory: val });
+              }
+            }}
+          >
             <SelectTrigger>
               <SelectValue placeholder="Select defect category" />
             </SelectTrigger>
             <SelectContent>
-              {DEFECT_CATEGORIES.map((cat) => (
+              {allCategoryOptions.builtIns.map((cat) => (
                 <SelectItem key={cat} value={cat}>{cat}</SelectItem>
               ))}
+              {allCategoryOptions.customs.map((c) => (
+                <SelectItem key={c.id} value={c.name} className="pr-9 group">
+                  <span className="inline-flex items-center gap-2">
+                    {c.name}
+                    <span className="text-[10px] text-muted-foreground">(custom)</span>
+                  </span>
+                  <button
+                    type="button"
+                    onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteCustomCategory(c.id, c.name); }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-destructive p-0.5"
+                    title="Remove custom category"
+                    aria-label={`Remove custom category ${c.name}`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </SelectItem>
+              ))}
+              <SelectItem value="__OTHER__">Other...</SelectItem>
             </SelectContent>
           </Select>
+          {showCustomCategoryInput && (
+            <div className="flex gap-2 mt-2">
+              <Input
+                value={newCategoryName}
+                onChange={(e) => setNewCategoryName(e.target.value)}
+                placeholder="New category name"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); saveCustomCategory(); }
+                }}
+              />
+              <Button type="button" size="sm" onClick={saveCustomCategory} disabled={!newCategoryName.trim() || savingCategory}>
+                {savingCategory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Save category"}
+              </Button>
+              <Button type="button" size="sm" variant="ghost" onClick={() => { setShowCustomCategoryInput(false); setNewCategoryName(""); }}>
+                Cancel
+              </Button>
+            </div>
+          )}
         </div>
 
         {/* Severity & Extent */}

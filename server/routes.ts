@@ -868,15 +868,18 @@ export async function registerRoutes(
     const createdAt = new Date().toISOString();
     let sortOrder = 0;
     const created: any[] = [];
+    const criterionLabel = grouping === "by_elevation" ? "Location" : "Type";
     for (const [key, list] of Object.entries(groupedKeys)) {
       const group = await storage.createGroup({
         projectId,
         name: key,
         groupKey: key,
+        groupingCriterion: criterionLabel,
+        displayOrder: sortOrder,
         sortOrder: sortOrder++,
         combinedNarrative: "",
         createdAt,
-      });
+      } as any);
       for (const o of list) {
         await storage.updateObservation(o.id, { groupId: group.id } as any);
       }
@@ -890,7 +893,7 @@ export async function registerRoutes(
   app.get("/api/projects/:id/observation-groups", async (req, res) => {
     const projectId = Number(req.params.id);
     const groups = await storage.getGroupsByProject(projectId);
-    groups.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+    groups.sort((a, b) => ((a as any).displayOrder ?? a.sortOrder ?? 0) - ((b as any).displayOrder ?? b.sortOrder ?? 0) || a.id - b.id);
     const allObs = await storage.getObservationsByProject(projectId);
 
     const result = await Promise.all(groups.map(async (g) => {
@@ -909,6 +912,40 @@ export async function registerRoutes(
     const updated = await storage.updateGroup(Number(req.params.id), req.body);
     if (!updated) return res.status(404).json({ message: "Group not found" });
     res.json(updated);
+  });
+
+  // Create a single new group (used for mixed-criteria manual grouping)
+  app.post("/api/projects/:id/observation-groups", async (req, res) => {
+    const projectId = Number(req.params.id);
+    const project = await storage.getProject(projectId);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+    const name = (req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ message: "name is required" });
+    const groupingCriterion = (req.body?.groupingCriterion || "").trim();
+    const combinedNarrative = (req.body?.combinedNarrative || "").trim();
+    const existingGroups = await storage.getGroupsByProject(projectId);
+    const nextOrder = existingGroups.length;
+    const group = await storage.createGroup({
+      projectId,
+      name,
+      groupKey: name,
+      groupingCriterion,
+      displayOrder: nextOrder,
+      sortOrder: nextOrder,
+      combinedNarrative,
+      createdAt: new Date().toISOString(),
+    } as any);
+    res.status(201).json(group);
+  });
+
+  // Reorder groups within a project
+  app.post("/api/projects/:id/groups/reorder", async (req, res) => {
+    const projectId = Number(req.params.id);
+    const orderedIds = (req.body?.orderedIds || []) as Array<number | string>;
+    if (!Array.isArray(orderedIds)) return res.status(400).json({ message: "orderedIds must be an array" });
+    const ids = orderedIds.map(n => Number(n)).filter(n => !isNaN(n));
+    await storage.reorderObservationGroups(projectId, ids);
+    res.json({ ok: true });
   });
 
   app.delete("/api/observation-groups/:id", async (req, res) => {
@@ -979,7 +1016,7 @@ export async function registerRoutes(
           const ps = await storage.getPhotosByObservation(m.id);
           for (const p of ps) photos.push({ observationId: m.observationId, caption: p.caption || "", filename: p.filename });
         }
-        const narrative = await generateGroupNarrative(g.name, obsPayload, photos, projectId);
+        const narrative = await generateGroupNarrative(g.name, obsPayload, photos, projectId, (g as any).groupingCriterion || "");
         await storage.updateGroup(g.id, { combinedNarrative: narrative } as any);
         results.push({ id: g.id, combinedNarrative: narrative });
       }
@@ -1053,6 +1090,30 @@ export async function registerRoutes(
 
   app.delete("/api/custom-roof-types/:id", async (req, res) => {
     await storage.deleteCustomRoofType(Number(req.params.id));
+    res.status(204).end();
+  });
+
+  // === CUSTOM DEFECT CATEGORIES (project-scoped, available in observation form dropdown) ===
+  app.get("/api/projects/:projectId/custom-defect-categories", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const cats = await storage.getCustomDefectCategoriesByProject(projectId);
+    res.json(cats);
+  });
+
+  app.post("/api/projects/:projectId/custom-defect-categories", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const name = (req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ message: "name is required" });
+    const category = await storage.createCustomDefectCategory({
+      projectId,
+      name,
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(category);
+  });
+
+  app.delete("/api/custom-defect-categories/:id", async (req, res) => {
+    await storage.deleteCustomDefectCategory(Number(req.params.id));
     res.status(204).end();
   });
 
@@ -2028,6 +2089,14 @@ export async function registerRoutes(
             spacing: { before: 300, after: 150 },
           }));
           sectionNum++;
+
+          const grpCriterion = ((grp as any).groupingCriterion || "").trim();
+          if (grpCriterion) {
+            obsChildren.push(new Paragraph({
+              children: [new TextRun({ text: `Grouped by: ${grpCriterion}`, font: "Arial", size: 18, italics: true, color: MUTED })],
+              spacing: { after: 100 },
+            }));
+          }
 
           if (grp.combinedNarrative) {
             const narrativeLines = grp.combinedNarrative.split("\n").filter(l => l.trim());

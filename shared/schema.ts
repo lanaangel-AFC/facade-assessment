@@ -84,6 +84,8 @@ export const observationGroups = sqliteTable("observation_groups", {
   projectId: integer("project_id").notNull(),
   name: text("name").notNull(),
   groupKey: text("group_key").notNull(),
+  groupingCriterion: text("grouping_criterion").default(""), // free-form: "Type", "Location", "System", or custom
+  displayOrder: integer("display_order").default(0),
   sortOrder: integer("sort_order").default(0),
   combinedNarrative: text("combined_narrative").default(""),
   createdAt: text("created_at").notNull(),
@@ -101,6 +103,14 @@ export const customIndicators = sqliteTable("custom_indicators", {
 export const customRoofTypes = sqliteTable("custom_roof_types", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+});
+
+// Custom defect categories — PROJECT-SCOPED, available in observation form dropdown
+export const customDefectCategories = sqliteTable("custom_defect_categories", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  name: text("name").notNull(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -216,6 +226,7 @@ export const insertUserSchema = createInsertSchema(users).pick({ username: true,
 export const insertObservationGroupSchema = createInsertSchema(observationGroups).omit({ id: true });
 export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
 export const insertCustomRoofTypeSchema = createInsertSchema(customRoofTypes).omit({ id: true });
+export const insertCustomDefectCategorySchema = createInsertSchema(customDefectCategories).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
@@ -247,6 +258,8 @@ export type CustomIndicator = typeof customIndicators.$inferSelect;
 export type InsertCustomIndicator = z.infer<typeof insertCustomIndicatorSchema>;
 export type CustomRoofType = typeof customRoofTypes.$inferSelect;
 export type InsertCustomRoofType = z.infer<typeof insertCustomRoofTypeSchema>;
+export type CustomDefectCategory = typeof customDefectCategories.$inferSelect;
+export type InsertCustomDefectCategory = z.infer<typeof insertCustomDefectCategorySchema>;
 export type Drop = typeof drops.$inferSelect;
 export type InsertDrop = z.infer<typeof insertDropSchema>;
 export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;

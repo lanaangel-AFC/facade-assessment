@@ -496,7 +496,8 @@ export async function generateGroupNarrative(
   groupName: string,
   observations: Array<{ observationId: string; defectCategory: string; location: string; severity: string; extent: string; fieldNote: string; indicators: string[]; aiNarrative: string }>,
   photos: Array<{ observationId: string; caption: string; filename?: string }>,
-  projectId?: number
+  projectId?: number,
+  groupingCriterion?: string
 ): Promise<string> {
   const client = await getClient();
 
@@ -541,8 +542,11 @@ export async function generateGroupNarrative(
   }
   const hasPhotos = imageParts.length > 0;
 
+  const criterionLine = (groupingCriterion || "").trim()
+    ? `Grouping criterion: ${groupingCriterion!.trim()} (this is how the group was formed — frame the narrative accordingly, e.g. by defect type, by location/elevation, by system, etc.)\n\n`
+    : "";
   const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
-    { type: "text", text: `Group name: ${groupName}\n\nObservations in this group:\n\n${obsContext}${hasPhotos ? "\n\nPhotos (each preceded by its engineer-provided caption and observation ID) follow below." : ""}` },
+    { type: "text", text: `Group name: ${groupName}\n${criterionLine}Observations in this group:\n\n${obsContext}${hasPhotos ? "\n\nPhotos (each preceded by its engineer-provided caption and observation ID) follow below." : ""}` },
     ...imageParts,
   ];
 

@@ -12,6 +12,7 @@ import {
   type ObservationGroup, type InsertObservationGroup, observationGroups,
   type CustomIndicator, type InsertCustomIndicator, customIndicators,
   type CustomRoofType, type InsertCustomRoofType, customRoofTypes,
+  type CustomDefectCategory, type InsertCustomDefectCategory, customDefectCategories,
   type Drop, type InsertDrop, drops,
   type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
@@ -169,6 +170,12 @@ sqlite.exec(`
     name TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS custom_defect_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS report_library_documents (
     id TEXT PRIMARY KEY,
     original_name TEXT NOT NULL,
@@ -231,6 +238,10 @@ try { sqlite.exec(`ALTER TABLE facade_systems ADD COLUMN roof_types TEXT DEFAULT
 
 // Photo caption column (defensive — already declared in CREATE TABLE above, but add for legacy DBs)
 try { sqlite.exec(`ALTER TABLE photos ADD COLUMN caption TEXT DEFAULT ''`); } catch {}
+
+// Mixed-criteria observation grouping columns
+try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN grouping_criterion TEXT DEFAULT ''`); } catch {}
+try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN display_order INTEGER DEFAULT 0`); } catch {}
 
 export const db = drizzle(sqlite);
 export { dataDir };
@@ -353,6 +364,9 @@ export class DatabaseStorage implements IStorage {
     db.delete(recommendations).where(eq(recommendations.projectId, id)).run();
     db.delete(facadeSystems).where(eq(facadeSystems.projectId, id)).run();
     db.delete(drops).where(eq(drops.projectId, id)).run();
+    db.delete(observationGroups).where(eq(observationGroups.projectId, id)).run();
+    db.delete(customIndicators).where(eq(customIndicators.projectId, id)).run();
+    db.delete(customDefectCategories).where(eq(customDefectCategories.projectId, id)).run();
     db.delete(projects).where(eq(projects.id, id)).run();
   }
 
@@ -526,6 +540,14 @@ export class DatabaseStorage implements IStorage {
   async deleteGroupsByProject(projectId: number): Promise<void> {
     db.delete(observationGroups).where(eq(observationGroups.projectId, projectId)).run();
   }
+  async reorderObservationGroups(projectId: number, orderedIds: number[]): Promise<void> {
+    orderedIds.forEach((gid, idx) => {
+      db.update(observationGroups)
+        .set({ displayOrder: idx, sortOrder: idx } as any)
+        .where(and(eq(observationGroups.id, gid), eq(observationGroups.projectId, projectId)))
+        .run();
+    });
+  }
 
   // Custom Indicators
   async getCustomIndicatorsByProject(projectId: number): Promise<CustomIndicator[]> {
@@ -552,6 +574,27 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteCustomRoofType(id: number): Promise<void> {
     db.delete(customRoofTypes).where(eq(customRoofTypes.id, id)).run();
+  }
+
+  // Custom Defect Categories (PROJECT-SCOPED)
+  async getCustomDefectCategoriesByProject(projectId: number): Promise<CustomDefectCategory[]> {
+    return db.select().from(customDefectCategories)
+      .where(eq(customDefectCategories.projectId, projectId))
+      .orderBy(asc(customDefectCategories.name))
+      .all();
+  }
+  async createCustomDefectCategory(data: InsertCustomDefectCategory): Promise<CustomDefectCategory> {
+    const trimmed = data.name.trim();
+    // Case-insensitive dedupe within the project
+    const existing = db.select().from(customDefectCategories)
+      .where(eq(customDefectCategories.projectId, data.projectId))
+      .all()
+      .find(r => r.name.toLowerCase() === trimmed.toLowerCase());
+    if (existing) return existing;
+    return db.insert(customDefectCategories).values({ ...data, name: trimmed }).returning().get();
+  }
+  async deleteCustomDefectCategory(id: number): Promise<void> {
+    db.delete(customDefectCategories).where(eq(customDefectCategories.id, id)).run();
   }
 
   // Drops (roof plan markers)
