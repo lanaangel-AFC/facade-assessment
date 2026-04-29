@@ -188,6 +188,7 @@ export default function ProjectDetail() {
   const saveTimer = useRef<NodeJS.Timeout | null>(null);
   const [aiSummaryLoading, setAiSummaryLoading] = useState(false);
   const [originalAiSummary, setOriginalAiSummary] = useState<string | null>(null);
+  const [aiIntroLoading, setAiIntroLoading] = useState(false);
 
   useEffect(() => {
     if (project) {
@@ -385,6 +386,14 @@ export default function ProjectDetail() {
           >
             <Download className="w-4 h-4 mr-2" />
             Download Photos
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => window.open(`${API_BASE}/api/export/elevations/${id}`, '_blank')}
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Download Elevations
           </Button>
         </div>
       </div>
@@ -604,6 +613,56 @@ export default function ProjectDetail() {
                     el.style.height = el.scrollHeight + "px";
                   }
                 }}
+              />
+            </Card>
+
+            {/* AI-Generated Introduction — polished Background/Introduction
+                section, used in the Word export's section 2.1. */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-primary" />
+                    AI-Generated Introduction (Background)
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    AFC-style rewrite of your Project Context above, for use as the
+                    Background and Introduction in the Word export. Regenerate after
+                    editing your notes. If empty, the export falls back to the raw
+                    Project Context.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={aiIntroLoading}
+                  onClick={async () => {
+                    setAiIntroLoading(true);
+                    try {
+                      const res = await aiRequest("/api/ai/generate-introduction", { projectId: Number(id) });
+                      const data = await res.json();
+                      updateField("aiIntroduction", data.introduction);
+                      toast({ title: "Introduction generated — review and edit" });
+                    } catch (err: any) {
+                      toast({ title: err.message || "Introduction generation failed", variant: "destructive" });
+                    } finally {
+                      setAiIntroLoading(false);
+                    }
+                  }}
+                >
+                  {aiIntroLoading ? (
+                    <><Loader2 className="w-4 h-4 mr-1 animate-spin" /> Generating...</>
+                  ) : (
+                    <><Sparkles className="w-4 h-4 mr-1" /> {(editForm as any).aiIntroduction ? "Regenerate" : "Generate Introduction"}</>
+                  )}
+                </Button>
+              </div>
+              <Textarea
+                value={(editForm as any).aiIntroduction || ""}
+                onChange={e => updateField("aiIntroduction", e.target.value)}
+                rows={8}
+                placeholder="Click 'Generate Introduction' to have AI rewrite your Project Context above into a polished AFC-style Background/Introduction section."
               />
             </Card>
 

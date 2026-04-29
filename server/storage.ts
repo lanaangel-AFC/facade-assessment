@@ -233,6 +233,9 @@ try { sqlite.exec(`ALTER TABLE projects ADD COLUMN roof_plan_original_name TEXT 
 // Project Context — free-form notes fed into AI generation prompts
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN project_context TEXT DEFAULT ''`); } catch {}
 
+// AI-rewritten introduction (polished Background/Introduction section text)
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN ai_introduction TEXT DEFAULT ''`); } catch {}
+
 // Roof types column on facade_systems
 try { sqlite.exec(`ALTER TABLE facade_systems ADD COLUMN roof_types TEXT DEFAULT '[]'`); } catch {}
 

@@ -604,6 +604,71 @@ Return ONLY the narrative text.${trainingExamples}`,
   return response.choices[0]?.message?.content?.trim() || "";
 }
 
+export async function generateProjectIntroduction(projectId: number): Promise<string> {
+  const client = await getClient();
+  const project = await storage.getProject(projectId);
+  if (!project) throw new Error("Project not found.");
+
+  const rawContext = ((project as any).projectContext || "").trim();
+
+  let dates: string[] = [];
+  try { dates = JSON.parse(project.inspectionDates || "[]"); } catch {}
+  let bgDocs: { title?: string; author?: string; date?: string }[] = [];
+  try { bgDocs = JSON.parse(project.backgroundDocs || "[]"); } catch {}
+
+  const meta = `
+Building / Project: ${project.name}
+Address: ${project.address}
+Client: ${project.client}
+Inspector: ${project.inspector}
+AFC Reference: ${project.afcReference || "Not specified"}
+Building Age: ${project.buildingAge || "Not specified"}
+Building Use: ${project.buildingUse || "Not specified"}
+Storeys: ${project.storeyCount || "Not specified"}
+Refurbishment History: ${project.refurbishmentHistory || "None noted"}
+Inspection Scope: ${project.inspectionScope || "Not specified"}
+Inspection Dates: ${dates.length > 0 ? dates.join(", ") : "Not specified"}
+Background Documents: ${bgDocs.length > 0 ? bgDocs.map(d => `${d.title || "Untitled"}${d.author ? " — " + d.author : ""}${d.date ? " (" + d.date + ")" : ""}`).join("; ") : "None"}
+  `.trim();
+
+  const styleQuery = `${project.name} ${project.address} ${project.buildingUse || ""} ${rawContext}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "general", 2);
+  const descStyleExamples = await getStyleExamples(styleQuery, "description", 1);
+  const combinedStyle = styleExamples + descStyleExamples;
+
+  const userInputBlock = rawContext
+    ? `ENGINEER'S ROUGH NOTES (rewrite into polished prose — do not invent facts beyond these notes and the project metadata):\n\n${rawContext}`
+    : `(No engineer notes were provided — write a concise generic Background and Introduction using only the project metadata above.)`;
+
+  const response = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "system",
+        content: `${combinedStyle}You are AFC, Angel Façade Consulting. Rewrite the engineer's rough background notes into a polished Background and Introduction section for a façade inspection report.
+
+STYLE RULES:
+- Concise, professional, structured. Australian English, Australian facade engineering terminology.
+- No fluff. No marketing language. No boilerplate about the importance of due diligence.
+- Match the voice and sentence structure of the STYLE EXEMPLARS above (if any).
+- Open with one sentence stating that AFC was engaged by the client to assess the building envelope at the address.
+- Follow with concise paragraphs (or short numbered points where appropriate) covering: building character/age/use, refurbishment history, scope of the inspection, dates, and any background context the engineer noted.
+- Do NOT invent details that are not in the engineer's notes or the project metadata.
+- Length: 150-300 words.
+- Return ONLY the introduction text, plain prose with optional light structure (numbered or lettered points only if it genuinely improves clarity). No section heading.`,
+      },
+      {
+        role: "user",
+        content: `Project metadata:\n\n${meta}\n\n${userInputBlock}\n\nRewrite this as the Background and Introduction section of an AFC façade condition assessment report.`,
+      },
+    ],
+    max_tokens: 700,
+    temperature: 0.3,
+  });
+
+  return response.choices[0]?.message?.content?.trim() || "";
+}
+
 export async function generateExecutiveSummary(projectId: number): Promise<string> {
   const client = await getClient();
   const project = await storage.getProject(projectId);

@@ -15,6 +15,7 @@ import {
   generateRecommendation,
   generateExecutiveSummary,
   generateGroupNarrative,
+  generateProjectIntroduction,
 } from "./ai";
 import multer from "multer";
 import path from "path";
@@ -773,6 +774,20 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/ai/generate-introduction", async (req, res) => {
+    try {
+      const { projectId } = req.body;
+      if (!projectId) return res.status(400).json({ message: "projectId is required" });
+      const introduction = await generateProjectIntroduction(Number(projectId));
+      // Persist on the project so the Word export picks it up automatically.
+      await storage.updateProject(Number(projectId), { aiIntroduction: introduction } as any);
+      res.json({ introduction });
+    } catch (err: any) {
+      const status = err.message?.includes("API key") ? 400 : 500;
+      res.status(status).json({ message: err.message || "Introduction generation failed" });
+    }
+  });
+
   app.post("/api/ai/generate-executive-summary", async (req, res) => {
     try {
       const { projectId } = req.body;
@@ -1310,6 +1325,107 @@ export async function registerRoutes(
     }
   });
 
+  // === ANNOTATED ELEVATIONS ZIP EXPORT ===
+  app.get("/api/export/elevations/:projectId", async (req, res) => {
+    try {
+      const projectId = Number(req.params.projectId);
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const projectElevations = await storage.getElevationsByProject(projectId);
+      projectElevations.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+      const allObservations = await storage.getObservationsByProject(projectId);
+      const projectDrops = await storage.getDropsByProject(projectId);
+      projectDrops.sort((a, b) => a.id - b.id);
+
+      // Helper to render an annotated image (elevation or roof plan) to a JPEG buffer.
+      const renderAnnotated = async (
+        srcPath: string,
+        markers: { cx: number; cy: number; label: string; color: string }[]
+      ): Promise<Buffer | null> => {
+        try {
+          const baseImg = sharp(srcPath);
+          const meta = await baseImg.metadata();
+          const W = meta.width || 1600;
+          const H = meta.height || 1200;
+          const radius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
+          const fontSize = Math.round(radius * 0.75);
+          const svgPins = markers.map((m) => {
+            const cx = Math.round((m.cx / 10000) * W);
+            const cy = Math.round((m.cy / 10000) * H);
+            const label = (m.label || "").replace(/[<>&"']/g, "");
+            return `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="${m.color}" stroke="white" stroke-width="3" />
+<text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>`;
+          }).join("");
+          const svgOverlay = Buffer.from(
+            `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgPins}</svg>`
+          );
+          return await baseImg
+            .composite([{ input: svgOverlay, top: 0, left: 0 }])
+            .jpeg({ quality: 90 })
+            .toBuffer();
+        } catch (err) {
+          console.warn("Failed to render annotated image:", err);
+          try { return fs.readFileSync(srcPath); } catch { return null; }
+        }
+      };
+
+      // Pre-render everything so we can return 404 cleanly if there is nothing.
+      type ZipEntry = { buf: Buffer; name: string };
+      const entries: ZipEntry[] = [];
+
+      for (const elev of projectElevations) {
+        const srcPath = path.join(elevationDir, elev.filename);
+        if (!fs.existsSync(srcPath)) continue;
+        const pins = await storage.getPinsByElevation(elev.id);
+        const markers = pins.map((pin) => {
+          const obs = allObservations.find(o => o.id === pin.observationId);
+          const color = obs?.severity === "Safety/Risk" ? "#EF4444"
+            : obs?.severity === "Essential" ? "#F97316"
+            : obs?.severity === "Desirable" ? "#EAB308"
+            : "#22C55E";
+          return { cx: pin.x, cy: pin.y, label: obs?.observationId || String(pin.id), color };
+        });
+        const buf = await renderAnnotated(srcPath, markers);
+        if (!buf) continue;
+        const safeName = (elev.name || `Elevation-${elev.id}`).replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
+        entries.push({ buf, name: `Elevations/Elevation - ${safeName}.jpg` });
+      }
+
+      if (project.roofPlanImagePath) {
+        const roofPlanFilename = path.basename(project.roofPlanImagePath);
+        const roofPlanPath = path.join(roofPlanDir, roofPlanFilename);
+        if (fs.existsSync(roofPlanPath)) {
+          const markers = projectDrops.map((d) => ({
+            cx: d.x, cy: d.y, label: d.dropNumber || String(d.id), color: "#00B5B8",
+          }));
+          const buf = await renderAnnotated(roofPlanPath, markers);
+          if (buf) {
+            entries.push({ buf, name: `Roof Plan/Roof Plan.jpg` });
+          }
+        }
+      }
+
+      if (entries.length === 0) {
+        return res.status(404).json({ message: "No elevations or roof plan to download" });
+      }
+
+      const archiver = require("archiver");
+      const archive = archiver("zip", { zlib: { level: 5 } });
+      const safeProjName = (project.afcReference || project.name).replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeProjName}-Elevations.zip"`);
+      archive.pipe(res);
+      for (const e of entries) archive.append(e.buf, { name: e.name });
+      await archive.finalize();
+    } catch (err: any) {
+      console.error("Elevations export error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ message: err.message || "Elevations export failed" });
+      }
+    }
+  });
+
   // === WORD EXPORT ===
   app.get("/api/export/word/:projectId", async (req, res) => {
     try {
@@ -1387,6 +1503,114 @@ export async function registerRoutes(
       const DARK_GRAY = "333333";
       const MUTED = "666666";
       const ALT_ROW = "F5F5F5";
+
+      // Render narrative text into structured docx paragraphs.
+      // Recognises:
+      //   "1. **Heading**:" / "1. Heading:"          → bold numbered heading line
+      //   "   a. detail" / "a. detail"               → lettered sub-item, indented
+      //   "   i. detail" / "i. detail"               → roman numeral sub-sub-item, more indented
+      //   "**bold**" inline                          → bold run
+      //   blank line                                 → paragraph break
+      // Anything else renders as a plain paragraph.
+      const renderNarrativeParagraphs = (
+        narrative: string,
+        opts: { fontSize?: number; afterSpacing?: number } = {}
+      ): Paragraph[] => {
+        const fontSize = opts.fontSize ?? 22;
+        const afterSpacing = opts.afterSpacing ?? 100;
+        const out: Paragraph[] = [];
+        if (!narrative) return out;
+        const lines = narrative.split(/\r?\n/);
+
+        // Build inline runs from a string with optional **bold** markers.
+        const buildRuns = (text: string, baseProps: { bold?: boolean; italics?: boolean; color?: string } = {}): TextRun[] => {
+          const runs: TextRun[] = [];
+          const re = /\*\*([^*]+)\*\*/g;
+          let lastIdx = 0;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(text)) !== null) {
+            if (m.index > lastIdx) {
+              runs.push(new TextRun({ text: text.slice(lastIdx, m.index), font: "Arial", size: fontSize, ...baseProps }));
+            }
+            runs.push(new TextRun({ text: m[1], font: "Arial", size: fontSize, ...baseProps, bold: true }));
+            lastIdx = m.index + m[0].length;
+          }
+          if (lastIdx < text.length) {
+            runs.push(new TextRun({ text: text.slice(lastIdx), font: "Arial", size: fontSize, ...baseProps }));
+          }
+          if (runs.length === 0) {
+            runs.push(new TextRun({ text, font: "Arial", size: fontSize, ...baseProps }));
+          }
+          return runs;
+        };
+
+        for (const rawLine of lines) {
+          const line = rawLine.replace(/\s+$/, "");
+          if (!line.trim()) continue;
+
+          // Numbered heading: "1. ..." (with optional bold or trailing colon)
+          const numMatch = line.match(/^\s*(\d+)\.\s+(.*)$/);
+          // Lettered sub-item: "a." or "  b."
+          const letterMatch = line.match(/^\s*([a-z])\.\s+(.*)$/i);
+          // Roman numeral sub-sub-item: "i.", "ii.", "iii.", "iv.", etc.
+          const romanMatch = line.match(/^\s*((?:x{0,3})(?:i{1,3}|iv|v|vi{0,3}|ix))\.\s+(.*)$/i);
+          // Bullet
+          const bulletMatch = line.match(/^\s*[\-•]\s+(.*)$/);
+
+          if (romanMatch && /^\s{2,}/.test(rawLine)) {
+            // Indented roman numerals → sub-sub-item
+            out.push(new Paragraph({
+              children: [
+                new TextRun({ text: `${romanMatch[1]}. `, font: "Arial", size: fontSize, bold: false }),
+                ...buildRuns(romanMatch[2]),
+              ],
+              indent: { left: 1080 },
+              spacing: { after: 60 },
+            }));
+            continue;
+          }
+
+          if (letterMatch) {
+            out.push(new Paragraph({
+              children: [
+                new TextRun({ text: `${letterMatch[1]}. `, font: "Arial", size: fontSize, bold: false }),
+                ...buildRuns(letterMatch[2]),
+              ],
+              indent: { left: 720 },
+              spacing: { after: 60 },
+            }));
+            continue;
+          }
+
+          if (numMatch) {
+            // Strip optional trailing colon and ** markers in the heading
+            const headingText = numMatch[2];
+            out.push(new Paragraph({
+              children: [
+                new TextRun({ text: `${numMatch[1]}. `, font: "Arial", size: fontSize, bold: true, color: DARK_GRAY }),
+                ...buildRuns(headingText, { bold: true, color: DARK_GRAY }),
+              ],
+              spacing: { before: 100, after: 60 },
+            }));
+            continue;
+          }
+
+          if (bulletMatch) {
+            out.push(new Paragraph({
+              children: buildRuns(bulletMatch[1]),
+              bullet: { level: 0 },
+              spacing: { after: 60 },
+            }));
+            continue;
+          }
+
+          out.push(new Paragraph({
+            children: buildRuns(line),
+            spacing: { after: afterSpacing },
+          }));
+        }
+        return out;
+      };
 
       // Helper: read photo from disk and return ImageRun or null
       const embedPhoto = (filename: string, caption: string, maxWidth: number): ImageRun | null => {
@@ -1595,14 +1819,7 @@ export async function registerRoutes(
       }));
 
       if (project.executiveSummary) {
-        // Split executive summary into paragraphs
-        const summaryParagraphs = project.executiveSummary.split("\n").filter(l => l.trim());
-        for (const para of summaryParagraphs) {
-          execChildren.push(new Paragraph({
-            children: [new TextRun({ text: para, font: "Arial", size: 22 })],
-            spacing: { after: 150 },
-          }));
-        }
+        execChildren.push(...renderNarrativeParagraphs(project.executiveSummary, { fontSize: 22, afterSpacing: 150 }));
       } else {
         execChildren.push(new Paragraph({
           children: [new TextRun({ text: "Executive summary not yet generated.", font: "Arial", size: 22, italics: true, color: MUTED })],
@@ -1654,10 +1871,22 @@ export async function registerRoutes(
         children: [new TextRun({ text: "2.1 General", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
         spacing: { before: 300, after: 150 },
       }));
-      introChildren.push(new Paragraph({
-        children: [new TextRun({ text: `Angel Fa\u00E7ade Consulting (AFC) was engaged by ${project.client} to carry out a condition assessment of the building envelope(s) at ${project.address}.`, font: "Arial", size: 22 })],
-        spacing: { after: 150 },
-      }));
+
+      // Prefer the AI-rewritten introduction when present; otherwise fall back to
+      // a one-line engagement statement plus the raw project context (if any).
+      const aiIntro = ((project as any).aiIntroduction || "").trim();
+      const rawProjectContext = ((project as any).projectContext || "").trim();
+      if (aiIntro) {
+        introChildren.push(...renderNarrativeParagraphs(aiIntro, { fontSize: 22, afterSpacing: 150 }));
+      } else {
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: `Angel Fa\u00E7ade Consulting (AFC) was engaged by ${project.client} to carry out a condition assessment of the building envelope(s) at ${project.address}.`, font: "Arial", size: 22 })],
+          spacing: { after: 150 },
+        }));
+        if (rawProjectContext) {
+          introChildren.push(...renderNarrativeParagraphs(rawProjectContext, { fontSize: 22, afterSpacing: 150 }));
+        }
+      }
 
       // 2.2 Inspection
       introChildren.push(new Paragraph({
@@ -1780,13 +2009,7 @@ export async function registerRoutes(
           // System description — use AI description, or fall back to structured summary
           const descText = sys.aiDescription || "";
           if (descText.trim()) {
-            const descParas = descText.split("\n").filter((l: string) => l.trim());
-            for (const p of descParas) {
-              siteChildren.push(new Paragraph({
-                children: [new TextRun({ text: p, font: "Arial", size: 22 })],
-                spacing: { after: 100 },
-              }));
-            }
+            siteChildren.push(...renderNarrativeParagraphs(descText, { fontSize: 22, afterSpacing: 100 }));
           } else {
             // Fallback: structured summary from system fields
             const fallbackLines: string[] = [];
@@ -2099,36 +2322,84 @@ export async function registerRoutes(
           }
 
           if (grp.combinedNarrative) {
-            const narrativeLines = grp.combinedNarrative.split("\n").filter(l => l.trim());
-            for (const line of narrativeLines) {
-              obsChildren.push(new Paragraph({
-                children: [new TextRun({ text: line, font: "Arial", size: 22 })],
-                spacing: { after: 100 },
-              }));
-            }
+            obsChildren.push(...renderNarrativeParagraphs(grp.combinedNarrative, { fontSize: 22, afterSpacing: 100 }));
           }
 
-          // Bookmarks for each observation in the group (so CAPEX links still resolve)
+          // Render each member observation with its full detail block (narrative,
+          // photos, recommendations) under the group narrative. Each member gets a
+          // bookmark so CAPEX links still resolve.
           for (const obs of members) {
             const bookmarkId = sanitizeBookmark(obs.observationId);
             obsChildren.push(new Paragraph({
+              heading: HeadingLevel.HEADING_3,
               children: [
                 new BookmarkStart(bookmarkId, getBookmarkLinkId(obs.observationId)),
-                new TextRun({ text: `${obs.observationId}: ${obs.defectCategory}${obs.location ? " — " + obs.location : ""}`, font: "Arial", size: 20, italics: true, color: MUTED }),
+                new TextRun({ text: `${obs.observationId} ${obs.defectCategory}`, font: "Arial", size: 24, bold: true, color: DARK_GRAY }),
                 new BookmarkEnd(getBookmarkLinkId(obs.observationId)),
               ],
-              spacing: { after: 40 },
+              spacing: { before: 200, after: 100 },
             }));
-          }
 
-          // Embed all photos from observations in this group
-          const groupPhotos: Photo[] = [];
-          for (const obs of members) {
-            const ps = obsPhotosMap[obs.id] || [];
-            groupPhotos.push(...ps);
-          }
-          if (groupPhotos.length > 0) {
-            obsChildren.push(...buildPhotoRows(groupPhotos, figureCounter));
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Location: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: obs.location, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 50 },
+            }));
+
+            obsChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: "Severity: ", font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: `${obs.severity} — ${obs.extent}`, font: "Arial", size: 22 }),
+              ],
+              spacing: { after: 100 },
+            }));
+
+            if (pinByObs[obs.id]) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Refer to ${pinByObs[obs.id].elevationName}, Pin ${pinByObs[obs.id].observationId}.`, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 100 },
+              }));
+            }
+
+            if (obs.fieldNote && obs.fieldNote.trim()) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: "Field note: ", font: "Arial", size: 20, bold: true, color: MUTED }),
+                  new TextRun({ text: obs.fieldNote, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 80 },
+              }));
+            }
+
+            if (obs.aiNarrative) {
+              obsChildren.push(...renderNarrativeParagraphs(obs.aiNarrative, { fontSize: 22, afterSpacing: 100 }));
+            }
+
+            const oPhotos = obsPhotosMap[obs.id] || [];
+            if (oPhotos.length > 0) {
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+            }
+
+            const obsRecs = recsByObs[obs.id] || [];
+            for (const rec of obsRecs) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: "Recommended action: ", font: "Arial", size: 22, bold: true }),
+                  new TextRun({ text: rec.action, font: "Arial", size: 22 }),
+                ],
+                spacing: { before: 100, after: 50 },
+              }));
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Timeframe: ${rec.timeframe} | Category: ${rec.category} | Budget: ${rec.budgetEstimate || "TBD"}`, font: "Arial", size: 20, color: MUTED }),
+                ],
+                spacing: { after: 150 },
+              }));
+            }
           }
         }
       } else {
@@ -2190,15 +2461,20 @@ export async function registerRoutes(
               }));
             }
 
-            // AI Narrative
+            // Field note (engineer's raw input)
+            if (obs.fieldNote && obs.fieldNote.trim()) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: "Field note: ", font: "Arial", size: 20, bold: true, color: MUTED }),
+                  new TextRun({ text: obs.fieldNote, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 80 },
+              }));
+            }
+
+            // AI Narrative — render with markdown-aware structure (numbered/lettered)
             if (obs.aiNarrative) {
-              const narrativeParas = obs.aiNarrative.split("\n").filter(l => l.trim());
-              for (const p of narrativeParas) {
-                obsChildren.push(new Paragraph({
-                  children: [new TextRun({ text: p, font: "Arial", size: 22 })],
-                  spacing: { after: 100 },
-                }));
-              }
+              obsChildren.push(...renderNarrativeParagraphs(obs.aiNarrative, { fontSize: 22, afterSpacing: 100 }));
             }
 
             // Observation photos
@@ -2274,14 +2550,18 @@ export async function registerRoutes(
               }));
             }
 
+            if (obs.fieldNote && obs.fieldNote.trim()) {
+              obsChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: "Field note: ", font: "Arial", size: 20, bold: true, color: MUTED }),
+                  new TextRun({ text: obs.fieldNote, font: "Arial", size: 20, italics: true, color: MUTED }),
+                ],
+                spacing: { after: 80 },
+              }));
+            }
+
             if (obs.aiNarrative) {
-              const narrativeParas = obs.aiNarrative.split("\n").filter(l => l.trim());
-              for (const p of narrativeParas) {
-                obsChildren.push(new Paragraph({
-                  children: [new TextRun({ text: p, font: "Arial", size: 22 })],
-                  spacing: { after: 100 },
-                }));
-              }
+              obsChildren.push(...renderNarrativeParagraphs(obs.aiNarrative, { fontSize: 22, afterSpacing: 100 }));
             }
 
             const oPhotos = obsPhotosMap[obs.id] || [];
