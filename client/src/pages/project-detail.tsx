@@ -24,7 +24,7 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList, Download,
+  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList, Download, Camera,
 } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -1007,17 +1007,56 @@ export default function ProjectDetail() {
                 </div>
                 <div>
                   <Label>File</Label>
-                  <Input
-                    type="file"
-                    accept=".jpg,.jpeg,.png,.webp,.pdf"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0] || null;
-                      setElevationFile(f);
-                      if (f && !elevationName) {
-                        setElevationName(f.name.replace(/\.[^.]+$/, ""));
-                      }
-                    }}
-                  />
+                  <div className="flex gap-2">
+                    <Input
+                      id="elevation-camera-input"
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] || null;
+                        setElevationFile(f);
+                        if (f && !elevationName) {
+                          setElevationName(f.name.replace(/\.[^.]+$/, ""));
+                        }
+                      }}
+                    />
+                    <Input
+                      id="elevation-file-input"
+                      type="file"
+                      accept=".jpg,.jpeg,.png,.webp,.pdf"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] || null;
+                        setElevationFile(f);
+                        if (f && !elevationName) {
+                          setElevationName(f.name.replace(/\.[^.]+$/, ""));
+                        }
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => document.getElementById("elevation-camera-input")?.click()}
+                      className="flex-1"
+                    >
+                      <Camera className="w-4 h-4 mr-2" />
+                      Take Photo
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => document.getElementById("elevation-file-input")?.click()}
+                      className="flex-1"
+                    >
+                      <Upload className="w-4 h-4 mr-2" />
+                      Upload File
+                    </Button>
+                  </div>
+                  {elevationFile && (
+                    <p className="text-xs text-muted-foreground mt-1 truncate">Selected: {elevationFile.name}</p>
+                  )}
                   <p className="text-xs text-muted-foreground mt-1">Accepted: JPG, PNG, WebP, PDF (first page)</p>
                 </div>
               </div>

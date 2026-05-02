@@ -5,7 +5,7 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
-import { Plus, ZoomIn, ZoomOut, RotateCcw, X, Trash2, Upload, ImageIcon, Move } from "lucide-react";
+import { Plus, ZoomIn, ZoomOut, RotateCcw, X, Trash2, Upload, ImageIcon, Move, Camera } from "lucide-react";
 import { useState, useRef } from "react";
 import type { Project, Drop } from "@shared/schema";
 
@@ -43,6 +43,7 @@ export default function RoofPlanMarkup({ project }: Props) {
   });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const [addMode, setAddMode] = useState(false);
   const [selectedDropId, setSelectedDropId] = useState<number | null>(null);
   const [editNumber, setEditNumber] = useState("");
@@ -264,14 +265,33 @@ export default function RoofPlanMarkup({ project }: Props) {
           className="hidden"
           onChange={handleFileSelected}
         />
-        <Button
-          onClick={() => fileInputRef.current?.click()}
-          disabled={uploadMutation.isPending}
-          size="sm"
-        >
-          <Upload className="w-4 h-4 mr-2" />
-          {uploadMutation.isPending ? "Uploading..." : "Upload Roof Plan"}
-        </Button>
+        <input
+          ref={cameraInputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={handleFileSelected}
+        />
+        <div className="flex gap-2">
+          <Button
+            onClick={() => cameraInputRef.current?.click()}
+            disabled={uploadMutation.isPending}
+            size="sm"
+            variant="outline"
+          >
+            <Camera className="w-4 h-4 mr-2" />
+            Take Photo
+          </Button>
+          <Button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploadMutation.isPending}
+            size="sm"
+          >
+            <Upload className="w-4 h-4 mr-2" />
+            {uploadMutation.isPending ? "Uploading..." : "Upload File"}
+          </Button>
+        </div>
       </Card>
     );
   }
@@ -299,6 +319,14 @@ export default function RoofPlanMarkup({ project }: Props) {
             className="hidden"
             onChange={handleFileSelected}
           />
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            className="hidden"
+            onChange={handleFileSelected}
+          />
           <Button variant="outline" size="icon" onClick={() => setZoom(z => Math.max(0.5, z * 0.9))}>
             <ZoomOut className="w-4 h-4" />
           </Button>
@@ -314,6 +342,16 @@ export default function RoofPlanMarkup({ project }: Props) {
             onClick={() => { setAddMode(!addMode); setSelectedDropId(null); }}
           >
             {addMode ? <><X className="w-4 h-4 mr-1" /> Cancel</> : <><Plus className="w-4 h-4 mr-1" /> Add Drop</>}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => cameraInputRef.current?.click()}
+            disabled={uploadMutation.isPending}
+            title="Replace using device camera"
+          >
+            <Camera className="w-4 h-4 mr-1" />
+            Photo
           </Button>
           <Button
             variant="outline"

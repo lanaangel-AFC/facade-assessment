@@ -15,7 +15,9 @@ import { PhotoCaptionInput } from "@/components/PhotoCaptionInput";
 import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2, Download,
 } from "lucide-react";
-import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin, Project } from "@shared/schema";
+import type { FacadeSystem, Observation, Photo, Recommendation, Elevation, ElevationPin, Project, ObservationLocation } from "@shared/schema";
+
+type AdditionalLocationWithPhotos = ObservationLocation & { photos?: Photo[] };
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
@@ -272,6 +274,18 @@ export default function ObservationForm() {
     enabled: isEdit,
   });
 
+  // Fetch additional locations for existing observation
+  const { data: existingLocations } = useQuery<ObservationLocation[]>({
+    queryKey: [`/api/observations/${obsIdParam}/locations`],
+    enabled: isEdit,
+  });
+  const [additionalLocations, setAdditionalLocations] = useState<AdditionalLocationWithPhotos[]>([]);
+  const [photoPromptForLocId, setPhotoPromptForLocId] = useState<number | null>(null);
+  const [photoSlotsRevealed, setPhotoSlotsRevealed] = useState<Record<number, number>>({}); // locationId -> count of slots revealed (in batches of 2)
+  const locFileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const locCameraInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [locUploading, setLocUploading] = useState<string | null>(null);
+
   // Fetch next observation ID when system changes (new only)
   const selectedSystemId = form.systemId ? Number(form.systemId) : null;
   const { data: nextIdData } = useQuery<{ observationId: string }>({
@@ -315,11 +329,28 @@ export default function ObservationForm() {
   }, [existingPhotos]);
 
   useEffect(() => {
+    if (existingLocations && existingPhotos) {
+      const locsWithPhotos: AdditionalLocationWithPhotos[] = existingLocations.map(loc => ({
+        ...loc,
+        photos: existingPhotos.filter((p: any) => p.locationId === loc.id),
+      }));
+      setAdditionalLocations(locsWithPhotos);
+      // Reveal at least enough slots to display existing photos (in pairs of 2)
+      const reveal: Record<number, number> = {};
+      for (const loc of locsWithPhotos) {
+        const count = loc.photos?.length || 0;
+        if (count > 0) reveal[loc.id] = Math.max(2, Math.ceil(count / 2) * 2);
+      }
+      setPhotoSlotsRevealed(prev => ({ ...reveal, ...prev }));
+    }
+  }, [existingLocations, existingPhotos]);
+
+  useEffect(() => {
     if (existingRecs) setRecs(existingRecs);
   }, [existingRecs]);
 
   const getPhotoForSlot = (slot: SlotKey): Photo | undefined => {
-    return photos.find((p) => p.slot === slot);
+    return photos.find((p) => p.slot === slot && !(p as any).locationId);
   };
 
   const saveMutation = useMutation({
@@ -403,11 +434,92 @@ export default function ObservationForm() {
     try {
       await apiRequest("DELETE", `/api/photos/${photoId}`);
       setPhotos((prev) => prev.filter((p) => p.id !== photoId));
+      // Also remove from any nested additionalLocations.photos
+      setAdditionalLocations(prev => prev.map(loc => ({
+        ...loc,
+        photos: (loc.photos || []).filter(p => p.id !== photoId),
+      })));
       queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/photos`] });
       toast({ title: "Photo removed" });
     } catch {
       toast({ title: "Failed to remove photo", variant: "destructive" });
     }
+  };
+
+  // Add a new additional location (POST then prompt for photos inline)
+  const addAdditionalLocation = async () => {
+    if (!obsIdParam) {
+      toast({ title: "Save the observation first before adding locations", variant: "destructive" });
+      return;
+    }
+    try {
+      const res = await apiRequest("POST", `/api/observations/${obsIdParam}/locations`, {
+        drop: "", elevation: "", level: "", description: "",
+      });
+      const newLoc: AdditionalLocationWithPhotos = await res.json();
+      newLoc.photos = [];
+      setAdditionalLocations(prev => [...prev, newLoc]);
+      setPhotoPromptForLocId(newLoc.id);
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/locations`] });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to add location", variant: "destructive" });
+    }
+  };
+
+  const updateAdditionalLocation = async (id: number, patch: Partial<ObservationLocation>) => {
+    setAdditionalLocations(prev => prev.map(l => (l.id === id ? { ...l, ...patch } : l)));
+    try {
+      await apiRequest("PATCH", `/api/observation-locations/${id}`, patch);
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to save location", variant: "destructive" });
+    }
+  };
+
+  const deleteAdditionalLocation = async (id: number) => {
+    if (!confirm("Delete this location and any photos attached to it?")) return;
+    try {
+      await apiRequest("DELETE", `/api/observation-locations/${id}`);
+      setAdditionalLocations(prev => prev.filter(l => l.id !== id));
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/locations`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/photos`] });
+      toast({ title: "Location removed" });
+    } catch (err: any) {
+      toast({ title: err.message || "Failed to remove location", variant: "destructive" });
+    }
+  };
+
+  const handleLocationPhotoUpload = async (file: File, locationId: number, slotIndex: number) => {
+    if (!obsIdParam) return;
+    const slot = `loc-${locationId}-${slotIndex}`;
+    setLocUploading(slot);
+    try {
+      const formData = new FormData();
+      formData.append("photo", file);
+      formData.append("slot", slot);
+      formData.append("locationId", String(locationId));
+      const res = await fetch(`${API_BASE}/api/observations/${obsIdParam}/photos`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) throw new Error("Upload failed");
+      const photo = await res.json();
+      setPhotos(prev => [...prev.filter(p => p.slot !== slot), photo]);
+      setAdditionalLocations(prev => prev.map(l => {
+        if (l.id !== locationId) return l;
+        const others = (l.photos || []).filter(p => p.slot !== slot);
+        return { ...l, photos: [...others, photo] };
+      }));
+      queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/photos`] });
+      toast({ title: "Photo added" });
+    } catch {
+      toast({ title: "Failed to upload photo", variant: "destructive" });
+    } finally {
+      setLocUploading(null);
+    }
+  };
+
+  const revealMoreLocationPhotoSlots = (locationId: number) => {
+    setPhotoSlotsRevealed(prev => ({ ...prev, [locationId]: (prev[locationId] || 0) + 2 }));
   };
 
   // Recommendation handlers
@@ -994,6 +1106,256 @@ export default function ObservationForm() {
           </div>
           {!isEdit && <p className="text-xs text-muted-foreground">Save the observation first to add photos</p>}
         </Card>
+
+        {/* Additional Locations — same defect at multiple locations */}
+        {isEdit && (
+          <Card className="p-4 space-y-3">
+            <div>
+              <h3 className="text-sm font-medium">Additional Locations</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Use this when the same defect was observed at multiple locations on the building.
+              </p>
+            </div>
+
+            {additionalLocations.length === 0 && (
+              <p className="text-xs text-muted-foreground italic">No additional locations yet.</p>
+            )}
+
+            {additionalLocations.map((loc, idx) => {
+              const slotsRevealed = photoSlotsRevealed[loc.id] || 0;
+              const elevationLabels: string[] = (() => {
+                let labels: string[] = [];
+                try { labels = JSON.parse(projectData?.projectElevations || "[]"); } catch {}
+                if (!labels.length) labels = ["North", "East", "South", "West", "Roof"];
+                const drawingNames = (elevations || []).map(e => e.name).filter(n => !labels.includes(n));
+                return [...labels, ...drawingNames];
+              })();
+              return (
+                <Card key={loc.id} className="p-3 space-y-3 bg-muted/20 border-dashed">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs font-medium text-muted-foreground">Location {idx + 2}</div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-destructive hover:text-destructive"
+                      onClick={() => deleteAdditionalLocation(loc.id)}
+                    >
+                      <Trash2 className="w-3.5 h-3.5 mr-1" />
+                      Delete location
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <Label className="text-xs">Drop</Label>
+                      <Input
+                        value={loc.drop || ""}
+                        onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, drop: e.target.value.slice(0, 3) } : l)))}
+                        onBlur={(e) => updateAdditionalLocation(loc.id, { drop: e.target.value.slice(0, 3) })}
+                        maxLength={3}
+                        placeholder="01"
+                        className="font-mono text-center"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs">Elevation</Label>
+                      <Select
+                        value={loc.elevation || ""}
+                        onValueChange={(val) => {
+                          setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, elevation: val } : l)));
+                          updateAdditionalLocation(loc.id, { elevation: val });
+                        }}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {elevationLabels.map(label => (
+                            <SelectItem key={label} value={label}>{label}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div>
+                      <Label className="text-xs">Level</Label>
+                      <Input
+                        value={loc.level || ""}
+                        onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, level: e.target.value.slice(0, 4) } : l)))}
+                        onBlur={(e) => updateAdditionalLocation(loc.id, { level: e.target.value.slice(0, 4) })}
+                        maxLength={4}
+                        placeholder="04"
+                        className="font-mono text-center"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label className="text-xs">Description (optional)</Label>
+                    <Textarea
+                      value={loc.description || ""}
+                      onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, description: e.target.value } : l)))}
+                      onBlur={(e) => updateAdditionalLocation(loc.id, { description: e.target.value })}
+                      placeholder="Notes specific to this instance"
+                      rows={2}
+                    />
+                  </div>
+
+                  {/* Inline 'do you need more images?' prompt — only when freshly added */}
+                  {photoPromptForLocId === loc.id && (
+                    <div className="rounded-md border border-primary/40 bg-primary/5 p-3 space-y-2">
+                      <p className="text-sm">Do you need more images? You can add up to 2 at a time.</p>
+                      <div className="flex gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => {
+                            setPhotoSlotsRevealed(prev => ({ ...prev, [loc.id]: 2 }));
+                            setPhotoPromptForLocId(null);
+                          }}
+                        >
+                          Yes, capture/upload photos
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setPhotoPromptForLocId(null)}
+                        >
+                          No, not yet
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Photos grid for this location — slots revealed in batches of 2 */}
+                  {slotsRevealed > 0 && (
+                    <div className="space-y-2">
+                      <Label className="text-xs">Photos for this location</Label>
+                      <div className="grid grid-cols-2 gap-3">
+                        {Array.from({ length: slotsRevealed }).map((_, slotIdx) => {
+                          const slotKey = `loc-${loc.id}-${slotIdx}`;
+                          const photo = (loc.photos || []).find(p => p.slot === slotKey);
+                          return (
+                            <div key={slotKey} className="space-y-1">
+                              {photo ? (
+                                <div className="space-y-1">
+                                  <div className="relative group">
+                                    <img
+                                      src={`${API_BASE}/api/uploads/${photo.filename}`}
+                                      alt={`Photo ${slotIdx + 1}`}
+                                      className="w-full h-24 object-cover rounded-lg border cursor-pointer"
+                                      onClick={() => window.open(`${API_BASE}/api/uploads/${photo.filename}`, "_blank")}
+                                    />
+                                    <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeletePhoto(photo.id)}
+                                        className="p-1 rounded-full bg-background/80 hover:bg-background"
+                                      >
+                                        <X className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <PhotoCaptionInput
+                                    photoId={photo.id}
+                                    initial={photo.caption || ""}
+                                    onSaved={(caption) => {
+                                      setPhotos((prev) => prev.map((p) => (p.id === photo.id ? { ...p, caption } : p)));
+                                      setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? {
+                                        ...l,
+                                        photos: (l.photos || []).map(p => (p.id === photo.id ? { ...p, caption } : p)),
+                                      } : l)));
+                                    }}
+                                  />
+                                </div>
+                              ) : (
+                                <div className="h-24 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-1 text-muted-foreground">
+                                  <ImageIcon className="w-5 h-5 opacity-40" />
+                                  <div className="flex gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => locCameraInputRefs.current[slotKey]?.click()}
+                                      className="p-1 rounded-md bg-primary/10 text-primary hover:bg-primary/20"
+                                      disabled={locUploading === slotKey}
+                                    >
+                                      <Camera className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => locFileInputRefs.current[slotKey]?.click()}
+                                      className="p-1 rounded-md bg-primary/10 text-primary hover:bg-primary/20"
+                                      disabled={locUploading === slotKey}
+                                    >
+                                      <Upload className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                              <input
+                                type="file"
+                                accept="image/*"
+                                capture="environment"
+                                className="hidden"
+                                ref={(el) => { locCameraInputRefs.current[slotKey] = el; }}
+                                onChange={(e) => {
+                                  const file = e.target.files?.[0];
+                                  if (file) handleLocationPhotoUpload(file, loc.id, slotIdx);
+                                  e.target.value = "";
+                                }}
+                              />
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                ref={(el) => { locFileInputRefs.current[slotKey] = el; }}
+                                onChange={(e) => {
+                                  const file = e.target.files?.[0];
+                                  if (file) handleLocationPhotoUpload(file, loc.id, slotIdx);
+                                  e.target.value = "";
+                                }}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => revealMoreLocationPhotoSlots(loc.id)}
+                      >
+                        <Plus className="w-3.5 h-3.5 mr-1" />
+                        Add 2 more
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* If no slots revealed and prompt is dismissed, show "Add photos" */}
+                  {slotsRevealed === 0 && photoPromptForLocId !== loc.id && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPhotoSlotsRevealed(prev => ({ ...prev, [loc.id]: 2 }))}
+                    >
+                      <Camera className="w-3.5 h-3.5 mr-1" />
+                      Add photos for this location
+                    </Button>
+                  )}
+                </Card>
+              );
+            })}
+
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={addAdditionalLocation}
+            >
+              <Plus className="w-4 h-4 mr-1" />
+              Add Another Location
+            </Button>
+          </Card>
+        )}
 
         {/* AI Narrative */}
         <div>

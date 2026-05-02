@@ -16,6 +16,7 @@ import {
   type Drop, type InsertDrop, drops,
   type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
+  type ObservationLocation, type InsertObservationLocation, observationLocations,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -246,6 +247,21 @@ try { sqlite.exec(`ALTER TABLE photos ADD COLUMN caption TEXT DEFAULT ''`); } ca
 try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN grouping_criterion TEXT DEFAULT ''`); } catch {}
 try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN display_order INTEGER DEFAULT 0`); } catch {}
 
+// Multi-location observations: additional location records and photo->location link
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS observation_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    drop TEXT DEFAULT '',
+    elevation TEXT DEFAULT '',
+    level TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    display_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+`);
+try { sqlite.exec(`ALTER TABLE photos ADD COLUMN location_id INTEGER DEFAULT NULL`); } catch {}
+
 export const db = drizzle(sqlite);
 export { dataDir };
 
@@ -406,11 +422,34 @@ export class DatabaseStorage implements IStorage {
     return db.update(observations).set(observation).where(eq(observations.id, id)).returning().get();
   }
   async deleteObservation(id: number): Promise<void> {
-    // Cascade: delete recommendations, photos, and elevation pins for this observation
+    // Cascade: delete recommendations, photos, additional locations, and elevation pins for this observation
     db.delete(recommendations).where(eq(recommendations.observationId, id)).run();
     db.delete(photos).where(eq(photos.observationId, id)).run();
+    db.delete(observationLocations).where(eq(observationLocations.observationId, id)).run();
     db.delete(elevationPins).where(eq(elevationPins.observationId, id)).run();
     db.delete(observations).where(eq(observations.id, id)).run();
+  }
+
+  // Observation Locations (additional locations for the same defect)
+  async getObservationLocations(observationId: number): Promise<ObservationLocation[]> {
+    return db.select().from(observationLocations)
+      .where(eq(observationLocations.observationId, observationId))
+      .orderBy(asc(observationLocations.displayOrder), asc(observationLocations.id))
+      .all();
+  }
+  async getObservationLocation(id: number): Promise<ObservationLocation | undefined> {
+    return db.select().from(observationLocations).where(eq(observationLocations.id, id)).get();
+  }
+  async createObservationLocation(data: InsertObservationLocation): Promise<ObservationLocation> {
+    return db.insert(observationLocations).values(data).returning().get();
+  }
+  async updateObservationLocation(id: number, data: Partial<InsertObservationLocation>): Promise<ObservationLocation | undefined> {
+    return db.update(observationLocations).set(data).where(eq(observationLocations.id, id)).returning().get();
+  }
+  async deleteObservationLocation(id: number): Promise<void> {
+    // Cascade: delete photos linked via locationId, then the location itself
+    db.delete(photos).where(eq(photos.locationId, id)).run();
+    db.delete(observationLocations).where(eq(observationLocations.id, id)).run();
   }
 
   async getNextObservationId(projectId: number, systemId: number): Promise<string> {

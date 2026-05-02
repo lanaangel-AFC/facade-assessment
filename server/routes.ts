@@ -231,7 +231,13 @@ export async function registerRoutes(
   app.get("/api/observations/:id", async (req, res) => {
     const observation = await storage.getObservation(Number(req.params.id));
     if (!observation) return res.status(404).json({ message: "Observation not found" });
-    res.json(observation);
+    const additionalLocations = await storage.getObservationLocations(observation.id);
+    const allObsPhotos = await storage.getPhotosByObservation(observation.id);
+    const locationsWithPhotos = additionalLocations.map(loc => ({
+      ...loc,
+      photos: allObsPhotos.filter(p => (p as any).locationId === loc.id),
+    }));
+    res.json({ ...observation, additionalLocations: locationsWithPhotos });
   });
 
   app.post("/api/projects/:projectId/observations", async (req, res) => {
@@ -344,19 +350,24 @@ export async function registerRoutes(
     res.status(201).json(photo);
   });
 
-  // Upload photo for an observation
+  // Upload photo for an observation (optionally tied to an additional location)
   app.post("/api/observations/:observationId/photos", upload.single("photo"), async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
     const observationId = Number(req.params.observationId);
     const slot = req.body.slot || "photo1";
+    const rawLocationId = req.body.locationId;
+    const locationId = rawLocationId && rawLocationId !== "null" && rawLocationId !== "" ? Number(rawLocationId) : null;
 
     // Get the observation to find its projectId
     const observation = await storage.getObservation(observationId);
     if (!observation) return res.status(404).json({ message: "Observation not found" });
 
-    // If a photo already exists in this slot for this observation, replace it
+    // Replace within the same scope (primary or specific location) and same slot
     const existingPhotos = await storage.getPhotosByObservation(observationId);
-    const existingInSlot = existingPhotos.find((p) => p.slot === slot);
+    const existingInSlot = existingPhotos.find((p) => {
+      const pLoc = (p as any).locationId ?? null;
+      return p.slot === slot && pLoc === locationId;
+    });
     if (existingInSlot) {
       const oldPath = path.join(uploadDir, existingInSlot.filename);
       if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
@@ -367,12 +378,61 @@ export async function registerRoutes(
       projectId: observation.projectId,
       systemId: null,
       observationId,
+      locationId,
       filename: req.file.filename,
       caption: req.body.caption || "",
       slot,
       createdAt: new Date().toISOString(),
-    });
+    } as any);
     res.status(201).json(photo);
+  });
+
+  // === OBSERVATION LOCATIONS (additional locations) ===
+  app.get("/api/observations/:observationId/locations", async (req, res) => {
+    const list = await storage.getObservationLocations(Number(req.params.observationId));
+    res.json(list);
+  });
+
+  app.post("/api/observations/:observationId/locations", async (req, res) => {
+    const observationId = Number(req.params.observationId);
+    const observation = await storage.getObservation(observationId);
+    if (!observation) return res.status(404).json({ message: "Observation not found" });
+    const existing = await storage.getObservationLocations(observationId);
+    const created = await storage.createObservationLocation({
+      observationId,
+      drop: req.body.drop || "",
+      elevation: req.body.elevation || "",
+      level: req.body.level || "",
+      description: req.body.description || "",
+      displayOrder: req.body.displayOrder ?? existing.length,
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(created);
+  });
+
+  app.patch("/api/observation-locations/:id", async (req, res) => {
+    const updated = await storage.updateObservationLocation(Number(req.params.id), req.body);
+    if (!updated) return res.status(404).json({ message: "Location not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/observation-locations/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    // Unlink photo files on disk before cascade-deleting location
+    const loc = await storage.getObservationLocation(id);
+    if (loc) {
+      const obsPhotos = await storage.getPhotosByObservation(loc.observationId);
+      for (const p of obsPhotos) {
+        if ((p as any).locationId === id) {
+          const oldPath = path.join(uploadDir, p.filename);
+          if (fs.existsSync(oldPath)) {
+            try { fs.unlinkSync(oldPath); } catch {}
+          }
+        }
+      }
+    }
+    await storage.deleteObservationLocation(id);
+    res.status(204).end();
   });
 
   // Update photo caption
@@ -1446,6 +1506,19 @@ export async function registerRoutes(
       for (const obs of allObservations) {
         obsPhotosMap[obs.id] = await storage.getPhotosByObservation(obs.id);
       }
+      // Additional locations per observation (multi-location feature)
+      const obsLocationsMap: Record<number, Awaited<ReturnType<typeof storage.getObservationLocations>>> = {};
+      for (const obs of allObservations) {
+        obsLocationsMap[obs.id] = await storage.getObservationLocations(obs.id);
+      }
+      const formatLocLabel = (drop?: string | null, elev?: string | null, level?: string | null): string => {
+        const parts = [
+          drop ? `Drop ${drop}` : "",
+          elev ? `${elev} Elevation` : "",
+          level ? `L${level}` : "",
+        ].filter(Boolean);
+        return parts.join(", ");
+      };
 
       // Sort systems by sortOrder then id
       systems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
@@ -1640,8 +1713,18 @@ export async function registerRoutes(
       };
 
       // Helper: create photo rows (2 per row) with captions
-      const buildPhotoRows = (photoList: Photo[], figureCounter: { n: number }): Paragraph[] => {
+      // photoLocationLabels: optional map from photo.id -> location label (e.g. "Drop 5, South Elevation")
+      const buildPhotoRows = (
+        photoList: Photo[],
+        figureCounter: { n: number },
+        photoLocationLabels?: Record<number, string>
+      ): Paragraph[] => {
         const paragraphs: Paragraph[] = [];
+        const tagFor = (photo: Photo, baseCaption: string): string => {
+          const loc = photoLocationLabels?.[photo.id];
+          if (!loc) return baseCaption;
+          return baseCaption ? `${baseCaption} (${loc})` : `(${loc})`;
+        };
         for (let i = 0; i < photoList.length; i += 2) {
           const rowChildren: (ImageRun | TextRun)[] = [];
           const photo1 = embedPhoto(photoList[i].filename, photoList[i].caption || "", 240);
@@ -1655,13 +1738,13 @@ export async function registerRoutes(
           }
           if (rowChildren.length > 0) {
             paragraphs.push(new Paragraph({ children: rowChildren, spacing: { before: 100, after: 50 } }));
-            // Captions
-            const cap1 = photoList[i].caption || "";
+            // Captions (with optional location tag)
+            const cap1 = tagFor(photoList[i], photoList[i].caption || "");
             const capText = `Figure ${figureCounter.n}${cap1 ? ` \u2013 ${cap1}` : ""}`;
             figureCounter.n++;
             let capLine = capText;
             if (i + 1 < photoList.length) {
-              const cap2 = photoList[i + 1].caption || "";
+              const cap2 = tagFor(photoList[i + 1], photoList[i + 1].caption || "");
               capLine += `          Figure ${figureCounter.n}${cap2 ? ` \u2013 ${cap2}` : ""}`;
               figureCounter.n++;
             }
@@ -1672,6 +1755,44 @@ export async function registerRoutes(
           }
         }
         return paragraphs;
+      };
+
+      // Helper: render "Also observed at" block + return per-photo location label map
+      const buildAlsoObservedAtBlock = (obsId: number): {
+        paragraphs: Paragraph[];
+        photoLabels: Record<number, string>;
+      } => {
+        const paragraphs: Paragraph[] = [];
+        const photoLabels: Record<number, string> = {};
+        const locs = obsLocationsMap[obsId] || [];
+        if (locs.length === 0) return { paragraphs, photoLabels };
+        paragraphs.push(new Paragraph({
+          children: [new TextRun({ text: "Also observed at:", font: "Arial", size: 22, bold: true })],
+          spacing: { before: 50, after: 50 },
+        }));
+        for (const loc of locs) {
+          const label = formatLocLabel(loc.drop, loc.elevation, loc.level) || "(unspecified)";
+          const desc = (loc.description || "").trim();
+          paragraphs.push(new Paragraph({
+            children: [
+              new TextRun({ text: `\u2022 ${label}`, font: "Arial", size: 22 }),
+              ...(desc ? [new TextRun({ text: ` \u2014 ${desc}`, font: "Arial", size: 22, italics: true, color: MUTED })] : []),
+            ],
+            spacing: { after: 30 },
+          }));
+        }
+        // Build photo\u2192label map for figure tagging
+        const allObsPhotos = obsPhotosMap[obsId] || [];
+        for (const p of allObsPhotos) {
+          const lid = (p as any).locationId as number | null;
+          if (lid != null) {
+            const loc = locs.find(l => l.id === lid);
+            if (loc) {
+              photoLabels[p.id] = formatLocLabel(loc.drop, loc.elevation, loc.level) || "additional location";
+            }
+          }
+        }
+        return { paragraphs, photoLabels };
       };
 
       // Teal border for headers/footers
@@ -2379,9 +2500,13 @@ export async function registerRoutes(
               obsChildren.push(...renderNarrativeParagraphs(obs.aiNarrative, { fontSize: 22, afterSpacing: 100 }));
             }
 
+            const { paragraphs: alsoParagraphs, photoLabels: photoLocLabels } = buildAlsoObservedAtBlock(obs.id);
+            if (alsoParagraphs.length > 0) {
+              obsChildren.push(...alsoParagraphs);
+            }
             const oPhotos = obsPhotosMap[obs.id] || [];
             if (oPhotos.length > 0) {
-              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter, photoLocLabels));
             }
 
             const obsRecs = recsByObs[obs.id] || [];
@@ -2478,9 +2603,13 @@ export async function registerRoutes(
             }
 
             // Observation photos
+            const { paragraphs: alsoParagraphs, photoLabels: photoLocLabels } = buildAlsoObservedAtBlock(obs.id);
+            if (alsoParagraphs.length > 0) {
+              obsChildren.push(...alsoParagraphs);
+            }
             const oPhotos = obsPhotosMap[obs.id] || [];
             if (oPhotos.length > 0) {
-              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter, photoLocLabels));
             }
 
             // Recommendations for this observation
@@ -2564,9 +2693,13 @@ export async function registerRoutes(
               obsChildren.push(...renderNarrativeParagraphs(obs.aiNarrative, { fontSize: 22, afterSpacing: 100 }));
             }
 
+            const { paragraphs: alsoParagraphs, photoLabels: photoLocLabels } = buildAlsoObservedAtBlock(obs.id);
+            if (alsoParagraphs.length > 0) {
+              obsChildren.push(...alsoParagraphs);
+            }
             const oPhotos = obsPhotosMap[obs.id] || [];
             if (oPhotos.length > 0) {
-              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter));
+              obsChildren.push(...buildPhotoRows(oPhotos, figureCounter, photoLocLabels));
             }
 
             const obsRecs = recsByObs[obs.id] || [];

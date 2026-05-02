@@ -160,9 +160,22 @@ export const photos = sqliteTable("photos", {
   projectId: integer("project_id").notNull(),
   systemId: integer("system_id"), // optional — context photos for system description
   observationId: integer("observation_id"), // optional — defect photos
+  locationId: integer("location_id"), // optional — when set, photo belongs to an additional observation_location
   filename: text("filename").notNull(),
   caption: text("caption").default(""),
   slot: text("slot").default("photo"), // context, photo1-photo6
+  createdAt: text("created_at").notNull(),
+});
+
+// Additional observation locations — when one defect occurs at multiple locations
+export const observationLocations = sqliteTable("observation_locations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  observationId: integer("observation_id").notNull(),
+  drop: text("drop").default(""),
+  elevation: text("elevation").default(""),
+  level: text("level").default(""),
+  description: text("description").default(""),
+  displayOrder: integer("display_order").default(0),
   createdAt: text("created_at").notNull(),
 });
 
@@ -231,6 +244,7 @@ export const insertCustomDefectCategorySchema = createInsertSchema(customDefectC
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
+export const insertObservationLocationSchema = createInsertSchema(observationLocations).omit({ id: true });
 
 // Types
 export type Project = typeof projects.$inferSelect;
@@ -267,3 +281,5 @@ export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;
 export type InsertReportLibraryDocument = z.infer<typeof insertReportLibraryDocumentSchema>;
 export type ReportLibraryPassage = typeof reportLibraryPassages.$inferSelect;
 export type InsertReportLibraryPassage = z.infer<typeof insertReportLibraryPassageSchema>;
+export type ObservationLocation = typeof observationLocations.$inferSelect;
+export type InsertObservationLocation = z.infer<typeof insertObservationLocationSchema>;

@@ -286,18 +286,35 @@ export async function generateObservationNarrative(observationId: number, existi
   let indicators: string[] = [];
   try { indicators = JSON.parse(observation.indicators || "[]"); } catch {}
 
+  const additionalLocations = await storage.getObservationLocations(observationId);
+  const formatLoc = (drop?: string | null, elev?: string | null, level?: string | null) => {
+    const parts = [
+      drop ? `Drop ${drop}` : "",
+      elev ? `${elev} Elevation` : "",
+      level ? `L${level}` : "",
+    ].filter(Boolean);
+    return parts.join(", ");
+  };
+  const primaryLocLabel = formatLoc((observation as any).gridDrop, (observation as any).gridElevation, (observation as any).gridLevel);
+  const multiLocBlock = additionalLocations.length > 0
+    ? `\nThis defect was observed at multiple locations across the building. Additional locations:\n${additionalLocations.map((l, i) => {
+        const label = formatLoc(l.drop, l.elevation, l.level) || "(unspecified)";
+        return `  ${i + 1}. ${label}${l.description ? ` — ${l.description}` : ""}`;
+      }).join("\n")}\nWrite the narrative so the reader understands the defect repeats across these locations (e.g. "These defects were observed at multiple locations across the building...").`
+    : "";
+
   const context = `
 System: ${systemName} (${systemType})
 Observation ID: ${observation.observationId}
-Location: ${observation.location}
+Location: ${observation.location}${primaryLocLabel ? ` (Primary: ${primaryLocLabel})` : ""}
 Defect Category: ${observation.defectCategory}
 Severity: ${observation.severity}
 Extent: ${observation.extent}
 Field Note: ${observation.fieldNote || "None"}
-Indicators Observed: ${indicators.join(", ") || "None specified"}
+Indicators Observed: ${indicators.join(", ") || "None specified"}${multiLocBlock}
   `.trim();
 
-  // Fetch observation photos for vision analysis
+  // Fetch observation photos for vision analysis — include both primary and additional-location photos
   const obsPhotos = await storage.getPhotosByObservation(observationId);
   const imageParts = buildCaptionedImageParts(obsPhotos);
 
@@ -400,6 +417,22 @@ export async function generateRecommendation(observationId: number, conservative
   let indicators: string[] = [];
   try { indicators = JSON.parse(observation.indicators || "[]"); } catch {}
 
+  const additionalLocations = await storage.getObservationLocations(observationId);
+  const formatLoc = (drop?: string | null, elev?: string | null, level?: string | null) => {
+    const parts = [
+      drop ? `Drop ${drop}` : "",
+      elev ? `${elev} Elevation` : "",
+      level ? `L${level}` : "",
+    ].filter(Boolean);
+    return parts.join(", ");
+  };
+  const multiLocBlock = additionalLocations.length > 0
+    ? `\nDefect repeats across the following locations:\n${additionalLocations.map((l, i) => {
+        const label = formatLoc(l.drop, l.elevation, l.level) || "(unspecified)";
+        return `  ${i + 1}. ${label}${l.description ? ` — ${l.description}` : ""}`;
+      }).join("\n")}\nFactor this multi-location occurrence into the recommended scope and budget (e.g. quantity / lineal metres should reflect all locations).`
+    : "";
+
   const context = `
 System: ${systemName} (${systemType})
 Observation ID: ${observation.observationId}
@@ -408,7 +441,7 @@ Defect Category: ${observation.defectCategory}
 Severity: ${observation.severity}
 Extent: ${observation.extent}
 Field Note: ${observation.fieldNote || "None"}
-Indicators: ${indicators.join(", ") || "None specified"}
+Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
   `.trim();
 
   const trainingExamples = await getTrainingExamples("recommendation");
