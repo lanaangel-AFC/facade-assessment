@@ -59,8 +59,21 @@ app.use((req, res, next) => {
   next();
 });
 
+// Lightweight health endpoint registered FIRST so Railway healthchecks
+// always pass even if heavier routes/migrations are slow.
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ ok: true });
+});
+
 (async () => {
-  await registerRoutes(httpServer, app);
+  console.log(`[startup] NODE_ENV=${process.env.NODE_ENV} PORT=${process.env.PORT} DATA_DIR=${process.env.DATA_DIR}`);
+  try {
+    await registerRoutes(httpServer, app);
+    console.log("[startup] Routes registered");
+  } catch (e) {
+    console.error("[startup] Failed to register routes:", e);
+    throw e;
+  }
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
@@ -100,4 +113,14 @@ app.use((req, res, next) => {
       log(`serving on port ${port}`);
     },
   );
-})();
+})().catch((err) => {
+  console.error("[startup] Fatal error during boot:", err);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});

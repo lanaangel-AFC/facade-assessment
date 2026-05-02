@@ -26,14 +26,21 @@ import fs from "fs";
 
 // Use DATA_DIR env var for persistent storage (Railway volume), fallback to cwd
 const dataDir = process.env.DATA_DIR || process.cwd();
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+try {
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  console.log(`[storage] Using DATA_DIR: ${dataDir}`);
+} catch (e) {
+  console.error(`[storage] Failed to create DATA_DIR ${dataDir}:`, e);
+}
 
 const dbPath = path.join(dataDir, "data.db");
+console.log(`[storage] Opening SQLite database at: ${dbPath}`);
 const sqlite = new Database(dbPath);
 sqlite.pragma("journal_mode = WAL");
 
 // Auto-create tables that may not exist yet (safe to run on every start)
-sqlite.exec(`
+try {
+  sqlite.exec(`
   CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -197,6 +204,10 @@ sqlite.exec(`
     created_at TEXT NOT NULL
   );
 `);
+  console.log("[storage] Base CREATE TABLE migrations completed");
+} catch (e) {
+  console.error("[storage] Base CREATE TABLE migration failed:", e);
+}
 
 // Report library tables — ALTER TABLE for defensive future migrations
 try { sqlite.exec(`ALTER TABLE report_library_documents ADD COLUMN extraction_error TEXT DEFAULT ''`); } catch {}
@@ -248,18 +259,23 @@ try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN grouping_criterion 
 try { sqlite.exec(`ALTER TABLE observation_groups ADD COLUMN display_order INTEGER DEFAULT 0`); } catch {}
 
 // Multi-location observations: additional location records and photo->location link
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS observation_locations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    observation_id INTEGER NOT NULL,
-    drop TEXT DEFAULT '',
-    elevation TEXT DEFAULT '',
-    level TEXT DEFAULT '',
-    description TEXT DEFAULT '',
-    display_order INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL
-  );
-`);
+// NOTE: "drop" is a reserved SQL keyword — must be quoted in DDL.
+try {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS observation_locations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      observation_id INTEGER NOT NULL,
+      "drop" TEXT DEFAULT '',
+      elevation TEXT DEFAULT '',
+      level TEXT DEFAULT '',
+      description TEXT DEFAULT '',
+      display_order INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+  `);
+} catch (e) {
+  console.error("[migration] observation_locations CREATE failed:", e);
+}
 try { sqlite.exec(`ALTER TABLE photos ADD COLUMN location_id INTEGER DEFAULT NULL`); } catch {}
 
 export const db = drizzle(sqlite);
