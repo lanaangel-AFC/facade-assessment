@@ -285,6 +285,12 @@ export default function ObservationForm() {
   const locFileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const locCameraInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const [locUploading, setLocUploading] = useState<string | null>(null);
+  // Accumulates per-location field edits that haven't been PATCHed yet.
+  // Why: location saves fire on blur; clicking "Update Observation" can race with
+  // the blur PATCH and navigate away before the last location's edits persist.
+  // Flushing this ref before the main PATCH closes that race.
+  const pendingLocationPatchesRef = useRef<Record<number, Partial<ObservationLocation>>>({});
+  const [savingLocationIds, setSavingLocationIds] = useState<Set<number>>(new Set());
 
   // Fetch next observation ID when system changes (new only)
   const selectedSystemId = form.systemId ? Number(form.systemId) : null;
@@ -355,6 +361,10 @@ export default function ObservationForm() {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      // Flush any per-location field edits that haven't yet been PATCHed (race
+      // with onBlur / navigation). Must complete BEFORE the main PATCH so the
+      // subsequent invalidate+refetch picks up the latest location data.
+      await flushPendingLocationPatches();
       const basePayload = {
         ...form,
         systemId: form.systemId ? Number(form.systemId) : null,
@@ -375,6 +385,7 @@ export default function ObservationForm() {
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
       if (isEdit && obsIdParam) {
         queryClient.invalidateQueries({ queryKey: ["/api/observations", obsIdParam] });
+        queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/locations`] });
       }
       toast({ title: isEdit ? "Observation updated" : "Observation created" });
 
@@ -468,11 +479,50 @@ export default function ObservationForm() {
 
   const updateAdditionalLocation = async (id: number, patch: Partial<ObservationLocation>) => {
     setAdditionalLocations(prev => prev.map(l => (l.id === id ? { ...l, ...patch } : l)));
+    // Snapshot the merged pending patch for this location, then clear the ref.
+    // Any further onChange edits that arrive while this PATCH is in-flight will
+    // re-populate the ref and be flushed by a later save (manual or on submit).
+    const merged = { ...(pendingLocationPatchesRef.current[id] || {}), ...patch };
+    delete pendingLocationPatchesRef.current[id];
+    setSavingLocationIds(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
     try {
-      await apiRequest("PATCH", `/api/observation-locations/${id}`, patch);
+      await apiRequest("PATCH", `/api/observation-locations/${id}`, merged);
     } catch (err: any) {
+      // Restore pending patch so the next flush retries.
+      pendingLocationPatchesRef.current[id] = { ...merged, ...(pendingLocationPatchesRef.current[id] || {}) };
       toast({ title: err.message || "Failed to save location", variant: "destructive" });
+    } finally {
+      setSavingLocationIds(prev => {
+        // Only clear the indicator if no further edits queued up while this was in-flight.
+        if (pendingLocationPatchesRef.current[id]) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
+  };
+
+  // Flush any per-field edits captured since the last save. Called before the
+  // main observation PATCH so the last location's edits aren't lost to a
+  // navigation/refetch race.
+  const flushPendingLocationPatches = async () => {
+    const entries = Object.entries(pendingLocationPatchesRef.current);
+    if (entries.length === 0) return;
+    pendingLocationPatchesRef.current = {};
+    await Promise.all(entries.map(async ([idStr, patch]) => {
+      const id = Number(idStr);
+      try {
+        await apiRequest("PATCH", `/api/observation-locations/${id}`, patch);
+      } catch (err: any) {
+        // Restore so the user doesn't lose data silently if the flush fails.
+        pendingLocationPatchesRef.current[id] = { ...patch, ...(pendingLocationPatchesRef.current[id] || {}) };
+        throw err;
+      }
+    }));
   };
 
   const deleteAdditionalLocation = async (id: number) => {
@@ -1133,7 +1183,15 @@ export default function ObservationForm() {
               return (
                 <Card key={loc.id} className="p-3 space-y-3 bg-muted/20 border-dashed">
                   <div className="flex items-center justify-between">
-                    <div className="text-xs font-medium text-muted-foreground">Location {idx + 2}</div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-xs font-medium text-muted-foreground">Location {idx + 2}</div>
+                      {(savingLocationIds.has(loc.id) || pendingLocationPatchesRef.current[loc.id]) && (
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground italic">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Saving…
+                        </span>
+                      )}
+                    </div>
                     <Button
                       type="button"
                       variant="ghost"
@@ -1150,7 +1208,11 @@ export default function ObservationForm() {
                       <Label className="text-xs">Drop</Label>
                       <Input
                         value={loc.drop || ""}
-                        onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, drop: e.target.value.slice(0, 3) } : l)))}
+                        onChange={(e) => {
+                          const v = e.target.value.slice(0, 3);
+                          setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, drop: v } : l)));
+                          pendingLocationPatchesRef.current[loc.id] = { ...(pendingLocationPatchesRef.current[loc.id] || {}), drop: v };
+                        }}
                         onBlur={(e) => updateAdditionalLocation(loc.id, { drop: e.target.value.slice(0, 3) })}
                         maxLength={3}
                         placeholder="01"
@@ -1163,6 +1225,7 @@ export default function ObservationForm() {
                         value={loc.elevation || ""}
                         onValueChange={(val) => {
                           setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, elevation: val } : l)));
+                          pendingLocationPatchesRef.current[loc.id] = { ...(pendingLocationPatchesRef.current[loc.id] || {}), elevation: val };
                           updateAdditionalLocation(loc.id, { elevation: val });
                         }}
                       >
@@ -1180,7 +1243,11 @@ export default function ObservationForm() {
                       <Label className="text-xs">Level</Label>
                       <Input
                         value={loc.level || ""}
-                        onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, level: e.target.value.slice(0, 4) } : l)))}
+                        onChange={(e) => {
+                          const v = e.target.value.slice(0, 4);
+                          setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, level: v } : l)));
+                          pendingLocationPatchesRef.current[loc.id] = { ...(pendingLocationPatchesRef.current[loc.id] || {}), level: v };
+                        }}
                         onBlur={(e) => updateAdditionalLocation(loc.id, { level: e.target.value.slice(0, 4) })}
                         maxLength={4}
                         placeholder="04"
@@ -1192,7 +1259,11 @@ export default function ObservationForm() {
                     <Label className="text-xs">Description (optional)</Label>
                     <Textarea
                       value={loc.description || ""}
-                      onChange={(e) => setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, description: e.target.value } : l)))}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, description: v } : l)));
+                        pendingLocationPatchesRef.current[loc.id] = { ...(pendingLocationPatchesRef.current[loc.id] || {}), description: v };
+                      }}
                       onBlur={(e) => updateAdditionalLocation(loc.id, { description: e.target.value })}
                       placeholder="Notes specific to this instance"
                       rows={2}
