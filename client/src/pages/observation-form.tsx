@@ -12,6 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { useToast } from "@/hooks/use-toast";
 import { DictationButton } from "@/components/DictationButton";
 import { PhotoCaptionInput } from "@/components/PhotoCaptionInput";
+import { LevelField } from "@/components/LevelField";
 import {
   ArrowLeft, Camera, Upload, X, ImageIcon, Save, Plus, Trash2, ChevronDown, ChevronUp, Sparkles, Loader2, Download,
 } from "lucide-react";
@@ -764,13 +765,10 @@ export default function ObservationForm() {
             </div>
             <div>
               <Label htmlFor="gridLevel" className="text-xs">Level</Label>
-              <Input
-                id="gridLevel"
+              <LevelField
+                projectId={projectId!}
                 value={form.gridLevel}
-                onChange={(e) => setForm(prev => ({ ...prev, gridLevel: e.target.value.slice(0, 4) }))}
-                maxLength={4}
-                placeholder="04"
-                className="font-mono text-center"
+                onChange={(v) => setForm(prev => ({ ...prev, gridLevel: v }))}
               />
             </div>
           </div>
@@ -1241,17 +1239,16 @@ export default function ObservationForm() {
                     </div>
                     <div>
                       <Label className="text-xs">Level</Label>
-                      <Input
+                      <LevelField
+                        projectId={projectId!}
                         value={loc.level || ""}
-                        onChange={(e) => {
-                          const v = e.target.value.slice(0, 4);
+                        onChange={(v) => {
                           setAdditionalLocations(prev => prev.map(l => (l.id === loc.id ? { ...l, level: v } : l)));
                           pendingLocationPatchesRef.current[loc.id] = { ...(pendingLocationPatchesRef.current[loc.id] || {}), level: v };
+                          // Persist immediately on selection (Select-mode change or roof-add).
+                          updateAdditionalLocation(loc.id, { level: v });
                         }}
-                        onBlur={(e) => updateAdditionalLocation(loc.id, { level: e.target.value.slice(0, 4) })}
-                        maxLength={4}
-                        placeholder="04"
-                        className="font-mono text-center"
+                        onBlur={(v) => updateAdditionalLocation(loc.id, { level: v })}
                       />
                     </div>
                   </div>

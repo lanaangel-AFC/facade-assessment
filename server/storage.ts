@@ -13,6 +13,7 @@ import {
   type CustomIndicator, type InsertCustomIndicator, customIndicators,
   type CustomRoofType, type InsertCustomRoofType, customRoofTypes,
   type CustomDefectCategory, type InsertCustomDefectCategory, customDefectCategories,
+  type ProjectRoofLevel, type InsertProjectRoofLevel, projectRoofLevels,
   type Drop, type InsertDrop, drops,
   type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
@@ -278,6 +279,20 @@ try {
 }
 try { sqlite.exec(`ALTER TABLE photos ADD COLUMN location_id INTEGER DEFAULT NULL`); } catch {}
 
+// Project-scoped roof levels (used by Level field dropdown in observation form)
+try {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS project_roof_levels (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      label TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+} catch (e) {
+  console.error("[migration] project_roof_levels CREATE failed:", e);
+}
+
 export const db = drizzle(sqlite);
 export { dataDir };
 
@@ -402,6 +417,7 @@ export class DatabaseStorage implements IStorage {
     db.delete(observationGroups).where(eq(observationGroups.projectId, id)).run();
     db.delete(customIndicators).where(eq(customIndicators.projectId, id)).run();
     db.delete(customDefectCategories).where(eq(customDefectCategories.projectId, id)).run();
+    db.delete(projectRoofLevels).where(eq(projectRoofLevels.projectId, id)).run();
     db.delete(projects).where(eq(projects.id, id)).run();
   }
 
@@ -653,6 +669,27 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteCustomDefectCategory(id: number): Promise<void> {
     db.delete(customDefectCategories).where(eq(customDefectCategories.id, id)).run();
+  }
+
+  // Project Roof Levels (PROJECT-SCOPED)
+  async getProjectRoofLevels(projectId: number): Promise<ProjectRoofLevel[]> {
+    return db.select().from(projectRoofLevels)
+      .where(eq(projectRoofLevels.projectId, projectId))
+      .orderBy(asc(projectRoofLevels.label))
+      .all();
+  }
+  async createProjectRoofLevel(data: InsertProjectRoofLevel): Promise<ProjectRoofLevel> {
+    const trimmed = data.label.trim();
+    // Case-insensitive dedupe within the project
+    const existing = db.select().from(projectRoofLevels)
+      .where(eq(projectRoofLevels.projectId, data.projectId))
+      .all()
+      .find(r => r.label.toLowerCase() === trimmed.toLowerCase());
+    if (existing) return existing;
+    return db.insert(projectRoofLevels).values({ ...data, label: trimmed }).returning().get();
+  }
+  async deleteProjectRoofLevel(id: number): Promise<void> {
+    db.delete(projectRoofLevels).where(eq(projectRoofLevels.id, id)).run();
   }
 
   // Drops (roof plan markers)

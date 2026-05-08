@@ -1193,6 +1193,33 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === PROJECT ROOF LEVELS (project-scoped, used by Level dropdown on observation form) ===
+  app.get("/api/projects/:projectId/roof-levels", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const levels = await storage.getProjectRoofLevels(projectId);
+    res.json(levels);
+  });
+
+  // Server constructs the canonical label as "Roof – {descriptor}" (en-dash separator)
+  // so the format stays consistent across the project. Case-insensitive dedupe.
+  app.post("/api/projects/:projectId/roof-levels", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const descriptor = (req.body?.descriptor || "").trim();
+    if (!descriptor) return res.status(400).json({ message: "descriptor is required" });
+    const label = `Roof – ${descriptor}`;
+    const level = await storage.createProjectRoofLevel({
+      projectId,
+      label,
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(level);
+  });
+
+  app.delete("/api/project-roof-levels/:id", async (req, res) => {
+    await storage.deleteProjectRoofLevel(Number(req.params.id));
+    res.status(204).end();
+  });
+
   // === REPORT LIBRARY (RAG) ===
   const reportsDir = path.join(uploadDir, "reports");
   if (!fs.existsSync(reportsDir)) {

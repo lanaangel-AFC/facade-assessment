@@ -115,6 +115,15 @@ export const customDefectCategories = sqliteTable("custom_defect_categories", {
   createdAt: text("created_at").notNull(),
 });
 
+// Project roof levels — PROJECT-SCOPED, used as selectable Level values when location is on a roof.
+// `label` stores the full string shown in the dropdown (e.g. "Roof – level 10", "Roof – mid-rise").
+export const projectRoofLevels = sqliteTable("project_roof_levels", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  label: text("label").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
 // Elevations (drawings / roof plans)
 export const elevations = sqliteTable("elevations", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -241,6 +250,7 @@ export const insertObservationGroupSchema = createInsertSchema(observationGroups
 export const insertCustomIndicatorSchema = createInsertSchema(customIndicators).omit({ id: true });
 export const insertCustomRoofTypeSchema = createInsertSchema(customRoofTypes).omit({ id: true });
 export const insertCustomDefectCategorySchema = createInsertSchema(customDefectCategories).omit({ id: true });
+export const insertProjectRoofLevelSchema = createInsertSchema(projectRoofLevels).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
@@ -275,6 +285,8 @@ export type CustomRoofType = typeof customRoofTypes.$inferSelect;
 export type InsertCustomRoofType = z.infer<typeof insertCustomRoofTypeSchema>;
 export type CustomDefectCategory = typeof customDefectCategories.$inferSelect;
 export type InsertCustomDefectCategory = z.infer<typeof insertCustomDefectCategorySchema>;
+export type ProjectRoofLevel = typeof projectRoofLevels.$inferSelect;
+export type InsertProjectRoofLevel = z.infer<typeof insertProjectRoofLevelSchema>;
 export type Drop = typeof drops.$inferSelect;
 export type InsertDrop = z.infer<typeof insertDropSchema>;
 export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;
