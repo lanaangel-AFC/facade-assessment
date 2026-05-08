@@ -6,6 +6,7 @@ import {
   insertFacadeSystemSchema,
   insertObservationSchema,
   insertRecommendationSchema,
+  effectiveSeverity,
 } from "@shared/schema";
 import type { FacadeSystem, Observation, Recommendation, Photo } from "@shared/schema";
 import {
@@ -1870,15 +1871,18 @@ export async function registerRoutes(
         });
       };
 
-      // Build CAPEX table rows for a set of recommendations
-      const buildCapexTableRows = (recs: { obsId: string; location: string; defect: string; rec: Recommendation }[]): TableRow[] => {
+      // Build CAPEX table rows for a set of recommendations.
+      // The displayed Severity column is the *effective* severity: Safety/Risk on
+      // the observation is promoted because the AI never assigns Safety/Risk to
+      // rec.category (it's only Essential/Desirable/Monitor at the rec layer).
+      const buildCapexTableRows = (recs: { obsId: string; location: string; defect: string; rec: Recommendation; severity: string }[]): TableRow[] => {
         const rows: TableRow[] = [
-          buildCapexRow("ID", "Location", "Defect/Issue", "Actions", "Time", "Category", "Budget", true, false, false),
+          buildCapexRow("ID", "Location", "Defect/Issue", "Actions", "Time", "Severity", "Budget", true, false, false),
         ];
         recs.forEach((r, idx) => {
           rows.push(buildCapexRow(
             r.obsId, r.location, r.defect,
-            r.rec.action, r.rec.timeframe, r.rec.category, r.rec.budgetEstimate || "",
+            r.rec.action, r.rec.timeframe, r.severity, r.rec.budgetEstimate || "",
             false, idx % 2 === 1, true
           ));
         });
@@ -1968,6 +1972,7 @@ export async function registerRoutes(
             location: obs?.location || "",
             defect: obs?.defectCategory || "",
             rec,
+            severity: effectiveSeverity(rec.category, obs?.severity),
           };
         });
 
@@ -2743,6 +2748,7 @@ export async function registerRoutes(
             location: obs?.location || "",
             defect: obs?.defectCategory || "",
             rec,
+            severity: effectiveSeverity(rec.category, obs?.severity),
           };
         }).sort((a, b) => a.obsId.localeCompare(b.obsId));
 

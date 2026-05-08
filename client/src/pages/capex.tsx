@@ -14,10 +14,10 @@ import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, ArrowUpDown, ArrowUp, ArrowDown, Loader2, ExternalLink, DollarSign } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Project, Observation, Recommendation, FacadeSystem } from "@shared/schema";
+import type { Project, Observation, Recommendation, FacadeSystem, Severity } from "@shared/schema";
+import { SEVERITIES, effectiveSeverity } from "@shared/schema";
 
-type SeverityCategory = "Safety/Risk" | "Essential" | "Desirable" | "Monitor";
-const SEVERITY_OPTIONS: SeverityCategory[] = ["Safety/Risk", "Essential", "Desirable", "Monitor"];
+const SEVERITY_OPTIONS: readonly Severity[] = SEVERITIES;
 const TIMEFRAME_OPTIONS = ["Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"] as const;
 
 type SortKey = "obsId" | "system" | "location" | "action" | "category" | "timeframe" | "budget";
@@ -234,20 +234,19 @@ export default function CapexPage() {
     });
   }, [recommendations, obsById, systemById]);
 
-  // Filtering by severity (the rec.category, with the convention that Safety/Risk
-  // is allowed as a CAPEX-level severity and is also derived from observation.severity)
-  const [filter, setFilter] = useState<SeverityCategory | "All">("All");
+  // Effective severity: Safety/Risk on the observation always wins (the AI never
+  // assigns Safety/Risk to rec.category, so without this promotion Safety/Risk
+  // items would never appear in the Safety/Risk bucket or filter).
+  const rowEffectiveSeverity = (r: Row): Severity => {
+    const draft = drafts[r.rec.id];
+    const cat = draft?.category || r.rec.category;
+    return effectiveSeverity(cat, r.obs?.severity);
+  };
+
+  const [filter, setFilter] = useState<Severity | "All">("All");
   const filteredRows = useMemo(() => {
     if (filter === "All") return rows;
-    return rows.filter(r => {
-      const draft = drafts[r.rec.id];
-      const cat = draft?.category || r.rec.category;
-      // Safety/Risk filter also matches observations marked Safety/Risk even if rec.category is Essential
-      if (filter === "Safety/Risk") {
-        return cat === "Safety/Risk" || r.obs?.severity === "Safety/Risk";
-      }
-      return cat === filter;
-    });
+    return rows.filter(r => rowEffectiveSeverity(r) === filter);
   }, [rows, filter, drafts]);
 
   // Sorting
@@ -270,7 +269,9 @@ export default function CapexPage() {
         case "action":
           av = draftA?.action ?? a.rec.action; bv = draftB?.action ?? b.rec.action; break;
         case "category":
-          av = draftA?.category ?? a.rec.category; bv = draftB?.category ?? b.rec.category; break;
+          av = effectiveSeverity(draftA?.category ?? a.rec.category, a.obs?.severity);
+          bv = effectiveSeverity(draftB?.category ?? b.rec.category, b.obs?.severity);
+          break;
         case "timeframe":
           av = draftA?.timeframe ?? a.rec.timeframe; bv = draftB?.timeframe ?? b.rec.timeframe; break;
         case "budget":
@@ -297,22 +298,19 @@ export default function CapexPage() {
     }
   };
 
-  // Totals
+  // Totals: bucket by effective severity (so Safety/Risk observations land in
+  // the Safety/Risk subtotal even when rec.category is Essential/Desirable/Monitor).
   const totals = useMemo(() => {
-    const buckets: Record<string, number> = {
+    const buckets: Record<Severity, number> = {
       "Safety/Risk": 0, "Essential": 0, "Desirable": 0, "Monitor": 0,
     };
     let grand = 0;
     for (const row of rows) {
       const draft = drafts[row.rec.id];
-      const cat = draft?.category || row.rec.category || "";
+      const sev = effectiveSeverity(draft?.category || row.rec.category, row.obs?.severity);
       const amount = parseBudgetToNumber(draft?.budgetEstimate ?? row.rec.budgetEstimate);
       grand += amount;
-      if (cat in buckets) buckets[cat] += amount;
-      // Treat Safety/Risk on the observation as overriding for subtotal grouping
-      if (row.obs?.severity === "Safety/Risk" && cat !== "Safety/Risk") {
-        // do nothing here - keep cat-derived grouping
-      }
+      buckets[sev] += amount;
     }
     return { buckets, grand };
   }, [rows, drafts]);
@@ -389,11 +387,7 @@ export default function CapexPage() {
           </Button>
           {SEVERITY_OPTIONS.map(s => {
             const cls = severityClasses(s);
-            const count = rows.filter(r => {
-              const cat = drafts[r.rec.id]?.category || r.rec.category;
-              if (s === "Safety/Risk") return cat === s || r.obs?.severity === "Safety/Risk";
-              return cat === s;
-            }).length;
+            const count = rows.filter(r => rowEffectiveSeverity(r) === s).length;
             const active = filter === s;
             return (
               <Button
@@ -459,7 +453,9 @@ export default function CapexPage() {
                 {sortedRows.map((row, idx) => {
                   const draft = drafts[row.rec.id];
                   if (!draft) return null;
-                  const cls = severityClasses(draft.category);
+                  const sev = effectiveSeverity(draft.category, row.obs?.severity);
+                  const cls = severityClasses(sev);
+                  const selectChipCls = severityClasses(draft.category).chip;
                   return (
                     <TableRow key={row.rec.id} className={cls.bg}>
                       <TableCell className="text-xs text-muted-foreground">{idx + 1}</TableCell>
@@ -499,7 +495,7 @@ export default function CapexPage() {
                             window.setTimeout(() => flushSave(row.rec), 0);
                           }}
                         >
-                          <SelectTrigger className={`text-xs ${cls.chip} border`}>
+                          <SelectTrigger className={`text-xs ${selectChipCls} border`}>
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -553,7 +549,8 @@ export default function CapexPage() {
             {sortedRows.map((row, idx) => {
               const draft = drafts[row.rec.id];
               if (!draft) return null;
-              const cls = severityClasses(draft.category);
+              const sev = effectiveSeverity(draft.category, row.obs?.severity);
+              const cls = severityClasses(sev);
               return (
                 <div key={row.rec.id} className={`rounded-md border ${cls.bg} ${cls.border} p-3 space-y-2`}>
                   <div className="flex items-center justify-between">

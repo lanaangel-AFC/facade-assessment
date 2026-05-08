@@ -283,3 +283,27 @@ export type ReportLibraryPassage = typeof reportLibraryPassages.$inferSelect;
 export type InsertReportLibraryPassage = z.infer<typeof insertReportLibraryPassageSchema>;
 export type ObservationLocation = typeof observationLocations.$inferSelect;
 export type InsertObservationLocation = z.infer<typeof insertObservationLocationSchema>;
+
+// Canonical severity / category values. Safety/Risk lives only on observations
+// (the AI never assigns it as a recommendation category), so the "effective"
+// severity used for CAPEX grouping/totals/Word export must be derived by
+// promoting the observation's severity to Safety/Risk when applicable.
+export const SEVERITIES = ["Safety/Risk", "Essential", "Desirable", "Monitor"] as const;
+export type Severity = typeof SEVERITIES[number];
+
+export const RECOMMENDATION_CATEGORIES = ["Essential", "Desirable", "Monitor"] as const;
+export type RecommendationCategory = typeof RECOMMENDATION_CATEGORIES[number];
+
+export function effectiveSeverity(
+  recCategory: string | null | undefined,
+  obsSeverity: string | null | undefined,
+): Severity {
+  if (obsSeverity === "Safety/Risk") return "Safety/Risk";
+  if (recCategory === "Essential" || recCategory === "Desirable" || recCategory === "Monitor") {
+    return recCategory;
+  }
+  if (obsSeverity === "Essential" || obsSeverity === "Desirable" || obsSeverity === "Monitor") {
+    return obsSeverity;
+  }
+  return "Essential";
+}
