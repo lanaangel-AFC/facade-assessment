@@ -354,7 +354,8 @@ export interface IStorage {
   createObservation(observation: InsertObservation): Promise<Observation>;
   updateObservation(id: number, observation: Partial<InsertObservation>): Promise<Observation | undefined>;
   deleteObservation(id: number): Promise<void>;
-  getNextObservationId(projectId: number, systemId: number): Promise<string>;
+  getNextObservationId(projectId: number, systemId: number, excludeObservationId?: number): Promise<string>;
+  repairMissingObservationIds(): Promise<number>;
   // Recommendations
   getRecommendationsByObservation(observationId: number): Promise<Recommendation[]>;
   getRecommendationsByProject(projectId: number): Promise<Recommendation[]>;
@@ -520,7 +521,7 @@ export class DatabaseStorage implements IStorage {
     db.delete(observationLocations).where(eq(observationLocations.id, id)).run();
   }
 
-  async getNextObservationId(projectId: number, systemId: number): Promise<string> {
+  async getNextObservationId(projectId: number, systemId: number, excludeObservationId?: number): Promise<string> {
     // Get the system to determine its sort order for the section number
     const system = db.select().from(facadeSystems).where(eq(facadeSystems.id, systemId)).get();
     if (!system) return "4.1-1";
@@ -535,15 +536,70 @@ export class DatabaseStorage implements IStorage {
     const systemIndex = allSystems.findIndex(s => s.id === systemId);
     const sectionNum = `4.${systemIndex + 1}`;
 
-    // Count existing observations for this system
+    // Find the highest existing suffix used for this section across the project,
+    // ignoring any observation we are repairing (so the same row isn't both
+    // counted and renumbered). Using max(suffix)+1 instead of count+1 avoids
+    // collisions if rows have been deleted or already-allocated IDs exist.
     const existing = db.select().from(observations)
       .where(eq(observations.projectId, projectId))
       .all();
 
-    const matching = existing.filter(o => o.observationId.startsWith(sectionNum + "-"));
-    const nextNum = matching.length + 1;
+    const prefix = sectionNum + "-";
+    let maxSuffix = 0;
+    for (const o of existing) {
+      if (excludeObservationId !== undefined && o.id === excludeObservationId) continue;
+      const oid = o.observationId;
+      if (typeof oid !== "string" || !oid.startsWith(prefix)) continue;
+      const suffix = parseInt(oid.slice(prefix.length), 10);
+      if (Number.isFinite(suffix) && suffix > maxSuffix) maxSuffix = suffix;
+    }
 
-    return `${sectionNum}-${nextNum}`;
+    return `${prefix}${maxSuffix + 1}`;
+  }
+
+  /**
+   * Backfill observation_id for any rows that have a system linked but a
+   * missing/empty identifier. Idempotent — safe to call on every boot.
+   */
+  async repairMissingObservationIds(): Promise<number> {
+    const broken = db.select().from(observations).all().filter(o =>
+      o.systemId != null && (o.observationId == null || o.observationId === "")
+    );
+    if (broken.length === 0) return 0;
+
+    // Repair within a single transaction so concurrent reads see a consistent state.
+    const repair = sqlite.transaction(() => {
+      for (const obs of broken) {
+        const newId = (() => {
+          // Inline because we're inside a sync transaction; mirrors getNextObservationId logic.
+          const system = db.select().from(facadeSystems).where(eq(facadeSystems.id, obs.systemId!)).get();
+          if (!system) return `obs-${obs.id}`;
+          const allSystems = db.select().from(facadeSystems)
+            .where(eq(facadeSystems.projectId, obs.projectId))
+            .all();
+          allSystems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+          const systemIndex = allSystems.findIndex(s => s.id === obs.systemId);
+          const sectionNum = `4.${systemIndex + 1}`;
+          const prefix = sectionNum + "-";
+          const existing = db.select().from(observations)
+            .where(eq(observations.projectId, obs.projectId))
+            .all();
+          let maxSuffix = 0;
+          for (const o of existing) {
+            if (o.id === obs.id) continue;
+            const oid = o.observationId;
+            if (typeof oid !== "string" || !oid.startsWith(prefix)) continue;
+            const suffix = parseInt(oid.slice(prefix.length), 10);
+            if (Number.isFinite(suffix) && suffix > maxSuffix) maxSuffix = suffix;
+          }
+          return `${prefix}${maxSuffix + 1}`;
+        })();
+
+        db.update(observations).set({ observationId: newId }).where(eq(observations.id, obs.id)).run();
+      }
+    });
+    repair();
+    return broken.length;
   }
 
   // Recommendations
@@ -843,3 +899,18 @@ export class DatabaseStorage implements IStorage {
 }
 
 export const storage = new DatabaseStorage();
+
+// Idempotent startup repair: if an observation was saved without a system
+// (so no observation_id was generated) and later linked to a system, the
+// PATCH used to leave observation_id blank. Backfill those here on every
+// boot — cheap query, no-op when nothing needs fixing.
+(async () => {
+  try {
+    const repaired = await storage.repairMissingObservationIds();
+    if (repaired > 0) {
+      console.log(`[startup] Repaired ${repaired} observation ID${repaired === 1 ? "" : "s"} that were linked to a system without an identifier`);
+    }
+  } catch (e) {
+    console.error("[startup] repairMissingObservationIds failed:", e);
+  }
+})();
