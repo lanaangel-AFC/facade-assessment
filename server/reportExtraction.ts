@@ -177,3 +177,30 @@ export async function extractPassages(filePath: string, mimeType: string): Promi
 
   return passages;
 }
+
+/**
+ * Extract raw text from a PDF or DOCX, returning the whole document as a single string.
+ * Used by Project Documents (factual context, no chunking / no embeddings).
+ * Throws if the file is unsupported (e.g. images) or extraction yields no text.
+ */
+export async function extractRawText(filePath: string, mimeType: string): Promise<string> {
+  const ext = path.extname(filePath).toLowerCase();
+  let rawText = "";
+
+  if (mimeType === "application/pdf" || ext === ".pdf") {
+    rawText = await extractPdfText(filePath);
+  } else if (
+    mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    ext === ".docx"
+  ) {
+    rawText = await extractDocxText(filePath);
+  } else {
+    throw new Error(`Unsupported file type: ${mimeType || ext}`);
+  }
+
+  if (!rawText || rawText.trim().length === 0) {
+    throw new Error("No text extracted from document");
+  }
+  // Normalize whitespace lightly — keep paragraph breaks
+  return rawText.replace(/\r\n/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
+}

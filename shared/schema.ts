@@ -205,6 +205,30 @@ export const aiTrainingData = sqliteTable("ai_training_data", {
   createdAt: text("created_at").notNull(),
 });
 
+// Project Documents (PROJECT-SCOPED — uploaded by the engineer for AI factual context
+// and listed as Harvard-style references in the Word export). Distinct from the global
+// Report Library used for style matching.
+export const projectDocuments = sqliteTable("project_documents", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  originalName: text("original_name").notNull(),
+  filePath: text("file_path").notNull(),
+  mimeType: text("mime_type").default(""),
+  fileSize: integer("file_size").default(0),
+  uploadedAt: text("uploaded_at").notNull(),
+  // Bibliographic fields — all free-form, all editable
+  author: text("author").default(""),
+  year: text("year").default(""),
+  title: text("title").default(""),
+  publisher: text("publisher").default(""),
+  documentType: text("document_type").default(""),
+  notes: text("notes").default(""),
+  // Extraction status
+  extractionStatus: text("extraction_status").default("pending"), // pending | processing | complete | error | skipped
+  extractionError: text("extraction_error").default(""),
+  extractedText: text("extracted_text").default(""),
+});
+
 // Report Library Documents (Global RAG source documents — past AFC reports)
 export const reportLibraryDocuments = sqliteTable("report_library_documents", {
   id: text("id").primaryKey(),
@@ -253,6 +277,7 @@ export const insertCustomDefectCategorySchema = createInsertSchema(customDefectC
 export const insertProjectRoofLevelSchema = createInsertSchema(projectRoofLevels).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
 export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
+export const insertProjectDocumentSchema = createInsertSchema(projectDocuments).omit({ id: true });
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
 export const insertObservationLocationSchema = createInsertSchema(observationLocations).omit({ id: true });
 
@@ -291,6 +316,8 @@ export type Drop = typeof drops.$inferSelect;
 export type InsertDrop = z.infer<typeof insertDropSchema>;
 export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;
 export type InsertReportLibraryDocument = z.infer<typeof insertReportLibraryDocumentSchema>;
+export type ProjectDocument = typeof projectDocuments.$inferSelect;
+export type InsertProjectDocument = z.infer<typeof insertProjectDocumentSchema>;
 export type ReportLibraryPassage = typeof reportLibraryPassages.$inferSelect;
 export type InsertReportLibraryPassage = z.infer<typeof insertReportLibraryPassageSchema>;
 export type ObservationLocation = typeof observationLocations.$inferSelect;

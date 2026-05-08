@@ -18,6 +18,7 @@ import {
   type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
   type ObservationLocation, type InsertObservationLocation, observationLocations,
+  type ProjectDocument, type InsertProjectDocument, projectDocuments,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -293,6 +294,33 @@ try {
   console.error("[migration] project_roof_levels CREATE failed:", e);
 }
 
+// Project Documents (project-scoped uploads used as AI factual context and Harvard
+// references in the Word export)
+try {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS project_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      original_name TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      mime_type TEXT DEFAULT '',
+      file_size INTEGER DEFAULT 0,
+      uploaded_at TEXT NOT NULL,
+      author TEXT DEFAULT '',
+      year TEXT DEFAULT '',
+      title TEXT DEFAULT '',
+      publisher TEXT DEFAULT '',
+      document_type TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      extraction_status TEXT DEFAULT 'pending',
+      extraction_error TEXT DEFAULT '',
+      extracted_text TEXT DEFAULT ''
+    );
+  `);
+} catch (e) {
+  console.error("[migration] project_documents CREATE failed:", e);
+}
+
 export const db = drizzle(sqlite);
 export { dataDir };
 
@@ -418,6 +446,14 @@ export class DatabaseStorage implements IStorage {
     db.delete(customIndicators).where(eq(customIndicators.projectId, id)).run();
     db.delete(customDefectCategories).where(eq(customDefectCategories.projectId, id)).run();
     db.delete(projectRoofLevels).where(eq(projectRoofLevels.projectId, id)).run();
+    // Delete project documents (and their files on disk)
+    const projDocs = db.select().from(projectDocuments).where(eq(projectDocuments.projectId, id)).all();
+    for (const d of projDocs) {
+      if (d.filePath) {
+        try { if (fs.existsSync(d.filePath)) fs.unlinkSync(d.filePath); } catch {}
+      }
+    }
+    db.delete(projectDocuments).where(eq(projectDocuments.projectId, id)).run();
     db.delete(projects).where(eq(projects.id, id)).run();
   }
 
@@ -770,6 +806,39 @@ export class DatabaseStorage implements IStorage {
   }
   async deletePassage(id: string): Promise<void> {
     db.delete(reportLibraryPassages).where(eq(reportLibraryPassages.id, id)).run();
+  }
+
+  // === Project Documents (project-scoped factual context + Harvard references) ===
+  async getProjectDocuments(projectId: number): Promise<ProjectDocument[]> {
+    return db.select().from(projectDocuments)
+      .where(eq(projectDocuments.projectId, projectId))
+      .orderBy(desc(projectDocuments.uploadedAt))
+      .all();
+  }
+  async getProjectDocument(id: number): Promise<ProjectDocument | undefined> {
+    return db.select().from(projectDocuments).where(eq(projectDocuments.id, id)).get();
+  }
+  async createProjectDocument(data: InsertProjectDocument): Promise<ProjectDocument> {
+    return db.insert(projectDocuments).values(data).returning().get();
+  }
+  async updateProjectDocument(id: number, patch: Partial<InsertProjectDocument>): Promise<ProjectDocument | undefined> {
+    return db.update(projectDocuments).set(patch).where(eq(projectDocuments.id, id)).returning().get();
+  }
+  async deleteProjectDocument(id: number): Promise<ProjectDocument | undefined> {
+    const doc = db.select().from(projectDocuments).where(eq(projectDocuments.id, id)).get();
+    if (!doc) return undefined;
+    db.delete(projectDocuments).where(eq(projectDocuments.id, id)).run();
+    if (doc.filePath) {
+      try { if (fs.existsSync(doc.filePath)) fs.unlinkSync(doc.filePath); } catch {}
+    }
+    return doc;
+  }
+  // Returns documents suitable for AI context: status complete with non-empty extracted text
+  async getProjectDocumentsForAI(projectId: number): Promise<ProjectDocument[]> {
+    return db.select().from(projectDocuments)
+      .where(eq(projectDocuments.projectId, projectId))
+      .all()
+      .filter((d) => d.extractionStatus === "complete" && (d.extractedText || "").trim().length > 0);
   }
 }
 

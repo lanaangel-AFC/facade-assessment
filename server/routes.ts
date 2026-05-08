@@ -1220,6 +1220,158 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === PROJECT DOCUMENTS (project-scoped factual context + Harvard references) ===
+  const projectDocsDir = path.join(uploadDir, "project-docs");
+  if (!fs.existsSync(projectDocsDir)) {
+    fs.mkdirSync(projectDocsDir, { recursive: true });
+  }
+
+  const projectDocUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, projectDocsDir),
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        cb(null, `${crypto.randomUUID()}${ext}`);
+      },
+    }),
+    limits: { fileSize: 100 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const ok =
+        file.mimetype === "application/pdf" ||
+        file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+        file.mimetype === "image/jpeg" ||
+        file.mimetype === "image/png" ||
+        /\.(pdf|docx|jpg|jpeg|png)$/i.test(file.originalname);
+      if (ok) cb(null, true);
+      else cb(new Error("Only PDF, DOCX, JPG, or PNG files are allowed"));
+    },
+  });
+
+  const PROJECT_DOC_TEXT_CAP = 30000;
+
+  async function processProjectDocument(documentId: number) {
+    const { extractRawText } = await import("./reportExtraction");
+    try {
+      const doc = await storage.getProjectDocument(documentId);
+      if (!doc) return;
+
+      const ext = path.extname(doc.filePath).toLowerCase();
+      const isImage = /^image\//.test(doc.mimeType || "") || /\.(jpe?g|png)$/i.test(ext);
+
+      if (isImage) {
+        await storage.updateProjectDocument(documentId, {
+          extractionStatus: "skipped",
+          extractionError: "",
+          extractedText: "",
+        });
+        return;
+      }
+
+      await storage.updateProjectDocument(documentId, { extractionStatus: "processing" });
+
+      let text = await extractRawText(doc.filePath, doc.mimeType || "");
+      if (text.length > PROJECT_DOC_TEXT_CAP) {
+        text = text.slice(0, PROJECT_DOC_TEXT_CAP) + "\n[...truncated]";
+      }
+      await storage.updateProjectDocument(documentId, {
+        extractionStatus: "complete",
+        extractionError: "",
+        extractedText: text,
+      });
+    } catch (err: any) {
+      console.error("Project document processing failed:", err);
+      try {
+        await storage.updateProjectDocument(documentId, {
+          extractionStatus: "error",
+          extractionError: err?.message || String(err),
+        });
+      } catch {}
+    }
+  }
+
+  app.post("/api/projects/:projectId/documents", projectDocUpload.single("file"), async (req, res) => {
+    try {
+      const projectId = Number(req.params.projectId);
+      if (!Number.isFinite(projectId)) {
+        return res.status(400).json({ message: "Invalid projectId" });
+      }
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+
+      const body = req.body || {};
+      const titleField = (body.title || "").trim() || req.file.originalname;
+
+      const doc = await storage.createProjectDocument({
+        projectId,
+        originalName: req.file.originalname,
+        filePath: req.file.path,
+        mimeType: req.file.mimetype || "",
+        fileSize: req.file.size || 0,
+        uploadedAt: new Date().toISOString(),
+        author: (body.author || "").toString(),
+        year: (body.year || "").toString(),
+        title: titleField,
+        publisher: (body.publisher || "").toString(),
+        documentType: (body.documentType || "").toString(),
+        notes: (body.notes || "").toString(),
+        extractionStatus: "pending",
+        extractionError: "",
+        extractedText: "",
+      });
+
+      processProjectDocument(doc.id).catch((err) => console.error("Background project-doc processing error:", err));
+      res.status(201).json(doc);
+    } catch (err: any) {
+      console.error("Project document upload error:", err);
+      res.status(500).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/documents", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    if (!Number.isFinite(projectId)) {
+      return res.status(400).json({ message: "Invalid projectId" });
+    }
+    const docs = await storage.getProjectDocuments(projectId);
+    res.json(docs);
+  });
+
+  app.patch("/api/project-documents/:id", async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+      const body = req.body || {};
+      // Only accept bibliographic / display fields here
+      const patch: Record<string, unknown> = {};
+      const ALLOWED = ["author", "year", "title", "publisher", "documentType", "notes"];
+      for (const k of ALLOWED) {
+        if (k in body) patch[k] = (body[k] ?? "").toString();
+      }
+      const updated = await storage.updateProjectDocument(id, patch as any);
+      if (!updated) return res.status(404).json({ message: "Document not found" });
+      res.json(updated);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "Update failed" });
+    }
+  });
+
+  app.delete("/api/project-documents/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+    await storage.deleteProjectDocument(id);
+    res.status(204).end();
+  });
+
+  app.get("/api/project-documents/:id/file", async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+    const doc = await storage.getProjectDocument(id);
+    if (!doc) return res.status(404).json({ message: "Document not found" });
+    if (!doc.filePath || !fs.existsSync(doc.filePath)) {
+      return res.status(404).json({ message: "File missing on disk" });
+    }
+    res.download(doc.filePath, doc.originalName);
+  });
+
   // === REPORT LIBRARY (RAG) ===
   const reportsDir = path.join(uploadDir, "reports");
   if (!fs.existsSync(reportsDir)) {
@@ -1524,6 +1676,7 @@ export async function registerRoutes(
       const systems = await storage.getSystemsByProject(projectId);
       const allObservations = await storage.getObservationsByProject(projectId);
       const allRecommendations = await storage.getRecommendationsByProject(projectId);
+      const projectDocs = await storage.getProjectDocuments(projectId);
 
       // Fetch photos for each system and observation
       const systemPhotosMap: Record<number, Photo[]> = {};
@@ -2119,6 +2272,47 @@ export async function registerRoutes(
           children: [new TextRun({ text: "No limitations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
           spacing: { after: 150 },
         }));
+      }
+
+      // 2.5 References — Harvard format. Omitted entirely if no project documents.
+      if (projectDocs.length > 0) {
+        introChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "2.5 References", font: "Arial", size: 28, bold: true, color: TEAL })],
+          spacing: { before: 300, after: 150 },
+        }));
+
+        const formatHarvard = (d: typeof projectDocs[number]): string => {
+          const author = (d.author || "").trim();
+          const year = (d.year || "").trim();
+          const titleStr = (d.title || d.originalName || "Untitled").trim();
+          const publisher = (d.publisher || "").trim();
+          // Harvard: Author (Year). Title. Publisher.
+          const parts: string[] = [];
+          if (author) {
+            parts.push(year ? `${author} (${year}).` : `${author}.`);
+          } else if (year) {
+            parts.push(`(${year}).`);
+          }
+          parts.push(`${titleStr}.`);
+          if (publisher) parts.push(`${publisher}.`);
+          return parts.join(" ");
+        };
+
+        const sortedRefs = [...projectDocs].sort((a, b) => {
+          const aKey = (a.author || a.title || a.originalName || "").toLowerCase();
+          const bKey = (b.author || b.title || b.originalName || "").toLowerCase();
+          return aKey.localeCompare(bKey);
+        });
+
+        for (const d of sortedRefs) {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: formatHarvard(d), font: "Arial", size: 20 })],
+            // Hanging indent: left indent + negative first-line offset (~36pt)
+            indent: { left: 720, hanging: 720 },
+            spacing: { after: 120 },
+          }));
+        }
       }
 
       // === SECTION 3: SITE DESCRIPTION ===

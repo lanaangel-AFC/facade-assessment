@@ -29,6 +29,7 @@ import {
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
 import RoofPlanMarkup from "@/components/roof-plan-markup";
+import ProjectDataTab from "@/components/ProjectDataTab";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -54,7 +55,7 @@ const COMMON_LIMITATIONS = [
   "Heritage listing constraints limit intrusive investigation",
 ];
 
-const VALID_TABS = ["overview", "systems", "elevations", "observations", "capex"] as const;
+const VALID_TABS = ["overview", "systems", "elevations", "observations", "project-data", "capex"] as const;
 type TabValue = typeof VALID_TABS[number];
 
 const readTabFromUrl = (): TabValue => {
@@ -471,6 +472,10 @@ export default function ProjectDetail() {
           <TabsTrigger value="observations" className="gap-1.5">
             <Eye className="w-4 h-4" />
             Observations
+          </TabsTrigger>
+          <TabsTrigger value="project-data" className="gap-1.5">
+            <ClipboardList className="w-4 h-4" />
+            Project Data
           </TabsTrigger>
           <TabsTrigger value="capex" className="gap-1.5">
             <DollarSign className="w-4 h-4" />
@@ -1178,6 +1183,11 @@ export default function ProjectDetail() {
               )}
             </div>
           )}
+        </TabsContent>
+
+        {/* === PROJECT DATA TAB === */}
+        <TabsContent value="project-data">
+          <ProjectDataTab projectId={Number(id)} />
         </TabsContent>
 
         {/* === CAPEX TAB === */}

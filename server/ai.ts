@@ -96,6 +96,79 @@ async function getProjectContextById(projectId: number | null | undefined): Prom
   }
 }
 
+const PROJECT_DOC_TOTAL_CAP = 60000;
+
+/**
+ * Build a "Project Documents" context block from the documents the engineer has
+ * uploaded for this project. Documents are presented as factual context — the
+ * model is told NOT to cite them inline; they will be listed as Harvard
+ * references separately in Section 2.x of the Word export.
+ *
+ * Prioritisation when total text exceeds PROJECT_DOC_TOTAL_CAP:
+ *   1. Most recently uploaded
+ *   2. Documents with non-empty notes
+ *   3. Smaller documents first
+ * Skips docs with status "skipped" or "error" (handled upstream by the storage
+ * helper, which only returns status=complete with non-empty text).
+ */
+async function buildProjectDocumentsBlock(projectId: number | null | undefined): Promise<string> {
+  if (!projectId) return "";
+  let docs;
+  try {
+    docs = await storage.getProjectDocumentsForAI(projectId);
+  } catch {
+    return "";
+  }
+  if (!docs || docs.length === 0) return "";
+
+  // Score: lower is better. Negative most-recent-uploaded weight is dominant.
+  const scored = docs.map((d) => {
+    const uploadedAt = Date.parse(d.uploadedAt || "") || 0;
+    const hasNotes = (d.notes || "").trim().length > 0;
+    const size = (d.extractedText || "").length;
+    return { d, uploadedAt, hasNotes, size };
+  });
+  scored.sort((a, b) => {
+    if (b.uploadedAt !== a.uploadedAt) return b.uploadedAt - a.uploadedAt;
+    if (a.hasNotes !== b.hasNotes) return a.hasNotes ? -1 : 1;
+    return a.size - b.size;
+  });
+
+  let total = 0;
+  const sections: string[] = [];
+  let included = 0;
+  for (const { d } of scored) {
+    const titleStr = (d.title || d.originalName || "Untitled").trim();
+    const yearStr = (d.year || "").trim();
+    const typeStr = (d.documentType || "").trim();
+    const headerBits = [titleStr];
+    if (yearStr || typeStr) {
+      const meta = [yearStr, typeStr].filter(Boolean).join(", ");
+      headerBits.push(`(${meta})`);
+    }
+    const header = `--- DOCUMENT ${included + 1}: ${headerBits.join(" ")} ---`;
+    const body = (d.extractedText || "").trim();
+    const block = `${header}\n${body}`;
+    if (total + block.length + 2 > PROJECT_DOC_TOTAL_CAP) {
+      // Skip oversized; try fitting smaller subsequent docs that may still fit
+      continue;
+    }
+    sections.push(block);
+    total += block.length + 2;
+    included += 1;
+  }
+
+  if (sections.length === 0) return "";
+
+  return `PROJECT DOCUMENTS PROVIDED BY THE ENGINEER (use as factual context where relevant — do not cite inline; the engineer will reference them separately in Section 2 of the report. Do not invent information that is not in these documents or the project metadata):
+
+${sections.join("\n\n")}
+
+---
+
+`;
+}
+
 // Load training data for style calibration
 async function getTrainingExamples(outputType: string, limit: number = 3): Promise<string> {
   try {
@@ -111,7 +184,7 @@ async function getTrainingExamples(outputType: string, limit: number = 3): Promi
   }
 }
 
-export async function identifySystem(photoIds: number[], projectContext: string = ""): Promise<{
+export async function identifySystem(photoIds: number[], projectContext: string = "", projectId?: number | null): Promise<{
   systemType: string;
   materials: { name: string; detail: string }[];
   keyFeatures: string[];
@@ -122,10 +195,12 @@ export async function identifySystem(photoIds: number[], projectContext: string 
 
   const photosToSend: { filename: string; caption?: string | null }[] = [];
   let resolvedContext = projectContext;
+  let resolvedProjectId: number | null | undefined = projectId ?? null;
   for (const photoId of photoIds) {
     const photo = await storage.getPhoto(photoId);
     if (!photo) continue;
     photosToSend.push(photo);
+    if (!resolvedProjectId) resolvedProjectId = (photo as any).projectId ?? null;
     if (!resolvedContext) {
       resolvedContext = await getProjectContextById((photo as any).projectId);
     }
@@ -137,13 +212,16 @@ export async function identifySystem(photoIds: number[], projectContext: string 
   }
 
   const contextBlock = buildProjectContextBlock(resolvedContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(resolvedProjectId);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `${contextBlock}You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
+        content: `${contextBlock}${projectDocsBlock}You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 ${CAPTION_GUIDANCE}
 
@@ -213,9 +291,12 @@ Related Systems: ${system.relatedSystems || "None noted"}
   const styleExamples = await getStyleExamples(styleQuery, "description", 2);
   const projectContext = await getProjectContextById(system.projectId);
   const contextBlock = buildProjectContextBlock(projectContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(system.projectId);
 
   const hasPhotos = imageParts.length > 0;
-  const systemPrompt = `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
@@ -326,8 +407,11 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}${multiLocBlock
   const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
   const projectContext = await getProjectContextById(observation.projectId);
   const contextBlock = buildProjectContextBlock(projectContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(observation.projectId);
 
-  const systemPrompt = `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use numbered points with lettered sub-items (a, b, c) for details.
@@ -449,6 +533,7 @@ Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
   const styleExamples = await getStyleExamples(styleQuery, "recommendation", 2);
   const projectContext = await getProjectContextById(observation.projectId);
   const contextBlock = buildProjectContextBlock(projectContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(observation.projectId);
 
   // Include observation photos with captions so recommendations can reflect visible severity
   const obsPhotos = await storage.getPhotosByObservation(observationId);
@@ -468,7 +553,9 @@ Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
     messages: [
       {
         role: "system",
-        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 CONSERVATIVENESS LEVEL: ${conservativeness.toUpperCase()}
@@ -549,6 +636,7 @@ export async function generateGroupNarrative(
   const styleExamples = await getStyleExamples(styleQuery, "narrative", 2);
   const projectContext = await getProjectContextById(projectId);
   const contextBlock = buildProjectContextBlock(projectContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
 
   // Build vision input: for each photo that has a filename, include its caption + image
   const photosWithFiles = photos.filter(p => p.filename) as { observationId: string; caption: string; filename: string }[];
@@ -588,7 +676,9 @@ export async function generateGroupNarrative(
     messages: [
       {
         role: "system",
-        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
 
 You will be given a group name (e.g. "Eastern Facade" or "Sealant Failure") and a set of related observations. Produce ONE combined narrative covering all of them, as a numbered list of defects with lettered sub-items.
@@ -668,6 +758,8 @@ Background Documents: ${bgDocs.length > 0 ? bgDocs.map(d => `${d.title || "Untit
   const styleExamples = await getStyleExamples(styleQuery, "general", 2);
   const descStyleExamples = await getStyleExamples(styleQuery, "description", 1);
   const combinedStyle = styleExamples + descStyleExamples;
+  const projectContextBlock = buildProjectContextBlock(rawContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
 
   const userInputBlock = rawContext
     ? `ENGINEER'S ROUGH NOTES (rewrite into polished prose — do not invent facts beyond these notes and the project metadata):\n\n${rawContext}`
@@ -678,7 +770,9 @@ Background Documents: ${bgDocs.length > 0 ? bgDocs.map(d => `${d.title || "Untit
     messages: [
       {
         role: "system",
-        content: `${combinedStyle}You are AFC, Angel Façade Consulting. Rewrite the engineer's rough background notes into a polished Background and Introduction section for a façade inspection report.
+        content: `${projectContextBlock}${projectDocsBlock}${combinedStyle}You are AFC, Angel Façade Consulting. Rewrite the engineer's rough background notes into a polished Background and Introduction section for a façade inspection report.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 STYLE RULES:
 - Concise, professional, structured. Australian English, Australian facade engineering terminology.
@@ -755,13 +849,16 @@ Summary Statistics:
   const styleQuery = `${project.name} ${project.address} ${project.buildingUse || ""} ${systems.map(s => s.systemType).join(" ")}`.trim();
   const styleExamples = await getStyleExamples(styleQuery, "general", 2);
   const contextBlock = buildProjectContextBlock((project as any).projectContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       {
         role: "system",
-        content: `${contextBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
+        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
+
+Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 STYLE RULES:
 - Be concise. Summarise what was done, what was found, and what needs to happen.
