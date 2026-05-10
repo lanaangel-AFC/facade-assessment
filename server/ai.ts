@@ -2,7 +2,81 @@ import OpenAI from "openai";
 import { storage, dataDir } from "./storage";
 import fs from "fs";
 import path from "path";
+import sharp from "sharp";
+import { encode as encodeGpt4o } from "gpt-tokenizer/model/gpt-4o";
 import { findSimilarPassages } from "./embeddings";
+
+const MAX_INPUT_TOKENS = 24000;
+const PROJECT_CONTEXT_TOKEN_CAP = 1500;
+const PROJECT_DOCS_TOKEN_CAP = 4000;
+const STYLE_EXEMPLARS_TOKEN_CAP = 4000;
+const STYLE_EXEMPLARS_MAX_COUNT = 5;
+const IMAGE_TOKEN_BUDGET = 1000;
+const MAX_GROUP_PHOTOS = 8;
+const MAX_PER_CALL_PHOTOS = 6;
+const VISION_MAX_EDGE_PX = 1024;
+
+export function countTokens(text: string): number {
+  if (!text) return 0;
+  try {
+    return encodeGpt4o(text).length;
+  } catch {
+    return Math.ceil(text.length / 4);
+  }
+}
+
+function truncateToTokens(text: string, maxTokens: number): string {
+  if (!text) return "";
+  const toks = countTokens(text);
+  if (toks <= maxTokens) return text;
+  // Binary-ish search: shrink by character ratio, then refine.
+  const ratio = maxTokens / toks;
+  let approxChars = Math.max(1, Math.floor(text.length * ratio) - 32);
+  let candidate = text.slice(0, approxChars);
+  while (countTokens(candidate) > maxTokens && candidate.length > 0) {
+    candidate = candidate.slice(0, Math.max(0, candidate.length - 64));
+  }
+  return candidate.trimEnd() + " …[truncated]";
+}
+
+type ChatParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+
+/**
+ * Wrapper that tries gpt-4o first then falls back to gpt-4o-mini on 429 /
+ * "Request too large" / "rate limit" errors. Throws a user-friendly error
+ * if the fallback also rate-limits.
+ */
+async function callOpenAIChat(
+  client: OpenAI,
+  params: ChatParams
+): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  try {
+    return await client.chat.completions.create(params);
+  } catch (err: any) {
+    const status = err?.status ?? err?.response?.status;
+    const message = String(err?.message || err || "");
+    const isRateLimit =
+      status === 429 ||
+      /request too large/i.test(message) ||
+      /rate limit/i.test(message);
+    if (!isRateLimit) throw err;
+    console.warn("[ai] gpt-4o hit 429, retrying with gpt-4o-mini");
+    try {
+      return await client.chat.completions.create({ ...params, model: "gpt-4o-mini" });
+    } catch (err2: any) {
+      const status2 = err2?.status ?? err2?.response?.status;
+      const message2 = String(err2?.message || err2 || "");
+      const isRateLimit2 =
+        status2 === 429 ||
+        /request too large/i.test(message2) ||
+        /rate limit/i.test(message2);
+      if (isRateLimit2) {
+        throw new Error("AI temporarily rate-limited. Please wait 30 seconds and try again.");
+      }
+      throw err2;
+    }
+  }
+}
 
 /**
  * Retrieve style exemplars from the user's past AFC reports (RAG).
@@ -10,12 +84,26 @@ import { findSimilarPassages } from "./embeddings";
  */
 async function getStyleExamples(query: string, category: string, topK: number = 2): Promise<string> {
   try {
-    const passages = await findSimilarPassages(query, category, topK);
+    // Pull a wider candidate pool, then budget-cap by tokens.
+    const fetchK = Math.max(topK, STYLE_EXEMPLARS_MAX_COUNT);
+    const passages = await findSimilarPassages(query, category, fetchK);
     if (passages.length === 0) return "";
 
-    const numbered = passages
-      .map((p, idx) => `${idx + 1}. ${p.text.trim()}`)
-      .join("\n\n");
+    const selected: string[] = [];
+    let cumulative = 0;
+    for (const p of passages) {
+      if (selected.length >= STYLE_EXEMPLARS_MAX_COUNT) break;
+      const text = (p.text || "").trim();
+      if (!text) continue;
+      const toks = countTokens(text);
+      if (cumulative + toks > STYLE_EXEMPLARS_TOKEN_CAP && selected.length > 0) break;
+      selected.push(text);
+      cumulative += toks;
+      if (cumulative >= STYLE_EXEMPLARS_TOKEN_CAP) break;
+    }
+    if (selected.length === 0) return "";
+
+    const numbered = selected.map((t, idx) => `${idx + 1}. ${t}`).join("\n\n");
 
     return `\n\nSTYLE EXEMPLARS from past AFC reports (match this voice, tone, sentence structure, and phrasing. Do not copy verbatim — mimic style only):\n\n${numbered}\n\n---\n`;
   } catch {
@@ -36,34 +124,85 @@ async function getClient(): Promise<OpenAI> {
  * Each photo gets a "Photo caption: ..." text block IMMEDIATELY BEFORE its image,
  * so the model associates the engineer's on-site context with the correct image.
  */
-function buildCaptionedImageParts(
-  photos: { filename: string; caption?: string | null }[]
-): OpenAI.Chat.Completions.ChatCompletionContentPart[] {
-  const uploadDir = path.join(dataDir, "uploads");
-  const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
-  for (const photo of photos) {
-    const filePath = path.join(uploadDir, photo.filename);
-    if (!fs.existsSync(filePath)) continue;
+async function loadResizedImage(filePath: string): Promise<{ base64: string; mimeType: string } | null> {
+  try {
+    const buf = await sharp(filePath)
+      .rotate()
+      .resize({ width: VISION_MAX_EDGE_PX, height: VISION_MAX_EDGE_PX, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    return { base64: buf.toString("base64"), mimeType: "image/jpeg" };
+  } catch {
     try {
       const imageData = fs.readFileSync(filePath);
       const base64 = imageData.toString("base64");
-      const ext = path.extname(photo.filename).toLowerCase();
+      const ext = path.extname(filePath).toLowerCase();
       const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-      const caption = (photo.caption || "").trim();
-      parts.push({
-        type: "text",
-        text: `Photo caption: ${caption || "(no caption provided)"}`,
-      });
-      parts.push({
-        type: "image_url",
-        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
-      });
-    } catch {}
+      return { base64, mimeType };
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function buildCaptionedImageParts(
+  photos: { filename: string; caption?: string | null }[],
+  maxPhotos: number = MAX_PER_CALL_PHOTOS
+): Promise<OpenAI.Chat.Completions.ChatCompletionContentPart[]> {
+  const uploadDir = path.join(dataDir, "uploads");
+  // Sort so photos with captions are kept first when capped.
+  const sorted = [...photos].sort((a, b) => {
+    const aHas = (a.caption || "").trim().length > 0 ? 0 : 1;
+    const bHas = (b.caption || "").trim().length > 0 ? 0 : 1;
+    return aHas - bHas;
+  });
+  const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  let count = 0;
+  for (const photo of sorted) {
+    if (count >= maxPhotos) break;
+    const filePath = path.join(uploadDir, photo.filename);
+    if (!fs.existsSync(filePath)) continue;
+    const loaded = await loadResizedImage(filePath);
+    if (!loaded) continue;
+    const caption = (photo.caption || "").trim();
+    parts.push({
+      type: "text",
+      text: `Photo caption: ${caption || "(no caption provided)"}`,
+    });
+    parts.push({
+      type: "image_url",
+      image_url: { url: `data:${loaded.mimeType};base64,${loaded.base64}`, detail: "high" },
+    });
+    count += 1;
   }
   return parts;
 }
 
 const CAPTION_GUIDANCE = `Each image is preceded by its caption (provided by the engineer on-site). Read captions as authoritative context — they describe what the engineer observed that may not be visually obvious.`;
+
+function countContentTokens(parts: OpenAI.Chat.Completions.ChatCompletionContentPart[]): {
+  textTokens: number;
+  imageCount: number;
+} {
+  let textTokens = 0;
+  let imageCount = 0;
+  for (const part of parts) {
+    if ((part as any).type === "text") {
+      textTokens += countTokens((part as any).text || "");
+    } else if ((part as any).type === "image_url") {
+      imageCount += 1;
+    }
+  }
+  return { textTokens, imageCount };
+}
+
+function logTokenBreakdown(label: string, sections: Record<string, number>, imageCount: number) {
+  const total = Object.values(sections).reduce((s, v) => s + v, 0) + imageCount * IMAGE_TOKEN_BUDGET;
+  const parts = Object.entries(sections)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  console.debug(`[ai] tokens ${label}: ${parts} photos=${imageCount} total=${total}`);
+}
 
 /**
  * Build a PROJECT CONTEXT block to inject into AI prompts.
@@ -71,9 +210,10 @@ const CAPTION_GUIDANCE = `Each image is preceded by its caption (provided by the
  */
 function buildProjectContextBlock(projectContext: string | null | undefined): string {
   if (!projectContext || !projectContext.trim()) return "";
+  const trimmed = truncateToTokens(projectContext.trim(), PROJECT_CONTEXT_TOKEN_CAP);
   return `PROJECT CONTEXT (provided by the engineer — read carefully and weigh when forming recommendations and analysis):
 
-${projectContext.trim()}
+${trimmed}
 
 When relevant, factor this PROJECT CONTEXT into recommendations and analysis. For example, if context mentions imminent works in a particular area, recommend that adjacent or related items be addressed within that scope where reasonable. Do not invent context — only use what is explicitly provided.
 
@@ -96,7 +236,7 @@ async function getProjectContextById(projectId: number | null | undefined): Prom
   }
 }
 
-const PROJECT_DOC_TOTAL_CAP = 60000;
+// Token-based caps live as MAX_INPUT_TOKENS / PROJECT_DOCS_TOKEN_CAP constants near the top.
 
 /**
  * Build a "Project Documents" context block from the documents the engineer has
@@ -134,10 +274,17 @@ async function buildProjectDocumentsBlock(projectId: number | null | undefined):
     return a.size - b.size;
   });
 
-  let total = 0;
+  // Per-doc budget so multiple docs share the cap fairly.
+  const perDocBudget = Math.max(
+    300,
+    Math.floor(PROJECT_DOCS_TOKEN_CAP / Math.max(1, Math.min(scored.length, 4)))
+  );
+
+  let totalTokens = 0;
   const sections: string[] = [];
   let included = 0;
   for (const { d } of scored) {
+    if (totalTokens >= PROJECT_DOCS_TOKEN_CAP) break;
     const titleStr = (d.title || d.originalName || "Untitled").trim();
     const yearStr = (d.year || "").trim();
     const typeStr = (d.documentType || "").trim();
@@ -147,14 +294,16 @@ async function buildProjectDocumentsBlock(projectId: number | null | undefined):
       headerBits.push(`(${meta})`);
     }
     const header = `--- DOCUMENT ${included + 1}: ${headerBits.join(" ")} ---`;
-    const body = (d.extractedText || "").trim();
+    const remainingBudget = PROJECT_DOCS_TOKEN_CAP - totalTokens;
+    const docBudget = Math.min(perDocBudget, remainingBudget);
+    const body = truncateToTokens((d.extractedText || "").trim(), docBudget);
     const block = `${header}\n${body}`;
-    if (total + block.length + 2 > PROJECT_DOC_TOTAL_CAP) {
-      // Skip oversized; try fitting smaller subsequent docs that may still fit
+    const blockTokens = countTokens(block);
+    if (totalTokens + blockTokens > PROJECT_DOCS_TOKEN_CAP && sections.length > 0) {
       continue;
     }
     sections.push(block);
-    total += block.length + 2;
+    totalTokens += blockTokens;
     included += 1;
   }
 
@@ -205,7 +354,7 @@ export async function identifySystem(photoIds: number[], projectContext: string 
       resolvedContext = await getProjectContextById((photo as any).projectId);
     }
   }
-  const captionedParts = buildCaptionedImageParts(photosToSend);
+  const captionedParts = await buildCaptionedImageParts(photosToSend);
 
   if (captionedParts.length === 0) {
     throw new Error("No valid photos found for analysis.");
@@ -214,12 +363,7 @@ export async function identifySystem(photoIds: number[], projectContext: string 
   const contextBlock = buildProjectContextBlock(resolvedContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(resolvedProjectId);
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `${contextBlock}${projectDocsBlock}You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
+  const systemContent = `${contextBlock}${projectDocsBlock}You are an expert facade engineer in Australia. Identify the facade system in the photo(s) concisely.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
@@ -236,15 +380,25 @@ Respond ONLY with valid JSON:
   "visibleConcerns": ["only list if clearly visible, e.g. gasket shortening at mullion heads"]
 }
 
-Keep each field brief. Materials: list only what you can see. Key features: 2-4 items max. Visible concerns: only obvious defects, not speculation.`,
-      },
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "Identify the facade system in these photos. Each image below is preceded by its caption from the engineer:" },
-          ...captionedParts,
-        ],
-      },
+Keep each field brief. Materials: list only what you can see. Key features: 2-4 items max. Visible concerns: only obvious defects, not speculation.`;
+
+  const userParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    { type: "text", text: "Identify the facade system in these photos. Each image below is preceded by its caption from the engineer:" },
+    ...captionedParts,
+  ];
+  const { textTokens: userTextTokens, imageCount } = countContentTokens(userParts);
+  logTokenBreakdown("identifySystem", {
+    context: countTokens(contextBlock),
+    docs: countTokens(projectDocsBlock),
+    system: countTokens(systemContent) - countTokens(contextBlock) - countTokens(projectDocsBlock),
+    user: userTextTokens,
+  }, imageCount);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userParts },
     ],
     max_tokens: 600,
     temperature: 0.3,
@@ -284,7 +438,7 @@ Related Systems: ${system.relatedSystems || "None noted"}
 
   // Fetch system photos for vision analysis
   const systemPhotos = await storage.getPhotosBySystem(systemId);
-  const imageParts = buildCaptionedImageParts(systemPhotos);
+  const imageParts = await buildCaptionedImageParts(systemPhotos);
 
   const trainingExamples = await getTrainingExamples("system_description");
   const styleQuery = `${system.systemType} ${materials.map(m => m.name + " " + m.detail).join(" ")} ${keyFeatures.join(" ")}`.trim();
@@ -336,7 +490,16 @@ Return ONLY the description text.${trainingExamples}`;
     ...imageParts,
   ];
 
-  const response = await client.chat.completions.create({
+  const { textTokens: userTextTokens, imageCount } = countContentTokens(userContent);
+  logTokenBreakdown("generateSystemDescription", {
+    context: countTokens(contextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(styleExamples),
+    system: countTokens(systemPrompt) - countTokens(contextBlock) - countTokens(projectDocsBlock) - countTokens(styleExamples),
+    user: userTextTokens,
+  }, imageCount);
+
+  const response = await callOpenAIChat(client, {
     model: "gpt-4o",
     messages: [
       { role: "system", content: systemPrompt },
@@ -397,7 +560,7 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}${multiLocBlock
 
   // Fetch observation photos for vision analysis — include both primary and additional-location photos
   const obsPhotos = await storage.getPhotosByObservation(observationId);
-  const imageParts = buildCaptionedImageParts(obsPhotos);
+  const imageParts = await buildCaptionedImageParts(obsPhotos);
 
   const hasPhotos = imageParts.length > 0;
   const hasExisting = existingNarrative.trim().length > 0;
@@ -464,7 +627,16 @@ Return ONLY the narrative text.${trainingExamples}`;
     ...imageParts,
   ];
 
-  const response = await client.chat.completions.create({
+  const { textTokens: userTextTokens, imageCount } = countContentTokens(userContent);
+  logTokenBreakdown("generateObservationNarrative", {
+    context: countTokens(contextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(styleExamples),
+    system: countTokens(systemPrompt) - countTokens(contextBlock) - countTokens(projectDocsBlock) - countTokens(styleExamples),
+    user: userTextTokens,
+  }, imageCount);
+
+  const response = await callOpenAIChat(client, {
     model: "gpt-4o",
     messages: [
       { role: "system", content: systemPrompt },
@@ -537,7 +709,7 @@ Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
 
   // Include observation photos with captions so recommendations can reflect visible severity
   const obsPhotos = await storage.getPhotosByObservation(observationId);
-  const imageParts = buildCaptionedImageParts(obsPhotos);
+  const imageParts = await buildCaptionedImageParts(obsPhotos);
   const hasPhotos = imageParts.length > 0;
 
   const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
@@ -548,12 +720,7 @@ Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
     ...imageParts,
   ];
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+  const systemContent = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
@@ -595,12 +762,22 @@ Respond ONLY with valid JSON:
   "category": "string",
   "budgetEstimate": "string — e.g. $5,000-$10,000 or TBC",
   "budgetBasis": "string — e.g. per lineal metre, per panel, lump sum, rate-based"
-}${trainingExamples}`,
-      },
-      {
-        role: "user",
-        content: userContent,
-      },
+}${trainingExamples}`;
+
+  const { textTokens: userTextTokens, imageCount } = countContentTokens(userContent);
+  logTokenBreakdown("generateRecommendation", {
+    context: countTokens(contextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(styleExamples),
+    system: countTokens(systemContent) - countTokens(contextBlock) - countTokens(projectDocsBlock) - countTokens(styleExamples),
+    user: userTextTokens,
+  }, imageCount);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userContent },
     ],
     max_tokens: 300,
     temperature: 0.3,
@@ -638,28 +815,31 @@ export async function generateGroupNarrative(
   const contextBlock = buildProjectContextBlock(projectContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
 
-  // Build vision input: for each photo that has a filename, include its caption + image
+  // Build vision input: cap at MAX_GROUP_PHOTOS across the whole group, prioritising
+  // photos that carry an engineer caption (more informative).
   const photosWithFiles = photos.filter(p => p.filename) as { observationId: string; caption: string; filename: string }[];
+  const sortedPhotos = [...photosWithFiles].sort((a, b) => {
+    const aHas = (a.caption || "").trim().length > 0 ? 0 : 1;
+    const bHas = (b.caption || "").trim().length > 0 ? 0 : 1;
+    return aHas - bHas;
+  });
+  const cappedPhotos = sortedPhotos.slice(0, MAX_GROUP_PHOTOS);
   const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
   const uploadDir = path.join(dataDir, "uploads");
-  for (const p of photosWithFiles) {
+  for (const p of cappedPhotos) {
     const filePath = path.join(uploadDir, p.filename);
     if (!fs.existsSync(filePath)) continue;
-    try {
-      const imageData = fs.readFileSync(filePath);
-      const base64 = imageData.toString("base64");
-      const ext = path.extname(p.filename).toLowerCase();
-      const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-      const caption = (p.caption || "").trim();
-      imageParts.push({
-        type: "text",
-        text: `Photo for observation ${p.observationId} — caption: ${caption || "(no caption provided)"}`,
-      });
-      imageParts.push({
-        type: "image_url",
-        image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
-      });
-    } catch {}
+    const loaded = await loadResizedImage(filePath);
+    if (!loaded) continue;
+    const caption = (p.caption || "").trim();
+    imageParts.push({
+      type: "text",
+      text: `Photo for observation ${p.observationId} — caption: ${caption || "(no caption provided)"}`,
+    });
+    imageParts.push({
+      type: "image_url",
+      image_url: { url: `data:${loaded.mimeType};base64,${loaded.base64}`, detail: "high" },
+    });
   }
   const hasPhotos = imageParts.length > 0;
 
@@ -671,12 +851,7 @@ export async function generateGroupNarrative(
     ...imageParts,
   ];
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
+  const systemContent = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing a grouped observations section for an Australian facade condition assessment report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
@@ -713,12 +888,53 @@ EXAMPLE (from a real report, Section 4.4 Eastern Facade):
 3. Gasket shortening:
    a. Gaskets at mullion heads have shortened, exposing the glazing rebate.
 
-Return ONLY the narrative text.${trainingExamples}`,
-      },
-      {
-        role: "user",
-        content: userContent,
-      },
+Return ONLY the narrative text.${trainingExamples}`;
+
+  // Enforce overall text-token budget: if context + docs + exemplars + system + user
+  // exceed MAX_INPUT_TOKENS (minus image budget), shave the lowest-priority sections.
+  // The non-negotiables are the system task instructions + observations payload.
+  let projectDocsBlockFinal = projectDocsBlock;
+  let styleExamplesFinal = styleExamples;
+  let contextBlockFinal = contextBlock;
+  const imageTokenAllowance = imageParts.filter(p => (p as any).type === "image_url").length * IMAGE_TOKEN_BUDGET;
+  const textBudget = Math.max(4000, MAX_INPUT_TOKENS - imageTokenAllowance);
+  const buildSystem = (ctx: string, docs: string, exemplars: string) =>
+    systemContent.replace(contextBlock + projectDocsBlock + styleExamples, ctx + docs + exemplars);
+  let systemContentFinal = systemContent;
+  let totalText =
+    countTokens(systemContentFinal) + countContentTokens(userContent).textTokens;
+  if (totalText > textBudget) {
+    // Drop exemplars first.
+    styleExamplesFinal = "";
+    systemContentFinal = buildSystem(contextBlockFinal, projectDocsBlockFinal, styleExamplesFinal);
+    totalText = countTokens(systemContentFinal) + countContentTokens(userContent).textTokens;
+  }
+  if (totalText > textBudget) {
+    // Then docs.
+    projectDocsBlockFinal = "";
+    systemContentFinal = buildSystem(contextBlockFinal, projectDocsBlockFinal, styleExamplesFinal);
+    totalText = countTokens(systemContentFinal) + countContentTokens(userContent).textTokens;
+  }
+  if (totalText > textBudget) {
+    // Then context.
+    contextBlockFinal = "";
+    systemContentFinal = buildSystem(contextBlockFinal, projectDocsBlockFinal, styleExamplesFinal);
+  }
+
+  const { textTokens: userTextTokens, imageCount } = countContentTokens(userContent);
+  logTokenBreakdown("generateGroupNarrative", {
+    context: countTokens(contextBlockFinal),
+    docs: countTokens(projectDocsBlockFinal),
+    exemplars: countTokens(styleExamplesFinal),
+    system: countTokens(systemContentFinal) - countTokens(contextBlockFinal) - countTokens(projectDocsBlockFinal) - countTokens(styleExamplesFinal),
+    user: userTextTokens,
+  }, imageCount);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContentFinal },
+      { role: "user", content: userContent },
     ],
     max_tokens: 700,
     temperature: 0.3,
@@ -765,12 +981,7 @@ Background Documents: ${bgDocs.length > 0 ? bgDocs.map(d => `${d.title || "Untit
     ? `ENGINEER'S ROUGH NOTES (rewrite into polished prose — do not invent facts beyond these notes and the project metadata):\n\n${rawContext}`
     : `(No engineer notes were provided — write a concise generic Background and Introduction using only the project metadata above.)`;
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `${projectContextBlock}${projectDocsBlock}${combinedStyle}You are AFC, Angel Façade Consulting. Rewrite the engineer's rough background notes into a polished Background and Introduction section for a façade inspection report.
+  const systemContent = `${projectContextBlock}${projectDocsBlock}${combinedStyle}You are AFC, Angel Façade Consulting. Rewrite the engineer's rough background notes into a polished Background and Introduction section for a façade inspection report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
@@ -782,12 +993,22 @@ STYLE RULES:
 - Follow with concise paragraphs (or short numbered points where appropriate) covering: building character/age/use, refurbishment history, scope of the inspection, dates, and any background context the engineer noted.
 - Do NOT invent details that are not in the engineer's notes or the project metadata.
 - Length: 150-300 words.
-- Return ONLY the introduction text, plain prose with optional light structure (numbered or lettered points only if it genuinely improves clarity). No section heading.`,
-      },
-      {
-        role: "user",
-        content: `Project metadata:\n\n${meta}\n\n${userInputBlock}\n\nRewrite this as the Background and Introduction section of an AFC façade condition assessment report.`,
-      },
+- Return ONLY the introduction text, plain prose with optional light structure (numbered or lettered points only if it genuinely improves clarity). No section heading.`;
+
+  const userContent = `Project metadata:\n\n${meta}\n\n${userInputBlock}\n\nRewrite this as the Background and Introduction section of an AFC façade condition assessment report.`;
+  logTokenBreakdown("generateProjectIntroduction", {
+    context: countTokens(projectContextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(combinedStyle),
+    system: countTokens(systemContent) - countTokens(projectContextBlock) - countTokens(projectDocsBlock) - countTokens(combinedStyle),
+    user: countTokens(userContent),
+  }, 0);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userContent },
     ],
     max_tokens: 700,
     temperature: 0.3,
@@ -851,12 +1072,7 @@ Summary Statistics:
   const contextBlock = buildProjectContextBlock((project as any).projectContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
+  const systemContent = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
@@ -896,12 +1112,22 @@ Major recommendations:
 2. Stabilise (remove) the drummy tiles above Ground at the southeastern corner.
 
 Keep total length to 150-350 words. Only state facts from the data. Do not speculate.
-Return ONLY the executive summary text.${trainingExamples}`,
-      },
-      {
-        role: "user",
-        content: `Generate an executive summary for this assessment:\n\n${context}`,
-      },
+Return ONLY the executive summary text.${trainingExamples}`;
+
+  const userContent = `Generate an executive summary for this assessment:\n\n${context}`;
+  logTokenBreakdown("generateExecutiveSummary", {
+    context: countTokens(contextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(styleExamples),
+    system: countTokens(systemContent) - countTokens(contextBlock) - countTokens(projectDocsBlock) - countTokens(styleExamples),
+    user: countTokens(userContent),
+  }, 0);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userContent },
     ],
     max_tokens: 800,
     temperature: 0.3,
