@@ -324,6 +324,118 @@ try {
 export const db = drizzle(sqlite);
 export { dataDir };
 
+// ---------------------------------------------------------------------------
+// Observation ID helpers (module-scope, synchronous — safe to call from
+// inside a sqlite.transaction() callback as well as from async callers).
+// ---------------------------------------------------------------------------
+
+function computeSectionNumberSync(projectId: number, systemId: number): string | null {
+  const system = db.select().from(facadeSystems).where(eq(facadeSystems.id, systemId)).get();
+  if (!system) return null;
+  const allSystems = db.select().from(facadeSystems)
+    .where(eq(facadeSystems.projectId, projectId))
+    .all();
+  allSystems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+  const systemIndex = allSystems.findIndex(s => s.id === systemId);
+  if (systemIndex < 0) return null;
+  return `4.${systemIndex + 1}`;
+}
+
+function computeNextObservationIdSync(projectId: number, systemId: number, excludeObservationId?: number): string {
+  const sectionNum = computeSectionNumberSync(projectId, systemId);
+  if (!sectionNum) return "4.1-1";
+  const prefix = sectionNum + "-";
+  const existing = db.select().from(observations).where(eq(observations.projectId, projectId)).all();
+  let maxSuffix = 0;
+  for (const o of existing) {
+    if (excludeObservationId !== undefined && o.id === excludeObservationId) continue;
+    const oid = o.observationId;
+    if (typeof oid !== "string" || !oid.startsWith(prefix)) continue;
+    const suffix = parseInt(oid.slice(prefix.length), 10);
+    if (Number.isFinite(suffix) && suffix > maxSuffix) maxSuffix = suffix;
+  }
+  return `${prefix}${maxSuffix + 1}`;
+}
+
+/**
+ * Renumber observations within a single project. Groups by systemId, orders
+ * by id (oldest first), and assigns `${sectionNum}-1..N`. When
+ * onlyIfDuplicates is true, a system is skipped if its current IDs already
+ * form a unique set (no duplicates) — gaps alone do not trigger renumber.
+ * Returns counts of systems and observations actually changed.
+ */
+function renumberObservationsForProject(projectId: number, onlyIfDuplicates: boolean): { systemsRenumbered: number; observationsRenumbered: number } {
+  const projObservations = db.select().from(observations).where(eq(observations.projectId, projectId)).all();
+  // Group by systemId
+  const bySystem = new Map<number, typeof projObservations>();
+  for (const o of projObservations) {
+    if (o.systemId == null) continue;
+    const list = bySystem.get(o.systemId) ?? [];
+    list.push(o);
+    bySystem.set(o.systemId, list);
+  }
+
+  let systemsRenumbered = 0;
+  let observationsRenumbered = 0;
+
+  const tx = sqlite.transaction(() => {
+    bySystem.forEach((obsList, sysId) => {
+      // Sort by id for stable, monotonic order (oldest first).
+      obsList.sort((a: typeof obsList[number], b: typeof obsList[number]) => a.id - b.id);
+
+      if (onlyIfDuplicates) {
+        const seen = new Set<string>();
+        let hasDuplicate = false;
+        for (const o of obsList) {
+          const oid = o.observationId ?? "";
+          if (oid === "") continue; // empty IDs are handled by repairMissingObservationIds
+          if (seen.has(oid)) { hasDuplicate = true; break; }
+          seen.add(oid);
+        }
+        if (!hasDuplicate) return; // skip this system
+      }
+
+      const sectionNum = computeSectionNumberSync(projectId, sysId);
+      if (!sectionNum) return;
+      const prefix = sectionNum + "-";
+
+      let changedInSystem = 0;
+      const oldIds: string[] = [];
+      const newIds: string[] = [];
+      for (let i = 0; i < obsList.length; i++) {
+        const obs = obsList[i];
+        const newId = `${prefix}${i + 1}`;
+        if (obs.observationId !== newId) {
+          db.update(observations).set({ observationId: newId }).where(eq(observations.id, obs.id)).run();
+          changedInSystem++;
+          oldIds.push(obs.observationId || "(empty)");
+          newIds.push(newId);
+        }
+      }
+      if (changedInSystem > 0) {
+        systemsRenumbered++;
+        observationsRenumbered += changedInSystem;
+        console.log(`[renumber] project ${projectId} system ${sysId} (${sectionNum}): renumbered ${changedInSystem} observation${changedInSystem === 1 ? "" : "s"} — old [${oldIds.join(", ")}] → new [${newIds.join(", ")}]`);
+      }
+    });
+  });
+  tx();
+
+  return { systemsRenumbered, observationsRenumbered };
+}
+
+function renumberObservationsAcrossProjects(onlyIfDuplicates: boolean): { systemsRenumbered: number; observationsRenumbered: number } {
+  const allProjects = db.select().from(projects).all();
+  let systemsRenumbered = 0;
+  let observationsRenumbered = 0;
+  for (const p of allProjects) {
+    const r = renumberObservationsForProject(p.id, onlyIfDuplicates);
+    systemsRenumbered += r.systemsRenumbered;
+    observationsRenumbered += r.observationsRenumbered;
+  }
+  return { systemsRenumbered, observationsRenumbered };
+}
+
 export interface IStorage {
   // Settings
   getSetting(key: string): Promise<string | undefined>;
@@ -352,10 +464,14 @@ export interface IStorage {
   getObservationsByProject(projectId: number): Promise<Observation[]>;
   getObservation(id: number): Promise<Observation | undefined>;
   createObservation(observation: InsertObservation): Promise<Observation>;
+  createObservationWithAutoId(observation: InsertObservation): Promise<Observation>;
+  assignObservationId(id: number, systemId: number): Promise<Observation | undefined>;
   updateObservation(id: number, observation: Partial<InsertObservation>): Promise<Observation | undefined>;
   deleteObservation(id: number): Promise<void>;
   getNextObservationId(projectId: number, systemId: number, excludeObservationId?: number): Promise<string>;
   repairMissingObservationIds(): Promise<number>;
+  renumberDuplicateObservationIds(): Promise<{ systemsRenumbered: number; observationsRenumbered: number }>;
+  renumberProjectObservations(projectId: number): Promise<{ systemsRenumbered: number; observationsRenumbered: number }>;
   // Recommendations
   getRecommendationsByObservation(observationId: number): Promise<Recommendation[]>;
   getRecommendationsByProject(projectId: number): Promise<Recommendation[]>;
@@ -487,6 +603,40 @@ export class DatabaseStorage implements IStorage {
   async createObservation(observation: InsertObservation): Promise<Observation> {
     return db.insert(observations).values(observation).returning().get();
   }
+  /**
+   * Atomically generate the next observationId AND insert the row in a single
+   * SQLite transaction. Prevents two concurrent POSTs from both reading the
+   * same max-suffix and producing duplicate IDs.
+   */
+  async createObservationWithAutoId(observation: InsertObservation): Promise<Observation> {
+    const sysId = observation.systemId;
+    // No system → just store as-is (observationId will be empty until system is linked).
+    if (sysId == null) {
+      return db.insert(observations).values(observation).returning().get();
+    }
+    const tx = sqlite.transaction((): Observation => {
+      const newId = computeNextObservationIdSync(observation.projectId, sysId);
+      const row = db.insert(observations).values({ ...observation, observationId: newId }).returning().get();
+      return row;
+    });
+    return tx();
+  }
+  /**
+   * Assign an observationId to an existing observation atomically (used by
+   * the PATCH path when a system is linked to an observation that was
+   * created without one). Returns the updated row, or undefined if missing.
+   */
+  async assignObservationId(id: number, systemId: number): Promise<Observation | undefined> {
+    const tx = sqlite.transaction((): Observation | undefined => {
+      const current = db.select().from(observations).where(eq(observations.id, id)).get();
+      if (!current) return undefined;
+      // Don't overwrite an existing non-empty ID.
+      if (current.observationId && current.observationId !== "") return current;
+      const newId = computeNextObservationIdSync(current.projectId, systemId, id);
+      return db.update(observations).set({ observationId: newId }).where(eq(observations.id, id)).returning().get();
+    });
+    return tx();
+  }
   async updateObservation(id: number, observation: Partial<InsertObservation>): Promise<Observation | undefined> {
     return db.update(observations).set(observation).where(eq(observations.id, id)).returning().get();
   }
@@ -522,44 +672,14 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getNextObservationId(projectId: number, systemId: number, excludeObservationId?: number): Promise<string> {
-    // Get the system to determine its sort order for the section number
-    const system = db.select().from(facadeSystems).where(eq(facadeSystems.id, systemId)).get();
-    if (!system) return "4.1-1";
-
-    // Get all systems for this project to determine the system's position
-    const allSystems = db.select().from(facadeSystems)
-      .where(eq(facadeSystems.projectId, projectId))
-      .all();
-
-    // Sort by sortOrder then by id for stable ordering
-    allSystems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
-    const systemIndex = allSystems.findIndex(s => s.id === systemId);
-    const sectionNum = `4.${systemIndex + 1}`;
-
-    // Find the highest existing suffix used for this section across the project,
-    // ignoring any observation we are repairing (so the same row isn't both
-    // counted and renumbered). Using max(suffix)+1 instead of count+1 avoids
-    // collisions if rows have been deleted or already-allocated IDs exist.
-    const existing = db.select().from(observations)
-      .where(eq(observations.projectId, projectId))
-      .all();
-
-    const prefix = sectionNum + "-";
-    let maxSuffix = 0;
-    for (const o of existing) {
-      if (excludeObservationId !== undefined && o.id === excludeObservationId) continue;
-      const oid = o.observationId;
-      if (typeof oid !== "string" || !oid.startsWith(prefix)) continue;
-      const suffix = parseInt(oid.slice(prefix.length), 10);
-      if (Number.isFinite(suffix) && suffix > maxSuffix) maxSuffix = suffix;
-    }
-
-    return `${prefix}${maxSuffix + 1}`;
+    return computeNextObservationIdSync(projectId, systemId, excludeObservationId);
   }
 
   /**
    * Backfill observation_id for any rows that have a system linked but a
    * missing/empty identifier. Idempotent — safe to call on every boot.
+   * Reads observation state fresh inside the transaction after each write
+   * so each backfilled row sees prior repairs and receives a unique ID.
    */
   async repairMissingObservationIds(): Promise<number> {
     const broken = db.select().from(observations).all().filter(o =>
@@ -567,39 +687,36 @@ export class DatabaseStorage implements IStorage {
     );
     if (broken.length === 0) return 0;
 
-    // Repair within a single transaction so concurrent reads see a consistent state.
     const repair = sqlite.transaction(() => {
       for (const obs of broken) {
-        const newId = (() => {
-          // Inline because we're inside a sync transaction; mirrors getNextObservationId logic.
-          const system = db.select().from(facadeSystems).where(eq(facadeSystems.id, obs.systemId!)).get();
-          if (!system) return `obs-${obs.id}`;
-          const allSystems = db.select().from(facadeSystems)
-            .where(eq(facadeSystems.projectId, obs.projectId))
-            .all();
-          allSystems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
-          const systemIndex = allSystems.findIndex(s => s.id === obs.systemId);
-          const sectionNum = `4.${systemIndex + 1}`;
-          const prefix = sectionNum + "-";
-          const existing = db.select().from(observations)
-            .where(eq(observations.projectId, obs.projectId))
-            .all();
-          let maxSuffix = 0;
-          for (const o of existing) {
-            if (o.id === obs.id) continue;
-            const oid = o.observationId;
-            if (typeof oid !== "string" || !oid.startsWith(prefix)) continue;
-            const suffix = parseInt(oid.slice(prefix.length), 10);
-            if (Number.isFinite(suffix) && suffix > maxSuffix) maxSuffix = suffix;
-          }
-          return `${prefix}${maxSuffix + 1}`;
-        })();
-
+        const newId = computeNextObservationIdSync(obs.projectId, obs.systemId!, obs.id);
         db.update(observations).set({ observationId: newId }).where(eq(observations.id, obs.id)).run();
       }
     });
     repair();
     return broken.length;
+  }
+
+  /**
+   * Detect duplicate observationIds within each system of each project and
+   * renumber that system's observations sequentially (1..N) ordered by id
+   * (stable, monotonic — oldest first). Only systems that contain at least
+   * one duplicate are renumbered; clean systems are left untouched.
+   *
+   * Safe because observations are referenced internally by their primary
+   * key `id`, not by the human-readable `observationId`. Renumbering only
+   * changes the display/export identifier.
+   */
+  async renumberDuplicateObservationIds(): Promise<{ systemsRenumbered: number; observationsRenumbered: number }> {
+    return renumberObservationsAcrossProjects(/* onlyIfDuplicates */ true);
+  }
+
+  /**
+   * Force-renumber all observations in a project sequentially per system.
+   * Used by the manual admin endpoint. Idempotent for already-sequential data.
+   */
+  async renumberProjectObservations(projectId: number): Promise<{ systemsRenumbered: number; observationsRenumbered: number }> {
+    return renumberObservationsForProject(projectId, /* onlyIfDuplicates */ false);
   }
 
   // Recommendations
@@ -912,5 +1029,17 @@ export const storage = new DatabaseStorage();
     }
   } catch (e) {
     console.error("[startup] repairMissingObservationIds failed:", e);
+  }
+  // Idempotent: only renumbers systems that actually contain duplicate
+  // observationIds. Clean systems are left alone (no churn). Safe to run
+  // on every boot because observations are referenced by primary-key id,
+  // not by the human-readable observationId.
+  try {
+    const r = await storage.renumberDuplicateObservationIds();
+    if (r.observationsRenumbered > 0) {
+      console.log(`[startup] Renumbered ${r.observationsRenumbered} observation ID${r.observationsRenumbered === 1 ? "" : "s"} across ${r.systemsRenumbered} system${r.systemsRenumbered === 1 ? "" : "s"} to resolve duplicates`);
+    }
+  } catch (e) {
+    console.error("[startup] renumberDuplicateObservationIds failed:", e);
   }
 })();
