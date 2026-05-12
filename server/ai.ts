@@ -15,6 +15,16 @@ const IMAGE_TOKEN_BUDGET = 1000;
 const MAX_GROUP_PHOTOS = 8;
 const MAX_PER_CALL_PHOTOS = 6;
 const VISION_MAX_EDGE_PX = 1024;
+const LINKED_OBS_TOKEN_CAP = 4000;
+
+// Two style guidance rules added per Lana's feedback (Feature 3). Appended to
+// both observation and group narrative system prompts so the model:
+//   1. Doesn't repeat the same idea in different words within a narrative.
+//   2. Actively looks for contributory causes across observations / photos /
+//      text and weaves them into a unified failure mode.
+const AFC_NARRATIVE_STYLE_RULES = `
+- Avoid repetition of ideas and language within the same narrative. Each idea should appear once, in the strongest place.
+- Seek contributory actions from the observations, photographs and text provided, and link them together in the narrative. Where multiple factors share a single failure mechanism, describe how they combine rather than listing them in isolation.`;
 
 export function countTokens(text: string): number {
   if (!text) return 0;
@@ -512,6 +522,57 @@ Return ONLY the description text.${trainingExamples}`;
   return response.choices[0]?.message?.content?.trim() || "";
 }
 
+/**
+ * Build a LINKED OBSERVATIONS context block describing other observations the
+ * engineer has flagged as causally related to the one being generated. The
+ * model is instructed to weave these into a combined narrative rather than
+ * repeating the ideas.
+ */
+async function buildLinkedObservationsBlock(observationId: number, projectId: number): Promise<string> {
+  let linked: any[] = [];
+  try {
+    linked = await (storage as any).getLinkedObservations(observationId);
+  } catch {
+    return "";
+  }
+  if (!linked || linked.length === 0) return "";
+
+  const formatted: string[] = [];
+  for (const obs of linked) {
+    let indicators: string[] = [];
+    try { indicators = JSON.parse(obs.indicators || "[]"); } catch {}
+    let captionLines: string[] = [];
+    try {
+      const photoRows = await storage.getPhotosByObservation(obs.id);
+      captionLines = photoRows
+        .map((p: any) => (p?.caption || "").trim())
+        .filter((c: string) => c.length > 0);
+    } catch {}
+    // Pull the highest-priority recommendation category, if any, to convey
+    // remedial direction without dumping the full rec list.
+    let recCategory = "";
+    try {
+      const recs = await storage.getRecommendationsByObservation(obs.id);
+      if (recs.length > 0) recCategory = recs[0].category || "";
+    } catch {}
+    formatted.push(
+      `LINKED OBSERVATION ${obs.observationId || `#${obs.id}`}:
+  Location: ${obs.location || "Unspecified"}
+  Defect Category: ${obs.defectCategory || "Unspecified"}
+  Severity: ${obs.severity || "Unspecified"}
+  Extent: ${obs.extent || "Unspecified"}${recCategory ? `\n  Recommendation category: ${recCategory}` : ""}
+  Indicators: ${indicators.join(", ") || "None"}
+  Field Note: ${obs.fieldNote || "None"}
+  Engineer-written narrative: ${(obs.aiNarrative || "").trim() || "None"}${captionLines.length > 0 ? `\n  Photo captions: ${captionLines.join(" | ")}` : ""}`
+    );
+  }
+
+  const body = formatted.join("\n\n");
+  const trimmed = truncateToTokens(body, LINKED_OBS_TOKEN_CAP);
+
+  return `\n\nThe following observations have been identified as CAUSALLY LINKED to this observation. Your narrative MUST weave them together — describe how they contribute to a combined defect or failure mode. Do not repeat ideas across the linked observations; instead, identify each contributing factor and connect them.\n\n${trimmed}\n\n---\n`;
+}
+
 export async function generateObservationNarrative(observationId: number, existingNarrative: string = ""): Promise<string> {
   const client = await getClient();
   const observation = await storage.getObservation(observationId);
@@ -571,8 +632,9 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}${multiLocBlock
   const projectContext = await getProjectContextById(observation.projectId);
   const contextBlock = buildProjectContextBlock(projectContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(observation.projectId);
+  const linkedObsBlock = await buildLinkedObservationsBlock(observationId, observation.projectId);
 
-  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}${linkedObsBlock}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
@@ -582,7 +644,7 @@ ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use your expertise as a facade engineer to provide professional analysis: explain WHY defects occur, what mechanisms are at play (e.g. UV degradation, thermal cycling, moisture ingress), and what the consequences are if unaddressed.
 - Use Australian facade engineering terminology.
 ${hasPhotos ? "- Analyse the attached photos (each preceded by its engineer-provided caption) to identify visible defects, their severity, and any additional details not captured in the field notes (e.g. extent of cracking, staining patterns, gasket condition, sealant failure mode). Treat captions as authoritative context." : ""}
-${hasExisting ? "- The user has written an existing narrative. Incorporate their observations and commentary into the output — preserve their specific details, measurements, and wording where appropriate, while enriching with your technical analysis." : ""}
+${hasExisting ? "- The user has written an existing narrative. Incorporate their observations and commentary into the output — preserve their specific details, measurements, and wording where appropriate, while enriching with your technical analysis." : ""}${AFC_NARRATIVE_STYLE_RULES}
 
 FORMAT — follow this structure:
 Start with a brief opening line about the system condition, then numbered observations:
@@ -627,19 +689,60 @@ Return ONLY the narrative text.${trainingExamples}`;
     ...imageParts,
   ];
 
+  // Token budgeting — linked observations are higher priority than style
+  // exemplars (per task spec). When the 24k cap is exceeded, drop exemplars
+  // first, then project docs, then project context, before truncating
+  // linked context. The linked block stays unless absolutely required.
+  let contextBlockFinal = contextBlock;
+  let projectDocsBlockFinal = projectDocsBlock;
+  let styleExamplesFinal = styleExamples;
+  let linkedObsBlockFinal = linkedObsBlock;
+  let systemPromptFinal = systemPrompt;
+  const rebuildSystemPrompt = () =>
+    systemPrompt.replace(
+      contextBlock + projectDocsBlock + styleExamples + linkedObsBlock,
+      contextBlockFinal + projectDocsBlockFinal + styleExamplesFinal + linkedObsBlockFinal,
+    );
+  const imageTokenAllowance = imageParts.filter(p => (p as any).type === "image_url").length * IMAGE_TOKEN_BUDGET;
+  const textBudget = Math.max(4000, MAX_INPUT_TOKENS - imageTokenAllowance);
+  let totalText = countTokens(systemPromptFinal) + countContentTokens(userContent).textTokens;
+  if (totalText > textBudget) {
+    styleExamplesFinal = "";
+    systemPromptFinal = rebuildSystemPrompt();
+    totalText = countTokens(systemPromptFinal) + countContentTokens(userContent).textTokens;
+  }
+  if (totalText > textBudget) {
+    projectDocsBlockFinal = "";
+    systemPromptFinal = rebuildSystemPrompt();
+    totalText = countTokens(systemPromptFinal) + countContentTokens(userContent).textTokens;
+  }
+  if (totalText > textBudget) {
+    contextBlockFinal = "";
+    systemPromptFinal = rebuildSystemPrompt();
+    totalText = countTokens(systemPromptFinal) + countContentTokens(userContent).textTokens;
+  }
+  if (totalText > textBudget && linkedObsBlockFinal) {
+    // Last resort — shrink the linked-obs block rather than drop it entirely
+    const overflow = totalText - textBudget;
+    const targetLinkedTokens = Math.max(800, countTokens(linkedObsBlockFinal) - overflow - 200);
+    linkedObsBlockFinal = truncateToTokens(linkedObsBlockFinal, targetLinkedTokens);
+    systemPromptFinal = rebuildSystemPrompt();
+  }
+
   const { textTokens: userTextTokens, imageCount } = countContentTokens(userContent);
   logTokenBreakdown("generateObservationNarrative", {
-    context: countTokens(contextBlock),
-    docs: countTokens(projectDocsBlock),
-    exemplars: countTokens(styleExamples),
-    system: countTokens(systemPrompt) - countTokens(contextBlock) - countTokens(projectDocsBlock) - countTokens(styleExamples),
+    context: countTokens(contextBlockFinal),
+    docs: countTokens(projectDocsBlockFinal),
+    exemplars: countTokens(styleExamplesFinal),
+    linked: countTokens(linkedObsBlockFinal),
+    system: countTokens(systemPromptFinal) - countTokens(contextBlockFinal) - countTokens(projectDocsBlockFinal) - countTokens(styleExamplesFinal) - countTokens(linkedObsBlockFinal),
     user: userTextTokens,
   }, imageCount);
 
   const response = await callOpenAIChat(client, {
     model: "gpt-4o",
     messages: [
-      { role: "system", content: systemPrompt },
+      { role: "system", content: systemPromptFinal },
       { role: "user", content: userContent },
     ],
     max_tokens: 800,
@@ -863,7 +966,7 @@ STYLE RULES:
 - Do NOT restate the group name as a heading — the heading is already there.
 - Open with an optional short (1-2 sentence) overall statement about the group condition, then immediately go to the numbered list.
 - Each distinct defect type is one numbered item. Sub-items (a, b, c) carry detail: what was observed, likely cause, implication.
-- Do not invent details beyond what the input data provides.
+- Do not invent details beyond what the input data provides.${AFC_NARRATIVE_STYLE_RULES}
 
 FORMAT:
 [Optional 1-2 sentence opening]

@@ -27,6 +27,7 @@ export const projects = sqliteTable("projects", {
   roofPlanOriginalName: text("roof_plan_original_name").default(""),
   projectContext: text("project_context").default(""),
   aiIntroduction: text("ai_introduction").default(""),
+  completedAt: text("completed_at").default(""), // Set on first successful Word export — used to auto-feed narratives into the Report Library
   createdAt: text("created_at").notNull(),
 });
 
@@ -76,6 +77,16 @@ export const observations = sqliteTable("observations", {
   gridElevation: text("grid_elevation").default(""),
   gridLevel: text("grid_level").default(""),
   groupId: integer("group_id"),
+  createdAt: text("created_at").notNull(),
+});
+
+// Causal links between observations within a single project. Bi-directional —
+// when (A → B) is created, (B → A) is inserted in the same transaction so
+// either side surfaces the relationship symmetrically.
+export const observationLinks = sqliteTable("observation_links", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  observationId: integer("observation_id").notNull(),
+  relatedObservationId: integer("related_observation_id").notNull(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -249,6 +260,13 @@ export const reportLibraryPassages = sqliteTable("report_library_passages", {
   text: text("text").notNull(),
   embedding: text("embedding"), // JSON-serialized float32[]
   sourceSection: text("source_section").default(""),
+  // When a passage is auto-ingested from a completed project's narratives,
+  // this records the originating projectId. Used to surface "auto-ingested"
+  // passages in settings UI. Empty/null for manually uploaded passages.
+  sourceProjectId: integer("source_project_id"),
+  // Stable content hash (sha256(text)) used for idempotent re-ingestion —
+  // skip insert if a passage with the same source + textHash already exists.
+  textHash: text("text_hash").default(""),
   createdAt: text("created_at").notNull(),
 });
 
@@ -280,6 +298,7 @@ export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibrar
 export const insertProjectDocumentSchema = createInsertSchema(projectDocuments).omit({ id: true });
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
 export const insertObservationLocationSchema = createInsertSchema(observationLocations).omit({ id: true });
+export const insertObservationLinkSchema = createInsertSchema(observationLinks).omit({ id: true });
 
 // Types
 export type Project = typeof projects.$inferSelect;
@@ -322,6 +341,8 @@ export type ReportLibraryPassage = typeof reportLibraryPassages.$inferSelect;
 export type InsertReportLibraryPassage = z.infer<typeof insertReportLibraryPassageSchema>;
 export type ObservationLocation = typeof observationLocations.$inferSelect;
 export type InsertObservationLocation = z.infer<typeof insertObservationLocationSchema>;
+export type ObservationLink = typeof observationLinks.$inferSelect;
+export type InsertObservationLink = z.infer<typeof insertObservationLinkSchema>;
 
 // Canonical severity / category values. Safety/Risk lives only on observations
 // (the AI never assigns it as a recommendation category), so the "effective"

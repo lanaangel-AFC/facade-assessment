@@ -211,6 +211,97 @@ function DocumentRow({ doc }: { doc: ReportDocument }) {
   );
 }
 
+interface AutoIngestedPassage {
+  id: string;
+  category: string;
+  text: string;
+  sourceSection: string;
+  sourceProjectId: number | null;
+  sourceProjectName: string | null;
+  createdAt: string;
+}
+
+function AutoIngestedSection() {
+  const { toast } = useToast();
+  const { data: passages } = useQuery<AutoIngestedPassage[]>({
+    queryKey: ["/api/report-library/auto-ingested"],
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (passageId: string) => {
+      await apiRequest("DELETE", `/api/report-library/passages/${passageId}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/report-library/auto-ingested"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/report-library/documents"] });
+      toast({ title: "Passage removed" });
+    },
+    onError: (err: Error) => {
+      toast({ title: err.message || "Delete failed", variant: "destructive" });
+    },
+  });
+
+  // Group by source project for tidier display
+  const grouped = (passages || []).reduce<Record<string, AutoIngestedPassage[]>>((acc, p) => {
+    const label = p.sourceProjectName || `Project ${p.sourceProjectId ?? "?"}`;
+    (acc[label] = acc[label] || []).push(p);
+    return acc;
+  }, {});
+
+  return (
+    <div className="space-y-2 mt-4 pt-4 border-t">
+      <h3 className="text-sm font-medium">Auto-ingested from completed projects</h3>
+      <p className="text-xs text-muted-foreground">
+        Finalised observation narratives from your in-app projects (added automatically the first
+        time you export the Word report). They feed the same style RAG as uploaded reports.
+      </p>
+      {(!passages || passages.length === 0) && (
+        <div className="text-xs text-muted-foreground italic py-3 text-center border border-dashed rounded-md">
+          No auto-ingested narratives yet. Export a project to Word to populate this list.
+        </div>
+      )}
+      {Object.entries(grouped).map(([projectLabel, ps]) => (
+        <div key={projectLabel} className="border rounded-md">
+          <div className="p-2 bg-muted/50 border-b text-xs font-medium">
+            {projectLabel} <span className="text-muted-foreground">— {ps.length} passage{ps.length === 1 ? "" : "s"}</span>
+          </div>
+          <div className="p-2 space-y-2">
+            {ps.map((p) => (
+              <div key={p.id} className="flex items-start gap-2 p-2 rounded bg-background border">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className={`text-xs px-2 py-0.5 rounded ${categoryColor(p.category)}`}>
+                      {p.category}
+                    </span>
+                    {p.sourceSection && (
+                      <span className="text-xs text-muted-foreground truncate">
+                        {p.sourceSection}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs leading-relaxed line-clamp-4">{p.text}</p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    if (confirm("Remove this auto-ingested passage from the Report Library?")) {
+                      deleteMutation.mutate(p.id);
+                    }
+                  }}
+                  disabled={deleteMutation.isPending}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ReportLibrarySection() {
   const { toast } = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -300,6 +391,8 @@ function ReportLibrarySection() {
           <DocumentRow key={d.id} doc={d} />
         ))}
       </div>
+
+      <AutoIngestedSection />
     </Card>
   );
 }

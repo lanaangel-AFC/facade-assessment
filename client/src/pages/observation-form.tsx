@@ -356,6 +356,46 @@ export default function ObservationForm() {
     if (existingRecs) setRecs(existingRecs);
   }, [existingRecs]);
 
+  // === Related Observations (causal links) ===
+  // All observations in this project — used to populate the picker list.
+  const { data: projectObservations } = useQuery<Observation[]>({
+    queryKey: [`/api/projects/${projectId}/observations`],
+  });
+  // Currently-linked observation ids for this observation. PATCH'd to the
+  // server only when the user saves the form (debounce-free, single write).
+  const [relatedObservationIds, setRelatedObservationIds] = useState<number[]>([]);
+  const [initialRelatedIds, setInitialRelatedIds] = useState<number[]>([]);
+  const { data: existingLinks } = useQuery<Observation[]>({
+    queryKey: [`/api/observations/${obsIdParam}/links`],
+    enabled: isEdit,
+  });
+  useEffect(() => {
+    if (existingLinks) {
+      const ids = existingLinks.map((o) => o.id);
+      setRelatedObservationIds(ids);
+      setInitialRelatedIds(ids);
+    }
+  }, [existingLinks]);
+  const currentObsNumericId = useMemo(() => {
+    if (obsIdParam && /^\d+$/.test(obsIdParam)) return Number(obsIdParam);
+    return existingObs?.id;
+  }, [obsIdParam, existingObs]);
+  const linkableObservations = useMemo(() => {
+    if (!projectObservations) return [];
+    return projectObservations
+      .filter((o) => o.id !== currentObsNumericId)
+      .sort((a, b) => (a.observationId || "").localeCompare(b.observationId || "", undefined, { numeric: true }));
+  }, [projectObservations, currentObsNumericId]);
+  const toggleRelated = (otherId: number) => {
+    setRelatedObservationIds((prev) =>
+      prev.includes(otherId) ? prev.filter((x) => x !== otherId) : [...prev, otherId],
+    );
+  };
+  const removeRelated = (otherId: number) => {
+    setRelatedObservationIds((prev) => prev.filter((x) => x !== otherId));
+  };
+  const [showLinkPicker, setShowLinkPicker] = useState(false);
+
   const getPhotoForSlot = (slot: SlotKey): Photo | undefined => {
     return photos.find((p) => p.slot === slot && !(p as any).locationId);
   };
@@ -371,22 +411,39 @@ export default function ObservationForm() {
         systemId: form.systemId ? Number(form.systemId) : null,
         indicators: JSON.stringify(indicators),
       };
+      let saved: Observation;
       if (isEdit) {
         const res = await apiRequest("PATCH", `/api/observations/${obsIdParam}`, basePayload);
-        return res.json();
+        saved = await res.json();
       } else {
         const res = await apiRequest("POST", `/api/projects/${projectId}/observations`, {
           ...basePayload,
           createdAt: new Date().toISOString(),
         });
-        return res.json();
+        saved = await res.json();
       }
+      // Persist related-observations only when the set has actually changed —
+      // avoids spurious writes on every save.
+      try {
+        const changed =
+          relatedObservationIds.length !== initialRelatedIds.length ||
+          relatedObservationIds.some((id) => !initialRelatedIds.includes(id));
+        if (changed && saved?.id) {
+          await apiRequest("PATCH", `/api/observations/${saved.id}/links`, {
+            relatedIds: relatedObservationIds,
+          });
+        }
+      } catch (err: any) {
+        toast({ title: err.message || "Failed to save linked observations", variant: "destructive" });
+      }
+      return saved;
     },
     onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: [`/api/projects/${projectId}/observations`] });
       if (isEdit && obsIdParam) {
         queryClient.invalidateQueries({ queryKey: ["/api/observations", obsIdParam] });
         queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/locations`] });
+        queryClient.invalidateQueries({ queryKey: [`/api/observations/${obsIdParam}/links`] });
       }
       toast({ title: isEdit ? "Observation updated" : "Observation created" });
 
@@ -1422,6 +1479,89 @@ export default function ObservationForm() {
               <Plus className="w-4 h-4 mr-1" />
               Add Another Location
             </Button>
+          </Card>
+        )}
+
+        {/* Related Observations (causal linking — Feature 1) */}
+        {isEdit && (
+          <Card className="p-4 space-y-3">
+            <div>
+              <h3 className="text-sm font-medium">Related observations (optional)</h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                Link observations that share a contributory cause. AI will weave them into a combined narrative.
+              </p>
+            </div>
+            {relatedObservationIds.length === 0 && !showLinkPicker && (
+              <p className="text-xs text-muted-foreground italic">No related observations linked.</p>
+            )}
+            {relatedObservationIds.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {relatedObservationIds.map((id) => {
+                  const o = projectObservations?.find((x) => x.id === id);
+                  if (!o) return null;
+                  const summary = (o.defectCategory || o.location || "").slice(0, 60);
+                  return (
+                    <span
+                      key={id}
+                      className="inline-flex items-center gap-1 rounded-full bg-accent px-2.5 py-1 text-xs"
+                    >
+                      <span className="font-medium">{o.observationId || `#${o.id}`}</span>
+                      {summary && <span className="text-muted-foreground">— {summary}</span>}
+                      <button
+                        type="button"
+                        onClick={() => removeRelated(id)}
+                        className="ml-1 p-0.5 hover:text-destructive"
+                        aria-label="Remove link"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setShowLinkPicker((v) => !v)}
+              >
+                {showLinkPicker ? (
+                  <><ChevronUp className="w-4 h-4 mr-1" /> Done</>
+                ) : (
+                  <><Plus className="w-4 h-4 mr-1" /> Link observations</>
+                )}
+              </Button>
+            </div>
+            {showLinkPicker && (
+              <div className="max-h-60 overflow-y-auto border rounded-md bg-background">
+                {linkableObservations.length === 0 && (
+                  <p className="text-xs text-muted-foreground italic p-3">
+                    No other observations in this project yet.
+                  </p>
+                )}
+                {linkableObservations.map((o) => {
+                  const checked = relatedObservationIds.includes(o.id);
+                  const summary = (o.defectCategory || o.location || "").slice(0, 80);
+                  return (
+                    <label
+                      key={o.id}
+                      className="flex items-start gap-2 p-2 text-sm hover-elevate cursor-pointer border-b last:border-b-0"
+                    >
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={() => toggleRelated(o.id)}
+                      />
+                      <span className="flex-1 min-w-0">
+                        <span className="font-medium">{o.observationId || `#${o.id}`}</span>
+                        {summary && <span className="text-muted-foreground"> — {summary}</span>}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
           </Card>
         )}
 

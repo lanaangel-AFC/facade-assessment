@@ -304,6 +304,28 @@ export async function registerRoutes(
     res.status(204).end();
   });
 
+  // === OBSERVATION LINKS (causal links between observations within a project) ===
+  app.get("/api/observations/:id/links", async (req, res) => {
+    const id = Number(req.params.id);
+    const linked = await (storage as any).getLinkedObservations(id);
+    res.json(linked);
+  });
+
+  app.patch("/api/observations/:id/links", async (req, res) => {
+    const id = Number(req.params.id);
+    const observation = await storage.getObservation(id);
+    if (!observation) return res.status(404).json({ message: "Observation not found" });
+    const incoming = Array.isArray(req.body?.relatedIds) ? req.body.relatedIds : [];
+    const ids = incoming.map((v: any) => Number(v)).filter((n: number) => Number.isInteger(n) && n > 0 && n !== id);
+    // Constrain to same-project observations (defensive — UI already filters)
+    const projectObs = await storage.getObservationsByProject(observation.projectId);
+    const projectObsIds = new Set(projectObs.map(o => o.id));
+    const filtered = ids.filter((rid: number) => projectObsIds.has(rid));
+    await (storage as any).setObservationLinks(id, filtered);
+    const linked = await (storage as any).getLinkedObservations(id);
+    res.json(linked);
+  });
+
   // === NEXT OBSERVATION ID ===
   app.get("/api/projects/:projectId/next-observation-id", async (req, res) => {
     const projectId = Number(req.params.projectId);
@@ -1432,6 +1454,64 @@ export async function registerRoutes(
     },
   });
 
+  /**
+   * Background ingestion of finalised in-app project narratives into the
+   * Report Library. Triggered after a successful Word export. Idempotent —
+   * passages already present with the same source project + textHash are
+   * skipped. Failures are logged, never thrown, never block the response.
+   */
+  async function ingestProjectNarrativesIntoLibrary(projectId: number) {
+    try {
+      const { embedBatch } = await import("./embeddings");
+      const project = await storage.getProject(projectId);
+      if (!project) return;
+      const allObservations = await storage.getObservationsByProject(projectId);
+      const candidates = allObservations
+        .map(o => ({ obs: o, text: (o.aiNarrative || "").trim() }))
+        .filter(c => c.text.length > 0);
+      if (candidates.length === 0) {
+        console.log(`[auto-ingest] project ${projectId}: no narratives to ingest`);
+        return;
+      }
+      const projectLabel = `In-app project: ${project.name} (${projectId})`;
+      const created: { id: string; text: string }[] = [];
+      for (const { obs, text } of candidates) {
+        const textHash = crypto.createHash("sha256").update(text).digest("hex");
+        const existing = await (storage as any).findPassageByProjectAndHash(projectId, textHash);
+        if (existing) continue;
+        const passage = await storage.createPassage({
+          id: crypto.randomUUID(),
+          documentId: `inapp-project-${projectId}`,
+          category: "narrative",
+          text,
+          embedding: null,
+          sourceSection: `${projectLabel} — observation ${obs.observationId || obs.id}`,
+          sourceProjectId: projectId as any,
+          textHash: textHash as any,
+          createdAt: new Date().toISOString(),
+        } as any);
+        created.push({ id: passage.id, text: passage.text });
+      }
+      // Embed in batches of 10 — same pattern as processReportDocument
+      for (let i = 0; i < created.length; i += 10) {
+        const batch = created.slice(i, i + 10);
+        try {
+          const embeddings = await embedBatch(batch.map((b) => b.text));
+          for (let j = 0; j < batch.length; j++) {
+            await storage.updatePassage(batch[j].id, {
+              embedding: JSON.stringify(embeddings[j]),
+            });
+          }
+        } catch (err: any) {
+          console.warn("[auto-ingest] embedding batch failed, leaving passages without embedding:", err?.message || err);
+        }
+      }
+      console.log(`[auto-ingest] project ${projectId}: created ${created.length} passage${created.length === 1 ? "" : "s"} (out of ${candidates.length} candidates)`);
+    } catch (err: any) {
+      console.error(`[auto-ingest] failed for project ${projectId}:`, err?.message || err);
+    }
+  }
+
   async function processReportDocument(documentId: string) {
     const { extractPassages } = await import("./reportExtraction");
     const { embedBatch } = await import("./embeddings");
@@ -1528,6 +1608,30 @@ export async function registerRoutes(
   app.delete("/api/report-library/passages/:id", async (req, res) => {
     await storage.deletePassage(req.params.id);
     res.status(204).end();
+  });
+
+  // Auto-ingested passages (from completed in-app projects). Used by the
+  // Settings → Report Library UI to show project-derived style references
+  // separately from manually uploaded report passages.
+  app.get("/api/report-library/auto-ingested", async (_req, res) => {
+    const rows = await (storage as any).getAutoIngestedPassages();
+    const projectMap: Record<number, string> = {};
+    for (const p of rows) {
+      const pid = (p as any).sourceProjectId as number | null;
+      if (pid && !(pid in projectMap)) {
+        const proj = await storage.getProject(pid);
+        projectMap[pid] = proj?.name || `Project ${pid}`;
+      }
+    }
+    res.json(rows.map((p: any) => ({
+      id: p.id,
+      category: p.category,
+      text: p.text,
+      sourceSection: p.sourceSection,
+      sourceProjectId: p.sourceProjectId,
+      sourceProjectName: p.sourceProjectId ? projectMap[p.sourceProjectId] : null,
+      createdAt: p.createdAt,
+    })));
   });
 
   app.get("/api/report-library/status/:id", async (req, res) => {
@@ -3109,6 +3213,21 @@ export async function registerRoutes(
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
       res.send(Buffer.from(buffer));
+
+      // Post-export: mark project as completed (first time only) and trigger
+      // background ingestion of finalised narratives into the Report Library
+      // so future projects can RAG against Lana's edited voice. Fire-and-forget
+      // so it does not delay the response or block on OpenAI calls.
+      try {
+        if (!(project as any).completedAt) {
+          await storage.updateProject(project.id, { completedAt: new Date().toISOString() } as any);
+        }
+        ingestProjectNarrativesIntoLibrary(project.id).catch((e) =>
+          console.error("[auto-ingest] background error:", e?.message || e),
+        );
+      } catch (e: any) {
+        console.error("[auto-ingest] failed to mark completedAt:", e?.message || e);
+      }
     } catch (err: any) {
       console.error("Word export error:", err);
       res.status(500).json({ message: err.message || "Word export failed" });

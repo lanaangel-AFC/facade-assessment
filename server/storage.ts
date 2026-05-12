@@ -19,6 +19,7 @@ import {
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
   type ObservationLocation, type InsertObservationLocation, observationLocations,
   type ProjectDocument, type InsertProjectDocument, projectDocuments,
+  type ObservationLink, observationLinks,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -294,6 +295,30 @@ try {
   console.error("[migration] project_roof_levels CREATE failed:", e);
 }
 
+// Observation completion timestamp on projects (Feature 2 — used to auto-feed
+// finalised narratives into the Report Library)
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN completed_at TEXT DEFAULT ''`); } catch {}
+
+// Auto-ingested-passage tracking fields on report_library_passages (Feature 2)
+try { sqlite.exec(`ALTER TABLE report_library_passages ADD COLUMN source_project_id INTEGER`); } catch {}
+try { sqlite.exec(`ALTER TABLE report_library_passages ADD COLUMN text_hash TEXT DEFAULT ''`); } catch {}
+
+// Observation Links (Feature 1 — causal linking between observations)
+try {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS observation_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      observation_id INTEGER NOT NULL,
+      related_observation_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_observation_links_pair
+      ON observation_links (observation_id, related_observation_id);
+  `);
+} catch (e) {
+  console.error("[migration] observation_links CREATE failed:", e);
+}
+
 // Project Documents (project-scoped uploads used as AI factual context and Harvard
 // references in the Word export)
 try {
@@ -555,6 +580,12 @@ export class DatabaseStorage implements IStorage {
       db.delete(elevationPins).where(eq(elevationPins.elevationId, elev.id)).run();
     }
     db.delete(elevations).where(eq(elevations.projectId, id)).run();
+    // Delete observation links pointing into or out of this project's observations
+    const obsIds = projectObservations.map(o => o.id);
+    for (const oid of obsIds) {
+      db.delete(observationLinks).where(eq(observationLinks.observationId, oid)).run();
+      db.delete(observationLinks).where(eq(observationLinks.relatedObservationId, oid)).run();
+    }
     db.delete(observations).where(eq(observations.projectId, id)).run();
     db.delete(recommendations).where(eq(recommendations.projectId, id)).run();
     db.delete(facadeSystems).where(eq(facadeSystems.projectId, id)).run();
@@ -641,12 +672,75 @@ export class DatabaseStorage implements IStorage {
     return db.update(observations).set(observation).where(eq(observations.id, id)).returning().get();
   }
   async deleteObservation(id: number): Promise<void> {
-    // Cascade: delete recommendations, photos, additional locations, and elevation pins for this observation
+    // Cascade: delete recommendations, photos, additional locations, elevation pins, and bi-directional links for this observation
     db.delete(recommendations).where(eq(recommendations.observationId, id)).run();
     db.delete(photos).where(eq(photos.observationId, id)).run();
     db.delete(observationLocations).where(eq(observationLocations.observationId, id)).run();
     db.delete(elevationPins).where(eq(elevationPins.observationId, id)).run();
+    db.delete(observationLinks).where(eq(observationLinks.observationId, id)).run();
+    db.delete(observationLinks).where(eq(observationLinks.relatedObservationId, id)).run();
     db.delete(observations).where(eq(observations.id, id)).run();
+  }
+
+  // Observation Links (bi-directional causal links)
+  async linkObservations(aId: number, bId: number): Promise<void> {
+    if (aId === bId) return;
+    const now = new Date().toISOString();
+    const tx = sqlite.transaction(() => {
+      const existingAB = db.select().from(observationLinks)
+        .where(and(eq(observationLinks.observationId, aId), eq(observationLinks.relatedObservationId, bId)))
+        .get();
+      if (!existingAB) {
+        db.insert(observationLinks).values({ observationId: aId, relatedObservationId: bId, createdAt: now }).run();
+      }
+      const existingBA = db.select().from(observationLinks)
+        .where(and(eq(observationLinks.observationId, bId), eq(observationLinks.relatedObservationId, aId)))
+        .get();
+      if (!existingBA) {
+        db.insert(observationLinks).values({ observationId: bId, relatedObservationId: aId, createdAt: now }).run();
+      }
+    });
+    tx();
+  }
+  async unlinkObservations(aId: number, bId: number): Promise<void> {
+    const tx = sqlite.transaction(() => {
+      db.delete(observationLinks).where(and(
+        eq(observationLinks.observationId, aId),
+        eq(observationLinks.relatedObservationId, bId),
+      )).run();
+      db.delete(observationLinks).where(and(
+        eq(observationLinks.observationId, bId),
+        eq(observationLinks.relatedObservationId, aId),
+      )).run();
+    });
+    tx();
+  }
+  async getLinkedObservationIds(observationId: number): Promise<number[]> {
+    const links = db.select().from(observationLinks)
+      .where(eq(observationLinks.observationId, observationId))
+      .all();
+    return links.map(l => l.relatedObservationId);
+  }
+  async getLinkedObservations(observationId: number): Promise<Observation[]> {
+    const ids = await this.getLinkedObservationIds(observationId);
+    if (ids.length === 0) return [];
+    const all = db.select().from(observations).all();
+    const byId = new Map(all.map(o => [o.id, o] as const));
+    return ids.map(id => byId.get(id)).filter((o): o is Observation => !!o);
+  }
+  async setObservationLinks(observationId: number, ids: number[]): Promise<void> {
+    const desiredList = ids.filter(id => id !== observationId);
+    const desired = new Set(desiredList);
+    const currentList = await this.getLinkedObservationIds(observationId);
+    const current = new Set(currentList);
+    const toAdd = desiredList.filter(id => !current.has(id));
+    const toRemove = currentList.filter(id => !desired.has(id));
+    for (const id of toAdd) {
+      await this.linkObservations(observationId, id);
+    }
+    for (const id of toRemove) {
+      await this.unlinkObservations(observationId, id);
+    }
   }
 
   // Observation Locations (additional locations for the same defect)
@@ -979,6 +1073,25 @@ export class DatabaseStorage implements IStorage {
   }
   async deletePassage(id: string): Promise<void> {
     db.delete(reportLibraryPassages).where(eq(reportLibraryPassages.id, id)).run();
+  }
+  /**
+   * Auto-ingested passages — those created from completed in-app projects
+   * (sourceProjectId is set). Returned newest-first for display in Settings.
+   */
+  async getAutoIngestedPassages(): Promise<ReportLibraryPassage[]> {
+    return db.select().from(reportLibraryPassages)
+      .all()
+      .filter(p => (p as any).sourceProjectId != null)
+      .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  }
+  /**
+   * Look up a passage by source project + content hash for idempotent
+   * re-ingestion (skip insert when the same narrative has already landed).
+   */
+  async findPassageByProjectAndHash(projectId: number, textHash: string): Promise<ReportLibraryPassage | undefined> {
+    return db.select().from(reportLibraryPassages)
+      .all()
+      .find(p => (p as any).sourceProjectId === projectId && (p as any).textHash === textHash);
   }
 
   // === Project Documents (project-scoped factual context + Harvard references) ===
