@@ -1,0 +1,116 @@
+# AFC word library — technical terms for dictation in every AFC app.
+#
+# HOW TO EDIT (on github.com: open this file, click the pencil icon, edit, "Commit changes")
+#   One entry per line. Lines starting with # are notes and are ignored.
+#
+#   A word or phrase on its own line is a term the speech service should expect:
+#       sealant
+#       backer rod
+#
+#   "heard => meant" tells the speech service a common mix-up. Anything after a
+#   second # is extra context for that mix-up:
+#       Fejsa => façade
+#       ceiling => sealant    # when talking about joints
+#
+#   Apps pick up changes within an hour (or straight away from the app's word
+#   library status button). Keep to general technical terms — no client details.
+
+# --- Common mix-ups -----------------------------------------------------------
+Fejsa => façade
+facade => façade
+ceiling => sealant    # when talking about joints, beads or caulking
+silicon => silicone   # sealant, not the element
+
+# --- Envelope and cladding ----------------------------------------------------
+façade
+curtain wall
+unitised curtain wall
+stick system
+spandrel
+spandrel panel
+mullion
+transom
+glazing bead
+pressure plate
+cover cap
+IGU
+insulated glass unit
+low-e coating
+ACP
+aluminium composite panel
+GRC
+glass reinforced concrete
+precast panel
+cladding
+rainscreen
+cavity
+weep hole
+drainage path
+louvre
+fin
+
+# --- Joints and sealants ------------------------------------------------------
+sealant
+silicone
+polyurethane sealant
+backer rod
+bond breaker
+primer
+movement joint
+control joint
+expansion joint
+caulking
+adhesion failure
+cohesive failure
+tooling
+joint width
+gasket
+spline
+wedge gasket
+
+# --- Roofing, waterproofing and flashings ------------------------------------
+flashing
+head flashing
+sill flashing
+coping
+parapet
+box gutter
+membrane
+waterproofing membrane
+upstand
+termination bar
+sump
+overflow
+downpipe
+
+# --- Concrete, masonry and steel ---------------------------------------------
+spalling
+delamination
+efflorescence
+carbonation
+chloride
+reinforcement
+concrete cancer
+cover depth
+render
+lintel
+brick tie
+wall tie
+corrosion
+section loss
+galvanised
+stainless steel
+
+# --- Access and inspection ----------------------------------------------------
+soffit
+BMU
+building maintenance unit
+abseil
+rope access
+EWP
+elevating work platform
+swing stage
+anchorage
+drop
+level
+elevation
