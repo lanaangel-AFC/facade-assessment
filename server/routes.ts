@@ -36,11 +36,20 @@ import fs from "fs";
 import { execSync } from "child_process";
 import crypto from "crypto";
 import sharp from "sharp";
+import { AFC_LOGO_JPEG_BASE64 } from "./afcBrand";
 import {
   Document,
   Packer,
   Paragraph,
+  Paragraph as DocxParagraph,
   TextRun,
+  TextRun as DocxTextRun,
+  TableOfContents,
+  NumberFormat,
+  LevelFormat,
+  HorizontalPositionRelativeFrom,
+  VerticalPositionRelativeFrom,
+  TextWrappingType,
   Table,
   TableRow,
   TableCell,
@@ -1947,6 +1956,62 @@ export async function registerRoutes(
       if (!project) return res.status(404).json({ message: "Project not found" });
 
       const v2 = isV2(project as any);
+
+      // ---- v2 house style (Stage 2 formatting) ----
+      // Legacy projects keep the original Arial/teal look. For v2 projects every
+      // TextRun / Paragraph created in this handler is passed through a small
+      // style map so the export matches the AFC final report without touching
+      // each of the ~130 call sites:
+      //   H1 20pt #3A3A3A regular, H2 16pt black regular, H3 14pt black regular,
+      //   body Aptos 11pt black, list markers ("1.", "a.", "iv.") teal 10pt,
+      //   bullets as teal squares, headings collected for the CONTENTS page.
+      // Pass `__raw: true` on a TextRun to opt out of the map (cover, captions...).
+      const V2_FONT = "Aptos";
+      const V2_LIST_TEAL = "52C6CC";
+      const V2_RULE_TEAL = "00CDC8";
+      const V2_HEAD_GREY = "3A3A3A";
+      const v2RunText = new WeakMap<object, string>();
+      const mapV2Run = (o: any): any => {
+        if (!o || typeof o !== "object") return o;
+        if (o.__raw) { const { __raw, ...r } = o; return { font: V2_FONT, ...r }; }
+        const r: any = { ...o };
+        if (!r.font || r.font === "Arial") r.font = V2_FONT;
+        const isMarker = typeof r.text === "string" && /^\s*(\d+|[a-z]|[ivx]+)\.[\t ]?$/i.test(r.text);
+        if (r.bold && r.size === 36) { r.size = 40; r.bold = false; r.color = V2_HEAD_GREY; }
+        else if (r.bold && r.size === 28) { r.size = 32; r.bold = false; r.color = "000000"; }
+        else if (r.bold && r.size === 24 && r.color === "333333") { r.size = 28; r.bold = false; r.color = "000000"; }
+        else if (isMarker) { r.color = V2_LIST_TEAL; r.bold = false; r.size = Math.max(16, (r.size || 22) - 2); }
+        else if (r.color === "333333") r.color = "000000";
+        return r;
+      };
+      // Shadow the docx classes inside this handler only (types still resolve to the imports).
+      const TextRun = class extends DocxTextRun {
+        constructor(o: any) {
+          const m = v2 ? mapV2Run(o) : o;
+          super(m);
+          if (m && typeof m === "object" && typeof m.text === "string") v2RunText.set(this, m.text);
+          else if (typeof m === "string") v2RunText.set(this, m);
+        }
+      } as typeof DocxTextRun;
+      const v2Toc = new WeakMap<object, { title: string; level: number }>();
+      const HEADING_LEVEL_NUM: Record<string, number> = { [HeadingLevel.HEADING_1]: 1, [HeadingLevel.HEADING_2]: 2, [HeadingLevel.HEADING_3]: 3 };
+      const Paragraph = class extends DocxParagraph {
+        constructor(o: any) {
+          let m = o;
+          if (v2 && o && typeof o === "object") {
+            m = { ...o };
+            if (m.bullet) { m.numbering = { reference: "v2-bullet", level: m.bullet.level || 0 }; delete m.bullet; }
+            if (m.heading) m.keepNext = true;
+          }
+          super(m);
+          if (v2 && m && typeof m === "object" && m.heading && HEADING_LEVEL_NUM[m.heading]) {
+            const title = (m.children || []).map((c: any) => v2RunText.get(c) || "").join("").trim();
+            if (title) v2Toc.set(this, { title, level: HEADING_LEVEL_NUM[m.heading] });
+          }
+        }
+      } as typeof DocxParagraph;
+      // A4 with 0.5" side margins (v2) → 10466 twips of text width.
+      const TEXT_W = v2 ? 10466 : 9026;
       const REPORT_TITLE = v2 ? reportTitleOf(project as any) : "FACADE DUE DILIGENCE REPORT";
       // v2 Issues: ordered list (top-level then sub-issues), numbered from 4.2.
       const rawIssues = v2 ? await storage.getIssuesByProject(projectId) : [];
@@ -2116,10 +2181,10 @@ export async function registerRoutes(
             // Indented roman numerals → sub-sub-item
             out.push(new Paragraph({
               children: [
-                new TextRun({ text: `${romanMatch[1]}. `, font: "Arial", size: fontSize, bold: false }),
+                new TextRun({ text: `${romanMatch[1]}.${v2 ? "\t" : " "}`, font: "Arial", size: fontSize, bold: false }),
                 ...buildRuns(romanMatch[2]),
               ],
-              indent: { left: 1080 },
+              ...(v2 ? { indent: { left: 1080, hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 1080 }] } : { indent: { left: 1080 } }),
               spacing: { after: 60 },
             }));
             continue;
@@ -2128,10 +2193,10 @@ export async function registerRoutes(
           if (letterMatch) {
             out.push(new Paragraph({
               children: [
-                new TextRun({ text: `${letterMatch[1]}. `, font: "Arial", size: fontSize, bold: false }),
+                new TextRun({ text: `${letterMatch[1]}.${v2 ? "\t" : " "}`, font: "Arial", size: fontSize, bold: false }),
                 ...buildRuns(letterMatch[2]),
               ],
-              indent: { left: 720 },
+              ...(v2 ? { indent: { left: 720, hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 720 }] } : { indent: { left: 720 } }),
               spacing: { after: 60 },
             }));
             continue;
@@ -2142,9 +2207,10 @@ export async function registerRoutes(
             const headingText = numMatch[2];
             out.push(new Paragraph({
               children: [
-                new TextRun({ text: `${numMatch[1]}. `, font: "Arial", size: fontSize, bold: true, color: DARK_GRAY }),
+                new TextRun({ text: `${numMatch[1]}.${v2 ? "\t" : " "}`, font: "Arial", size: fontSize, bold: true, color: DARK_GRAY }),
                 ...buildRuns(headingText, { bold: true, color: DARK_GRAY }),
               ],
+              ...(v2 ? { indent: { left: 360 + (opts.plainIndent || 0), hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 360 + (opts.plainIndent || 0) }] } : {}),
               spacing: { before: 100, after: 60 },
             }));
             continue;
@@ -2240,6 +2306,71 @@ export async function registerRoutes(
         return paragraphs;
       };
 
+      // v2 photos: EXIF-rotated, down-sampled JPEGs (keeps the .docx small), laid out
+      // in a borderless table with a "Figure N – caption" under each photo, a thin
+      // blue outline, and either 2-up 4:3 crops (issues) or one full-width photo
+      // per row at its natural aspect (façade description), as in the final report.
+      const v2PhotoCache = new Map<string, { data: Buffer; w: number; h: number } | null>();
+      const prepV2Photo = async (filename: string, crop43: boolean) => {
+        const key = `${filename}|${crop43}`;
+        if (v2PhotoCache.has(key)) return v2PhotoCache.get(key)!;
+        const filePath = path.join(uploadDir, filename);
+        let out: { data: Buffer; w: number; h: number } | null = null;
+        try {
+          if (fs.existsSync(filePath)) {
+            const img = sharp(filePath).rotate();
+            const r = await (crop43
+              ? img.resize({ width: 1200, height: 900, fit: "cover", position: "centre" })
+              : img.resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
+            ).jpeg({ quality: 80 }).toBuffer({ resolveWithObject: true });
+            out = { data: r.data, w: r.info.width, h: r.info.height };
+          } else console.warn(`Photo file not found: ${filePath}`);
+        } catch (err) { console.warn(`Failed to process photo ${filename}:`, err); }
+        v2PhotoCache.set(key, out);
+        return out;
+      };
+      const V2_CAPTION_BLUE = "0E2841";
+      const V2_PHOTO_OUTLINE = { type: "solidFill", solidFillType: "rgb", value: "156082", width: 9144 } as const;
+      const buildPhotoGridV2 = async (
+        photoList: Photo[], figureCounter: { n: number }, opts: { single?: boolean } = {},
+      ): Promise<(Paragraph | Table)[]> => {
+        const perRow = opts.single ? 1 : 2;
+        const colW = Math.floor(TEXT_W / perRow);
+        const none = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+        const cells: TableCell[] = [];
+        for (const ph of photoList) {
+          const img = await prepV2Photo(ph.filename, !opts.single);
+          if (!img) continue;
+          // px at 96 dpi: 2-up ≈ 3.4" wide, single ≈ 6.1" wide (max 4.6" tall)
+          let w = opts.single ? 585 : 330;
+          let h = Math.round(w * img.h / img.w);
+          const maxH = opts.single ? 440 : 248;
+          if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
+          const cap = (ph.caption || "").trim();
+          const capText = `Figure ${figureCounter.n++}${cap ? ` \u2013 ${cap}` : ""}`;
+          cells.push(new TableCell({
+            width: { size: colW, type: WidthType.DXA },
+            borders: { top: none, bottom: none, left: none, right: none },
+            margins: { top: 60, bottom: 120, left: 0, right: perRow > 1 ? 180 : 0 },
+            children: [
+              new Paragraph({ children: [new ImageRun({ data: img.data, type: "jpg", transformation: { width: w, height: h }, outline: V2_PHOTO_OUTLINE as any, altText: { title: cap || ph.filename, description: cap, name: ph.filename } } as any)], spacing: { after: 40 } }),
+              new Paragraph({ children: [new TextRun({ __raw: true, text: capText, size: 18, bold: true, color: V2_CAPTION_BLUE } as any)], spacing: { after: 0 } }),
+            ],
+          }));
+        }
+        if (!cells.length) return [];
+        const rows: TableRow[] = [];
+        for (let i = 0; i < cells.length; i += perRow) {
+          const rc = cells.slice(i, i + perRow);
+          while (rc.length < perRow) rc.push(new TableCell({ width: { size: colW, type: WidthType.DXA }, borders: { top: none, bottom: none, left: none, right: none }, children: [new Paragraph({ children: [] })] }));
+          rows.push(new TableRow({ children: rc, cantSplit: true }));
+        }
+        return [
+          new Table({ layout: TableLayoutType.FIXED, width: { size: TEXT_W, type: WidthType.DXA }, columnWidths: Array(perRow).fill(colW), borders: { top: none, bottom: none, left: none, right: none, insideHorizontal: none, insideVertical: none }, rows } as any),
+          new Paragraph({ children: [], spacing: { after: 120 } }),
+        ];
+      };
+
       // Helper: render "Also observed at" block + return per-photo location label map
       const buildAlsoObservedAtBlock = (obsId: number): {
         paragraphs: Paragraph[];
@@ -2282,8 +2413,32 @@ export async function registerRoutes(
       const tealBorder = { style: BorderStyle.SINGLE, size: 6, color: TEAL };
       const noBorder = { style: BorderStyle.NONE, size: 0, color: WHITE };
 
+      // v2 header/footer: 8pt grey uppercase text between thin teal rules.
+      const v2Rule = { style: BorderStyle.SINGLE, size: 4, color: V2_RULE_TEAL };
+      const v2HF = (text: string) => new TextRun({ __raw: true, text, size: 16, color: V2_HEAD_GREY } as any);
+      const contentHeaderV2 = new Header({
+        children: [new Paragraph({
+          children: [v2HF((project.address || project.name || "").toUpperCase()), new TextRun({ __raw: true, text: "\t" } as any), v2HF("ANGEL FA\u00C7ADE CONSULTING PTY LTD")],
+          tabStops: [{ type: TabStopType.RIGHT, position: TEXT_W }],
+          border: { bottom: v2Rule },
+          spacing: { after: 0 },
+        })],
+      });
+      const contentFooterV2 = new Footer({
+        children: [new Paragraph({
+          children: [
+            v2HF(REPORT_TITLE.toUpperCase()),
+            new TextRun({ __raw: true, text: "\t" } as any),
+            new TextRun({ __raw: true, children: ["Page ", PageNumber.CURRENT], size: 16, color: V2_HEAD_GREY } as any),
+          ],
+          tabStops: [{ type: TabStopType.RIGHT, position: TEXT_W }],
+          border: { top: v2Rule },
+          spacing: { before: 0 },
+        })],
+      });
+
       // Common header for content sections
-      const contentHeader = new Header({
+      const contentHeader = v2 ? contentHeaderV2 : new Header({
         children: [
           new Paragraph({
             children: [
@@ -2299,7 +2454,7 @@ export async function registerRoutes(
       });
 
       // Common footer for content sections
-      const contentFooter = new Footer({
+      const contentFooter = v2 ? contentFooterV2 : new Footer({
         children: [
           new Paragraph({
             children: [
@@ -2333,6 +2488,36 @@ export async function registerRoutes(
 
         const textRun = (text: string) => new TextRun({ text, font: "Arial", size: fontSize, color: textColor, bold });
 
+        if (v2) {
+          // v2: plain white grid, grey rules, bold header/IDs, red Safety/Risk,
+          // "MAJOR RENEWAL:" bolded in actions, shaded budget-total rows. 10pt.
+          const isTotal = isAlt;
+          const W2 = [850, 1300, 1300, 3316, 1300, 1200, 1200];
+          const run = (text: string, extra: any = {}) => new TextRun({ __raw: true, text, size: 20, color: isHeader ? V2_HEAD_GREY : BLACK, bold: isHeader || isTotal, ...extra } as any);
+          const cell = (w: number, children: any[], extra: any = {}) => new TableCell({
+            width: { size: w, type: WidthType.DXA },
+            shading: { type: ShadingType.CLEAR, fill: isTotal ? "F2F2F2" : WHITE },
+            verticalAlign: VerticalAlign.TOP,
+            margins: { top: 40, bottom: 40, left: 80, right: 80 },
+            children: [new Paragraph({ children, ...extra })],
+          });
+          const idKids = withLink && !isHeader
+            ? [new InternalHyperlink({ anchor: sanitizeBookmark(anchorOverride || obsId), children: [run(obsId, { bold: true, color: BLACK })] })]
+            : [run(obsId, { bold: true })];
+          const mr = !isHeader && action.match(/^\s*(MAJOR RENEWAL:)([\s\S]*)$/i);
+          const actionKids = mr ? [run(mr[1].toUpperCase(), { bold: true }), run(mr[2])] : [run(action)];
+          const sevKids = [run(category, !isHeader && /safety/i.test(category) ? { color: "EE0000" } : {})];
+          return new TableRow({
+            cantSplit: true,
+            tableHeader: isHeader,
+            children: [
+              cell(W2[0], idKids), cell(W2[1], [run(location)]), cell(W2[2], [run(defect)]),
+              cell(W2[3], actionKids), cell(W2[4], [run(timeframe)]), cell(W2[5], sevKids),
+              cell(W2[6], [run(budget)], isTotal ? { alignment: AlignmentType.RIGHT } : {}),
+            ],
+          } as any);
+        }
+
         const idChildren = withLink && !isHeader
           ? [new InternalHyperlink({
               anchor: sanitizeBookmark(anchorOverride || obsId),
@@ -2354,6 +2539,9 @@ export async function registerRoutes(
           ],
         });
       };
+
+      const v2Grey = { style: BorderStyle.SINGLE, size: 4, color: "999999" };
+      const V2_TABLE_BORDERS = { top: v2Grey, bottom: v2Grey, left: v2Grey, right: v2Grey, insideHorizontal: v2Grey, insideVertical: v2Grey };
 
       // Build CAPEX table rows for a set of recommendations.
       // The displayed Severity column is the *effective* severity: Safety/Risk on
@@ -2400,7 +2588,9 @@ export async function registerRoutes(
           }
           const label = TIMEFRAME_GROUP_LABELS[rank] || "Other";
           const amt = !sum ? "TBC" : (lo === sum ? formatMoney(sum) : `${formatMoney(lo)} – ${formatMoney(sum)}`) + (unpriced ? " + TBC" : "");
-          rows.push(buildCapexRow("", "", `Subtotal – ${label}`, "", "", "", amt, false, true, false));
+          rows.push(v2
+            ? buildCapexRow("", "", "", `BUDGET FOR ${label.toUpperCase()}`, "", "", amt, false, true, false)
+            : buildCapexRow("", "", `Subtotal – ${label}`, "", "", "", amt, false, true, false));
         }
         return rows;
       };
@@ -2451,6 +2641,43 @@ export async function registerRoutes(
         children: [new TextRun({ text: `AFC Reference: ${project.afcReference || ""}`, font: "Arial", size: 22, color: MUTED })],
       }));
 
+      if (v2) {
+        // v2 cover (matches the AFC final): logo top right, teal bar + dark block
+        // down the left page edge, right-aligned title block in the lower third.
+        coverChildren.length = 0;
+        const PT = 12700; // EMU per point
+        const solid = (hex: string) => sharp({ create: { width: 8, height: 8, channels: 3, background: `#${hex}` } }).png().toBuffer();
+        const [barPng, blockPng] = await Promise.all([solid("00EBE6"), solid("3A3A3A")]);
+        const floatAt = (xPt: number, yPt: number) => ({
+          horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: Math.round(xPt * PT) },
+          verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: Math.round(yPt * PT) },
+          wrap: { type: TextWrappingType.NONE }, behindDocument: true, allowOverlap: true,
+        });
+        const px = (pt: number) => Math.round(pt * 96 / 72);
+        coverChildren.push(new Paragraph({
+          children: [
+            new ImageRun({ data: Buffer.from(AFC_LOGO_JPEG_BASE64, "base64"), type: "jpg", transformation: { width: px(145.4), height: px(46.6) }, floating: floatAt(371.5, 42.5), altText: { title: "AFC logo", description: "Angel Fa\u00E7ade Consulting", name: "afc-logo" } } as any),
+            new ImageRun({ data: barPng, type: "png", transformation: { width: px(18), height: px(735) }, floating: floatAt(27, 38), altText: { title: "", description: "", name: "cover-bar" } } as any),
+            new ImageRun({ data: blockPng, type: "png", transformation: { width: px(18), height: px(19) }, floating: floatAt(27, 785), altText: { title: "", description: "", name: "cover-block" } } as any),
+          ],
+        }));
+        const coverLine = (text: string, size: number, color: string, after = 0, extra: any = {}) => new Paragraph({
+          alignment: AlignmentType.RIGHT,
+          children: [new TextRun({ __raw: true, text, size, color, ...extra } as any)],
+          spacing: { after },
+        });
+        const exportDate = new Date().toLocaleDateString("en-AU", { day: "2-digit", month: "long", year: "numeric", timeZone: "Australia/Sydney" }).toUpperCase();
+        const rev = String((project as any).revision ?? "0").replace(/^0+(?=\d)/, "") || "0";
+        coverChildren.push(new Paragraph({ children: [], spacing: { before: 9600 } }));
+        coverChildren.push(coverLine((project.address || project.name || "").toUpperCase(), 52, "0A1D30"));
+        coverChildren.push(coverLine(REPORT_TITLE.toUpperCase(), 36, "0E2841"));
+        coverChildren.push(coverLine(`Revision ${rev}`, 24, "0E2841", 160, { smallCaps: true }));
+        coverChildren.push(coverLine(exportDate, 24, "262626", 840));
+        coverChildren.push(coverLine("ANGEL FA\u00C7ADE CONSULTING", 28, "262626"));
+        coverChildren.push(coverLine(`${(project.inspector || "Lana Angel").toUpperCase()} | 0407 759 590`, 20, "262626"));
+        coverChildren.push(coverLine(project.afcReference || "", 20, "262626"));
+      }
+
       // === SECTION 1: EXECUTIVE SUMMARY ===
       const execChildren: (Paragraph | Table)[] = [];
       execChildren.push(new Paragraph({
@@ -2467,9 +2694,9 @@ export async function registerRoutes(
           if (!line) continue;
           const num = line.match(/^(\d+)\.\s+(.*)$/);
           if (EXEC_HEADS.test(line)) {
-            execChildren.push(new Paragraph({ children: [new TextRun({ text: line.replace(/:$/, ""), font: "Arial", size: 22, bold: true, color: DARK_GRAY })], spacing: { before: 200, after: 80 }, keepNext: true }));
+            execChildren.push(new Paragraph({ children: [new TextRun({ text: `${line.replace(/:$/, "")}:`, font: "Arial", size: 22, bold: true, color: BLACK })], spacing: { before: 200, after: 80 }, keepNext: true }));
           } else if (num) {
-            execChildren.push(new Paragraph({ children: [new TextRun({ text: `${num[1]}.\t${num[2]}`, font: "Arial", size: 22 })], indent: { left: 360, hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 360 }], spacing: { after: 60 } }));
+            execChildren.push(new Paragraph({ children: [new TextRun({ text: `${num[1]}.\t`, font: "Arial", size: 22 }), new TextRun({ text: num[2], font: "Arial", size: 22 })], indent: { left: 360, hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 360 }], spacing: { after: 60 } }));
           } else {
             execChildren.push(new Paragraph({ children: [new TextRun({ text: line, font: "Arial", size: 22 })], spacing: { after: 150 } }));
           }
@@ -2496,14 +2723,15 @@ export async function registerRoutes(
         });
         if (picked.length > 0) {
           execChildren.push(new Paragraph({
-            heading: HeadingLevel.HEADING_2,
-            children: [new TextRun({ text: "BUDGETS for major and safety-related recommendations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            children: [new TextRun({ __raw: true, text: "BUDGETS for major and safety-related recommendations:", size: 22, bold: true, color: BLACK } as any)],
             spacing: { before: 300, after: 150 },
+            keepNext: true,
           }));
           execChildren.push(new Table({
             layout: TableLayoutType.FIXED,
-            width: { size: 9026, type: WidthType.DXA },
-            columnWidths: [800, 1050, 1100, 2950, 1050, 1000, 1076],
+            width: { size: TEXT_W, type: WidthType.DXA },
+            columnWidths: [850, 1300, 1300, 3316, 1300, 1200, 1200],
+            borders: V2_TABLE_BORDERS,
             rows: buildBudgetTableRowsV2(picked),
           } as any));
         }
@@ -2872,11 +3100,17 @@ export async function registerRoutes(
           }
 
           if (!annotatedBuffer) continue;
+          let elevImgType: "png" | "jpg" = "png";
+          if (v2) {
+            // v2: flatten + down-sample the annotated drawing (multi-MB PNGs otherwise).
+            try { annotatedBuffer = await sharp(annotatedBuffer).resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true }).flatten({ background: "#ffffff" }).jpeg({ quality: 85 }).toBuffer(); elevImgType = "jpg"; } catch {}
+          }
+          const elevCaption = `Figure ${figureCounter.n} \u2013 ${elev.name}`;
 
-          // Figure heading
-          target.push(new Paragraph({
+          // Figure heading (legacy) — v2 puts a caption under the drawing instead
+          if (!v2) target.push(new Paragraph({
             heading: HeadingLevel.HEADING_3,
-            children: [new TextRun({ text: `Figure ${figureCounter.n} \u2013 ${elev.name}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+            children: [new TextRun({ text: elevCaption, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
             spacing: { before: 200, after: 100 },
           }));
           figureCounter.n++;
@@ -2891,12 +3125,15 @@ export async function registerRoutes(
               new ImageRun({
                 data: annotatedBuffer,
                 transformation: { width: targetWidth, height: targetHeight },
-                type: "png",
+                type: elevImgType,
+                ...(v2 ? { outline: V2_PHOTO_OUTLINE } : {}),
                 altText: { title: elev.name, description: elev.name, name: elev.filename },
-              }),
+              } as any),
             ],
-            spacing: { after: 200 },
+            spacing: { after: v2 ? 40 : 200 },
+            ...(v2 ? { keepNext: true } : {}),
           }));
+          if (v2) target.push(new Paragraph({ children: [new TextRun({ __raw: true, text: elevCaption, size: 18, bold: true, color: V2_CAPTION_BLUE } as any)], spacing: { after: 200 } }));
 
           // Legend / pin list
           if (pins.length > 0) {
@@ -2962,9 +3199,14 @@ export async function registerRoutes(
           }
 
           if (annotatedBuffer) {
-            target.push(new Paragraph({
+            let roofImgType: "png" | "jpg" = "png";
+            if (v2) {
+              try { annotatedBuffer = await sharp(annotatedBuffer).resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true }).flatten({ background: "#ffffff" }).jpeg({ quality: 85 }).toBuffer(); roofImgType = "jpg"; } catch {}
+            }
+            const roofCaption = `Figure ${figureCounter.n} \u2013 ${caption}`;
+            if (!v2) target.push(new Paragraph({
               heading: HeadingLevel.HEADING_3,
-              children: [new TextRun({ text: `Figure ${figureCounter.n} – ${caption}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+              children: [new TextRun({ text: roofCaption, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
               spacing: { before: 200, after: 100 },
             }));
             figureCounter.n++;
@@ -2978,12 +3220,15 @@ export async function registerRoutes(
                 new ImageRun({
                   data: annotatedBuffer,
                   transformation: { width: targetWidth, height: targetHeight },
-                  type: "png",
+                  type: roofImgType,
+                  ...(v2 ? { outline: V2_PHOTO_OUTLINE } : {}),
                   altText: { title: "Roof Plan", description: "Roof plan with drop locations", name: roofPlanFilename },
-                }),
+                } as any),
               ],
-              spacing: { after: 200 },
+              spacing: { after: v2 ? 40 : 200 },
+              ...(v2 ? { keepNext: true } : {}),
             }));
+            if (v2) target.push(new Paragraph({ children: [new TextRun({ __raw: true, text: roofCaption, size: 18, bold: true, color: V2_CAPTION_BLUE } as any)], spacing: { after: 200 } }));
 
             if (!showDropList) {
               // v2: drops are shown on the figure only
@@ -3075,19 +3320,11 @@ export async function registerRoutes(
           const chosen = systems.flatMap(sy => (systemPhotosMap[sy.id] || []).filter(ph => (ph as any).includeInReport));
           if (chosen.length) {
             siteChildren.push(new Paragraph({ children: [], spacing: { after: 100 } }));
-            siteChildren.push(...buildPhotoRows(chosen, figureCounter));
+            siteChildren.push(...((await buildPhotoGridV2(chosen, figureCounter, { single: true })) as any[]));
           }
         }
 
-        // Appendix A — elevation drawings with pinned observations
-        if (projectElevations.length > 0) {
-          appendixChildren.push(new Paragraph({
-            heading: HeadingLevel.HEADING_1,
-            children: [new TextRun({ text: "Appendix A \u2013 Elevations", font: "Arial", size: 36, bold: true, color: TEAL })],
-            spacing: { before: 400, after: 200 },
-          }));
-          await renderElevationFigures(appendixChildren);
-        }
+        // Appendix A (elevations) is rendered after Section 4 so figure numbers run in page order.
       } else {
       // 3.1 Introduction
       siteChildren.push(new Paragraph({
@@ -3245,7 +3482,7 @@ export async function registerRoutes(
           const photosForIssue = jsonIds(issue.photoIds).map(pid => allObsPhotos.get(pid)).filter((p): p is Photo => !!p);
           if (photosForIssue.length) {
             obsChildren.push(new Paragraph({ children: [], spacing: { after: 80 } }));
-            obsChildren.push(...buildPhotoRows(photosForIssue, figureCounter));
+            obsChildren.push(...((v2 ? await buildPhotoGridV2(photosForIssue, figureCounter) : buildPhotoRows(photosForIssue, figureCounter)) as any[]));
           }
         }
       }
@@ -3568,6 +3805,17 @@ export async function registerRoutes(
         }
       }
 
+      // v2 Appendix A — elevation drawings with pinned observations (built here so
+      // its figure numbers follow the Section 4 photos).
+      if (v2 && projectElevations.length > 0) {
+        appendixChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          children: [new TextRun({ text: "Appendix A \u2013 Elevations", font: "Arial", size: 36, bold: true, color: TEAL })],
+          spacing: { before: 400, after: 200 },
+        }));
+        await renderElevationFigures(appendixChildren);
+      }
+
       // === SECTION 5: CAPEX SUMMARY ===
       const capexChildren: (Paragraph | Table)[] = [];
       capexChildren.push(new Paragraph({
@@ -3595,8 +3843,8 @@ export async function registerRoutes(
 
         capexChildren.push(new Table({
           layout: TableLayoutType.FIXED,
-          width: { size: 9026, type: WidthType.DXA },
-          ...(v2 ? { columnWidths: [800, 1050, 1100, 2950, 1050, 1000, 1076] } : {}),
+          width: { size: TEXT_W, type: WidthType.DXA },
+          ...(v2 ? { columnWidths: [850, 1300, 1300, 3316, 1300, 1200, 1200], borders: V2_TABLE_BORDERS } : {}),
           rows: v2
             ? buildBudgetTableRowsV2(allRecommendations.map(rec => ({ rec, obs: allObservations.find(o => o.id === rec.observationId) })))
             : buildCapexTableRows(allCapexData),
@@ -3609,98 +3857,72 @@ export async function registerRoutes(
       }
 
       // Build the document with multiple sections
+      const pageLegacy = { size: { width: 11906, height: 16838 }, margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 } };
+      // v2: 0.5" side margins, header/footer close to the page edge (as the final report).
+      const pageV2 = { size: { width: 11906, height: 16838 }, margin: { top: 1200, right: 720, bottom: 1000, left: 720, header: 600, footer: 460 } };
+      const page = v2 ? pageV2 : pageLegacy;
+      const contentSection = (children: any[], extra: any = {}) => ({
+        properties: { page: { ...page, ...(extra.page || {}) } },
+        headers: { default: contentHeader },
+        footers: { default: contentFooter },
+        children,
+      });
+
+      // v2 CONTENTS page: a real Word TOC field (headings 1–3) with the entries
+      // pre-filled so it reads correctly before Word refreshes the page numbers.
+      const tocChildren: any[] = [];
+      if (v2) {
+        const entries: { title: string; level: number }[] = [];
+        for (const arr of [execChildren, introChildren, siteChildren, obsChildren, capexChildren, appendixChildren] as any[][]) {
+          for (const c of arr) { const e = v2Toc.get(c); if (e) entries.push(e); }
+        }
+        tocChildren.push(new Paragraph({ children: [new TextRun({ __raw: true, text: "CONTENTS", size: 32, color: "0F4761" } as any)], spacing: { after: 120 } }));
+        tocChildren.push(new TableOfContents("CONTENTS", { hyperlink: true, headingStyleRange: "1-3", cachedEntries: entries } as any));
+      }
+
+      const v2Styles = {
+        default: { document: { run: { font: V2_FONT, size: 22, color: BLACK } } },
+        paragraphStyles: [
+          { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 40, color: V2_HEAD_GREY }, paragraph: { spacing: { before: 0, after: 200 }, keepNext: true } },
+          { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 32, color: BLACK }, paragraph: { spacing: { before: 300, after: 120 }, keepNext: true } },
+          { id: "Heading3", name: "Heading 3", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 28, color: BLACK }, paragraph: { spacing: { before: 200, after: 100 }, keepNext: true } },
+        ],
+      };
       const doc = new Document({
-        styles: {
+        styles: v2 ? (v2Styles as any) : {
           default: {
             document: {
               run: { font: "Arial", size: 22 },
             },
           },
         },
+        ...(v2 ? {
+          features: { updateFields: true },
+          numbering: { config: [{ reference: "v2-bullet", levels: [0, 1, 2].map(level => ({
+            level, format: LevelFormat.BULLET, text: "\u25AA", alignment: AlignmentType.LEFT,
+            style: { run: { color: V2_RULE_TEAL, font: V2_FONT }, paragraph: { indent: { left: 360 * (level + 1), hanging: 360 } } },
+          })) }] },
+        } : {}),
         sections: [
           // Cover page - no header/footer
           {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
+            properties: { page: v2 ? { ...pageV2, margin: { ...pageV2.margin, top: 1440, right: 1400 } } : pageLegacy },
             children: coverChildren,
           },
+          ...(v2 ? [contentSection(tocChildren, { page: { pageNumbers: { start: 1, formatType: NumberFormat.LOWER_ROMAN } } })] : []),
           // Executive Summary
-          {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: execChildren,
-          },
+          contentSection(execChildren, v2 ? { page: { pageNumbers: { start: 1, formatType: NumberFormat.DECIMAL } } } : {}),
           // Introduction
-          {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: introChildren,
-          },
+          contentSection(introChildren),
           // Site Description
-          {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: siteChildren,
-          },
+          contentSection(siteChildren),
           // Observations
-          {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: obsChildren,
-          },
+          contentSection(obsChildren),
           // CAPEX Summary
-          {
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: capexChildren,
-          },
-          ...(appendixChildren.length ? [{
-            properties: {
-              page: {
-                size: { width: 11906, height: 16838 },
-                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
-              },
-            },
-            headers: { default: contentHeader },
-            footers: { default: contentFooter },
-            children: appendixChildren,
-          }] : []),
+          contentSection(capexChildren),
+          ...(appendixChildren.length ? [contentSection(appendixChildren)] : []),
         ],
-      });
+      } as any);
 
       const buffer = await Packer.toBuffer(doc);
       const filename = `${project.afcReference || project.name}-Report.docx`.replace(/[^a-zA-Z0-9._-]/g, "_");
