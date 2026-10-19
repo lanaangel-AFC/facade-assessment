@@ -1993,7 +1993,8 @@ export async function registerRoutes(
           else if (typeof m === "string") v2RunText.set(this, m);
         }
       } as typeof DocxTextRun;
-      const v2Toc = new WeakMap<object, { title: string; level: number }>();
+      const v2Toc = new WeakMap<object, { title: string; level: number; anchor: string }>();
+      let v2TocSeq = 0;
       const HEADING_LEVEL_NUM: Record<string, number> = { [HeadingLevel.HEADING_1]: 1, [HeadingLevel.HEADING_2]: 2, [HeadingLevel.HEADING_3]: 3 };
       const Paragraph = class extends DocxParagraph {
         constructor(o: any) {
@@ -2003,11 +2004,19 @@ export async function registerRoutes(
             if (m.bullet) { m.numbering = { reference: "v2-bullet", level: m.bullet.level || 0 }; delete m.bullet; }
             if (m.heading) m.keepNext = true;
           }
-          super(m);
+          // v2 headings get their own bookmark so the CONTENTS entries can link to them.
+          let toc: { title: string; level: number; anchor: string } | null = null;
           if (v2 && m && typeof m === "object" && m.heading && HEADING_LEVEL_NUM[m.heading]) {
             const title = (m.children || []).map((c: any) => v2RunText.get(c) || "").join("").trim();
-            if (title) v2Toc.set(this, { title, level: HEADING_LEVEL_NUM[m.heading] });
+            if (title) {
+              const anchor = `toc_h${++v2TocSeq}`;
+              const bmId = 90000 + v2TocSeq;
+              toc = { title, level: HEADING_LEVEL_NUM[m.heading], anchor };
+              m.children = [new BookmarkStart(anchor, bmId), ...(m.children || []), new BookmarkEnd(bmId)];
+            }
           }
+          super(m);
+          if (toc) v2Toc.set(this, toc);
         }
       } as typeof DocxParagraph;
       // A4 with 0.5" side margins (v2) → 10466 twips of text width.
@@ -2502,7 +2511,7 @@ export async function registerRoutes(
             children: [new Paragraph({ children, ...extra })],
           });
           const idKids = withLink && !isHeader
-            ? [new InternalHyperlink({ anchor: sanitizeBookmark(anchorOverride || obsId), children: [run(obsId, { bold: true, color: BLACK })] })]
+            ? [new InternalHyperlink({ anchor: sanitizeBookmark(anchorOverride || obsId), children: [run(obsId, { bold: true, color: "007C78", underline: {} })] })]
             : [run(obsId, { bold: true })];
           const mr = !isHeader && action.match(/^\s*(MAJOR RENEWAL:)([\s\S]*)$/i);
           const actionKids = mr ? [run(mr[1].toUpperCase(), { bold: true }), run(mr[2])] : [run(action)];
@@ -3881,20 +3890,39 @@ export async function registerRoutes(
       // pre-filled so it reads correctly before Word refreshes the page numbers.
       const tocChildren: any[] = [];
       if (v2) {
-        const entries: { title: string; level: number }[] = [];
+        const entries: { title: string; level: number; anchor: string }[] = [];
         for (const arr of [execChildren, introChildren, siteChildren, obsChildren, capexChildren, appendixChildren] as any[][]) {
           for (const c of arr) { const e = v2Toc.get(c); if (e) entries.push(e); }
         }
         tocChildren.push(new Paragraph({ children: [new TextRun({ __raw: true, text: "CONTENTS", size: 32, color: "0F4761" } as any)], spacing: { after: 120 } }));
-        tocChildren.push(new TableOfContents("CONTENTS", { hyperlink: true, headingStyleRange: "1-3", cachedEntries: entries } as any));
+        // Entries are written into the TOC field's result (styles TOC1–TOC3, staggered,
+        // each linked to its heading). Word fills in page numbers when it updates the field.
+        const tocLines = entries.map(e => new Paragraph({
+          style: `TOC${e.level}`,
+          children: [new InternalHyperlink({ anchor: e.anchor, children: [
+            new TextRun({ __raw: true, text: e.title } as any),
+            new TextRun({ __raw: true, text: "\t" } as any),
+          ] })],
+        }));
+        tocChildren.push(new TableOfContents("CONTENTS", { hyperlink: true, headingStyleRange: "1-3", contentChildren: tocLines } as any));
       }
 
       const v2Styles = {
         default: { document: { run: { font: V2_FONT, size: 22, color: BLACK } } },
         paragraphStyles: [
-          { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 40, color: V2_HEAD_GREY }, paragraph: { spacing: { before: 0, after: 200 }, keepNext: true } },
-          { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 32, color: BLACK }, paragraph: { spacing: { before: 300, after: 120 }, keepNext: true } },
-          { id: "Heading3", name: "Heading 3", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 28, color: BLACK }, paragraph: { spacing: { before: 200, after: 100 }, keepNext: true } },
+          { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 40, color: V2_HEAD_GREY }, paragraph: { outlineLevel: 0, spacing: { before: 0, after: 200 }, keepNext: true } },
+          { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 32, color: BLACK }, paragraph: { outlineLevel: 1, spacing: { before: 300, after: 120 }, keepNext: true } },
+          // CONTENTS levels, staggered: bold level 1, then 0.63 cm / 1.27 cm indents.
+          ...[1, 2, 3].map(l => ({
+            id: `TOC${l}`, name: `toc ${l}`, basedOn: "Normal", next: "Normal", uiPriority: 39,
+            run: { font: V2_FONT, size: l === 1 ? 22 : l === 2 ? 21 : 20, bold: l === 1, color: l === 3 ? "434343" : BLACK },
+            paragraph: {
+              indent: { left: (l - 1) * 360 },
+              spacing: { before: l === 1 ? 160 : 20, after: 20 },
+              tabStops: [{ type: TabStopType.RIGHT, position: TEXT_W, leader: "dot" }],
+            },
+          })),
+          { id: "Heading3", name: "Heading 3", basedOn: "Normal", next: "Normal", quickFormat: true, run: { font: V2_FONT, size: 28, color: BLACK }, paragraph: { outlineLevel: 2, spacing: { before: 200, after: 100 }, keepNext: true } },
         ],
       };
       const doc = new Document({
