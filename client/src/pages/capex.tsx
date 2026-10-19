@@ -1,4 +1,5 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
+import { TIMEFRAMES as V2_TIMEFRAMES, isV2 } from "@shared/reportV2";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import { Link, useParams } from "wouter";
 import { Button } from "@/components/ui/button";
@@ -18,7 +19,7 @@ import type { Project, Observation, Recommendation, FacadeSystem, Severity } fro
 import { SEVERITIES, effectiveSeverity } from "@shared/schema";
 
 const SEVERITY_OPTIONS: readonly Severity[] = SEVERITIES;
-const TIMEFRAME_OPTIONS = ["Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"] as const;
+const LEGACY_TIMEFRAME_OPTIONS = ["Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"] as const;
 
 type SortKey = "obsId" | "system" | "location" | "action" | "category" | "timeframe" | "budget";
 type SortDir = "asc" | "desc";
@@ -94,6 +95,8 @@ export default function CapexPage() {
     queryKey: ["/api/projects", projectId],
     enabled: !Number.isNaN(projectId),
   });
+  const v2 = project ? isV2(project as any) : false;
+  const TIMEFRAME_OPTIONS: readonly string[] = v2 ? V2_TIMEFRAMES : LEGACY_TIMEFRAME_OPTIONS;
   const { data: observations } = useQuery<Observation[]>({
     queryKey: [`/api/projects/${projectId}/observations`],
     enabled: !Number.isNaN(projectId),
@@ -123,7 +126,7 @@ export default function CapexPage() {
             action: rec.action || "",
             budgetEstimate: rec.budgetEstimate || "",
             category: rec.category || "Essential",
-            timeframe: rec.timeframe || "1 year",
+            timeframe: rec.timeframe || (v2 ? "Within 1 year" : "1 year"),
           };
         }
       }
@@ -365,7 +368,7 @@ export default function CapexPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
             <DollarSign className="w-6 h-6 text-muted-foreground" />
-            CAPEX Schedule
+            {v2 ? "Works BUDGET Summary" : "CAPEX Schedule"}
           </h1>
           <p className="text-sm text-muted-foreground">
             Edit cost, recommendation text, severity, and timeline. Changes save automatically and flow to the source observations and Word export.
@@ -404,7 +407,7 @@ export default function CapexPage() {
           })}
         </div>
         <div className="text-sm text-right">
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">Total CAPEX</div>
+          <div className="text-xs uppercase tracking-wide text-muted-foreground">{v2 ? "Total works budget" : "Total CAPEX"}</div>
           <div className="text-lg font-semibold">{formatCurrency(totals.grand)}</div>
         </div>
       </div>

@@ -15,7 +15,7 @@ const defaultForm = {
   name: "",
   address: "",
   client: "",
-  inspector: "",
+  inspector: "Lana Angel",
   afcReference: "",
   revision: "01",
   buildingAge: "",

@@ -27,6 +27,17 @@ export const projects = sqliteTable("projects", {
   roofPlanOriginalName: text("roof_plan_original_name").default(""),
   projectContext: text("project_context").default(""),
   aiIntroduction: text("ai_introduction").default(""),
+  // --- Report v2 (Stage 1 changes; projects created after this release) ---
+  reportVersion: integer("report_version").default(1), // 1 = legacy export layout, 2 = Stage 1 layout
+  assessmentType: text("assessment_type").default("condition"), // condition | due_diligence
+  reportTitle: text("report_title").default(""), // cover/footer title; blank = default for assessmentType
+  clientOnBehalfOf: text("client_on_behalf_of").default(""), // "engaged by JLL on behalf of their client ..."
+  inspectionPurpose: text("inspection_purpose").default(""), // purpose / specific aim notes for 2.1
+  aiBackground: text("ai_background").default(""), // 3.1 General background
+  observationsOverview: text("observations_overview").default(""), // v2: 4.1 Overview
+  locationDescription: text("location_description").default(""), // 3.2 Location text
+  referencesIntro: text("references_intro").default(""), // 2.3 opening sentence
+  inspectionMatrix: text("inspection_matrix").default(""), // JSON InspectionMatrix (shared/inspectionMatrix.ts); empty = legacy 2.2 export
   completedAt: text("completed_at").default(""), // Set on first successful Word export — used to auto-feed narratives into the Report Library
   createdAt: text("created_at").notNull(),
 });
@@ -54,6 +65,7 @@ export const facadeSystems = sqliteTable("facade_systems", {
   relatedSystems: text("related_systems").default(""), // Free text referencing other systems
   aiDescription: text("ai_description").default(""), // AI-generated prose description
   roofTypes: text("roof_types").default("[]"), // JSON array of roof type strings (used when system is Roof)
+  reportHeading: text("report_heading").default(""), // v2: systems sharing a heading are combined in 3.3
   sortOrder: integer("sort_order").default(0),
   createdAt: text("created_at").notNull(),
 });
@@ -171,6 +183,23 @@ export const recommendations = sqliteTable("recommendations", {
   budgetBasis: text("budget_basis").default(""), // e.g. "$80-$120 per lineal m"
   dependencies: text("dependencies").default(""), // references to other recommendation IDs
   sortOrder: integer("sort_order").default(0),
+  issueId: integer("issue_id"), // v2: issue-level recommendation (shown under that issue only)
+  createdAt: text("created_at").notNull(),
+});
+
+// v2 Report Issues — Section 4 is built from a ranked list of issues, each
+// pulling in observations from any system.
+export const reportIssues = sqliteTable("report_issues", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  parentId: integer("parent_id"), // sub-issue (4.n.m) when set
+  sortOrder: integer("sort_order").default(0),
+  title: text("title").notNull(),
+  steer: text("steer").default(""), // engineer's one-line brief for the AI
+  summary: text("summary").default(""), // 3-5 sentences incl. severity
+  keyObservations: text("key_observations").default(""), // numbered list
+  observationIds: text("observation_ids").default("[]"), // JSON number[] (db ids)
+  photoIds: text("photo_ids").default("[]"), // JSON number[] — shown at end of the issue
   createdAt: text("created_at").notNull(),
 });
 
@@ -184,6 +213,7 @@ export const photos = sqliteTable("photos", {
   filename: text("filename").notNull(),
   caption: text("caption").default(""),
   slot: text("slot").default("photo"), // context, photo1-photo6
+  includeInReport: integer("include_in_report").default(0), // v2: system photos only appear in 3.3 when ticked
   createdAt: text("created_at").notNull(),
 });
 
@@ -294,6 +324,7 @@ export const insertCustomRoofTypeSchema = createInsertSchema(customRoofTypes).om
 export const insertCustomDefectCategorySchema = createInsertSchema(customDefectCategories).omit({ id: true });
 export const insertProjectRoofLevelSchema = createInsertSchema(projectRoofLevels).omit({ id: true });
 export const insertDropSchema = createInsertSchema(drops).omit({ id: true });
+export const insertReportIssueSchema = createInsertSchema(reportIssues).omit({ id: true });
 export const insertReportLibraryDocumentSchema = createInsertSchema(reportLibraryDocuments);
 export const insertProjectDocumentSchema = createInsertSchema(projectDocuments).omit({ id: true });
 export const insertReportLibraryPassageSchema = createInsertSchema(reportLibraryPassages);
@@ -332,6 +363,8 @@ export type InsertCustomDefectCategory = z.infer<typeof insertCustomDefectCatego
 export type ProjectRoofLevel = typeof projectRoofLevels.$inferSelect;
 export type InsertProjectRoofLevel = z.infer<typeof insertProjectRoofLevelSchema>;
 export type Drop = typeof drops.$inferSelect;
+export type ReportIssue = typeof reportIssues.$inferSelect;
+export type InsertReportIssue = z.infer<typeof insertReportIssueSchema>;
 export type InsertDrop = z.infer<typeof insertDropSchema>;
 export type ReportLibraryDocument = typeof reportLibraryDocuments.$inferSelect;
 export type InsertReportLibraryDocument = z.infer<typeof insertReportLibraryDocumentSchema>;

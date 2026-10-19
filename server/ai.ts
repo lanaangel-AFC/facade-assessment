@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { parseMatrix, matrixHasContent, buildInspectionText, inspectionTextToPlain, matrixDates } from "@shared/inspectionMatrix";
 import { storage, dataDir } from "./storage";
 import fs from "fs";
 import path from "path";
@@ -343,6 +344,49 @@ async function getTrainingExamples(outputType: string, limit: number = 3): Promi
   }
 }
 
+
+/**
+ * Report v2: spatial context so the AI understands where things are — the
+ * building's systems (in report order), roof-plan drops, access record and,
+ * for an observation, where its pins sit on the elevation drawings.
+ * Returns "" for legacy projects so their output is unchanged.
+ */
+async function buildSpatialContextBlock(projectId: number | null | undefined, observationId?: number): Promise<string> {
+  if (!projectId) return "";
+  const project: any = await storage.getProject(projectId);
+  if (!project || (project.reportVersion ?? 1) < 2) return "";
+  const lines: string[] = [];
+  const systems = (await storage.getSystemsByProject(projectId)).sort((a: any, b: any) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+  if (systems.length) {
+    lines.push("Façade systems (report order):");
+    for (const sy of systems) {
+      const desc = ((sy as any).aiDescription || "").replace(/\s+/g, " ").trim();
+      lines.push(`- ${sy.name} — ${sy.systemType}; ${sy.location}${desc ? `. ${desc.slice(0, 350)}${desc.length > 350 ? "…" : ""}` : ""}`);
+    }
+  }
+  let elevNames: string[] = [];
+  try { elevNames = JSON.parse(project.projectElevations || "[]"); } catch {}
+  if (elevNames.length) lines.push(`Elevations / areas used on this building: ${elevNames.join(", ")}.`);
+  const drops = await storage.getDropsByProject(projectId);
+  if (drops.length) lines.push(`Roof plan shows ${drops.length} abseil drop(s): ${drops.map((d: any) => d.dropNumber).join(", ")}.`);
+  const m = parseMatrix(project.inspectionMatrix);
+  if (m && matrixHasContent(m)) lines.push(`Inspection access record:\n${inspectionTextToPlain(buildInspectionText(m))}`);
+  if (observationId) {
+    const elevs = await storage.getElevationsByProject(projectId);
+    const where: string[] = [];
+    const third = (v: number, a: string, b: string, c: string) => (v < 3333 ? a : v < 6667 ? b : c);
+    for (const e of elevs) {
+      const pins = (await storage.getPinsByElevation(e.id)).filter((p: any) => p.observationId === observationId);
+      for (const p of pins) {
+        where.push(`${e.name} (${e.type === "roof_plan" ? "roof plan" : "elevation"}): ${third(p.y, "upper", "middle", "lower")} part, ${third(p.x, "left", "centre", "right")} of the drawing`);
+      }
+    }
+    if (where.length) lines.push(`This observation is pinned on: ${where.join("; ")}.`);
+  }
+  if (!lines.length) return "";
+  return `BUILDING LAYOUT CONTEXT (use to describe locations and arrangements accurately; do not list this back):\n${lines.join("\n")}\n\n`;
+}
+
 export async function identifySystem(photoIds: number[], projectContext: string = "", projectId?: number | null): Promise<{
   systemType: string;
   materials: { name: string; detail: string }[];
@@ -458,11 +502,15 @@ Related Systems: ${system.relatedSystems || "None noted"}
   const projectDocsBlock = await buildProjectDocumentsBlock(system.projectId);
 
   const hasPhotos = imageParts.length > 0;
-  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
+  const spatialBlock = await buildSpatialContextBlock((system as any).projectId);
+  const v2Photo = spatialBlock && hasPhotos ? `
+- PHOTOS ARE THE PRIMARY EVIDENCE OF ARRANGEMENT. Before writing, study every photo to work out how the system is put together: what sits above/below/beside what, how panels or units are framed and jointed, where the system meets adjacent systems (slab edges, roofs, podium, balconies), and any changes between levels or elevations. Describe the arrangement in that order so the observations section can refer back to it.
+- Describe only what can be seen or is stated; where a detail is inferred from a photo, say "appears to".` : "";
+  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}${spatialBlock}You are an expert facade engineer writing Section 3.2 (Facade Description) of an Australian facade condition assessment report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
-${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
+${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:${v2Photo}
 - Use a structured numbered/lettered list format, NOT flowing paragraphs.
 - Be concise. Elaborate on the information provided by the user, and${hasPhotos ? " use the photos (and the caption accompanying each) to identify additional details about the system (glazing type, retention method, frame finish, cladding material, jointing, etc.)." : " do not invent details not supported by the data."}
 - Use Australian facade engineering terminology.
@@ -633,20 +681,30 @@ Indicators Observed: ${indicators.join(", ") || "None specified"}${multiLocBlock
   const contextBlock = buildProjectContextBlock(projectContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(observation.projectId);
   const linkedObsBlock = await buildLinkedObservationsBlock(observationId, observation.projectId);
+  const spatialBlock = await buildSpatialContextBlock(observation.projectId, observationId);
+  const v2Obs = spatialBlock.length > 0 || (((await storage.getProject(observation.projectId)) as any)?.reportVersion ?? 1) >= 2;
 
-  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}${linkedObsBlock}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
+  const systemPrompt = `${contextBlock}${projectDocsBlock}${styleExamples}${linkedObsBlock}${spatialBlock}You are an expert facade engineer writing Section 4 (Observations) of an Australian facade condition assessment report.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 
 ${hasPhotos ? CAPTION_GUIDANCE + "\n\n" : ""}STYLE RULES:
 - Use numbered points with lettered sub-items (a, b, c) for details.
-- State what was observed, the likely cause, and the implication.
-- Use your expertise as a facade engineer to provide professional analysis: explain WHY defects occur, what mechanisms are at play (e.g. UV degradation, thermal cycling, moisture ingress), and what the consequences are if unaddressed.
+${v2Obs ? `- Lead with what was observed: what, where (elevation, level, drop) and how much. Be specific and factual.
+- Give a cause only where the evidence supports it; say "likely" or "possibly" where it is not certain. Do not invent a cause.
+- Mention a consequence only where it is material (safety, water ingress, loss of performance). Do not add a generic "if left unaddressed" line to every point.
+- Positive findings are fine (e.g. "The sealant joints were generally in good condition").` : `- State what was observed, the likely cause, and the implication.
+- Use your expertise as a facade engineer to provide professional analysis: explain WHY defects occur, what mechanisms are at play (e.g. UV degradation, thermal cycling, moisture ingress), and what the consequences are if unaddressed.`}
 - Use Australian facade engineering terminology.
 ${hasPhotos ? "- Analyse the attached photos (each preceded by its engineer-provided caption) to identify visible defects, their severity, and any additional details not captured in the field notes (e.g. extent of cracking, staining patterns, gasket condition, sealant failure mode). Treat captions as authoritative context." : ""}
 ${hasExisting ? "- The user has written an existing narrative. Incorporate their observations and commentary into the output — preserve their specific details, measurements, and wording where appropriate, while enriching with your technical analysis." : ""}${AFC_NARRATIVE_STYLE_RULES}
 
-FORMAT — follow this structure:
+${v2Obs ? `FORMAT — numbered key observations, with lettered sub-items only where they add detail:
+1. [Short statement of the issue and where]:
+   a. [Detail: extent, location, condition, cause or consequence where relevant]
+2. [Next point]
+Keep it brief; one point may be a single sentence.
+` : `FORMAT — follow this structure:
 Start with a brief opening line about the system condition, then numbered observations:
 
 1. [Defect type]:
@@ -656,7 +714,7 @@ Start with a brief opening line about the system condition, then numbered observ
 
 2. [Next defect if applicable]:
    a. [Details]
-
+`}
 EXAMPLE (from a real report):
 The WW facade system appears to be in generally good condition from a materials perspective. We have some concerns relating to its construction detailing.
 
@@ -823,7 +881,9 @@ Indicators: ${indicators.join(", ") || "None specified"}${multiLocBlock}
     ...imageParts,
   ];
 
-  const systemContent = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
+  const spatialBlockRec = await buildSpatialContextBlock(observation.projectId, observationId);
+  const recV2 = (((await storage.getProject(observation.projectId)) as any)?.reportVersion ?? 1) >= 2;
+  const systemContent = `${contextBlock}${spatialBlockRec}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing recommendations for a facade condition assessment CAPEX table.
 
 Use information from the project documents to inform your analysis. Do not cite documents inline — they will be listed as references in the report.
 ${hasPhotos ? "\n" + CAPTION_GUIDANCE + "\n" : ""}
@@ -855,7 +915,7 @@ STYLE RULES:
 - Scale the scope, budget, and timeframe to match the conservativeness level above.
 - Use Australian facade engineering terminology.
 
-Timeframe options: "Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"
+Timeframe options: ${recV2 ? '"Immediate", "Within 1 year", "Within 5 years", "Longer term", "Ongoing"' : '"Immediate", "3 months", "1 year", "2 years", "5 years", "10 years"'}
 Category options: "Essential", "Desirable", "Monitor"
 
 Respond ONLY with valid JSON:
@@ -1055,6 +1115,9 @@ export async function generateProjectIntroduction(projectId: number): Promise<st
 
   let dates: string[] = [];
   try { dates = JSON.parse(project.inspectionDates || "[]"); } catch {}
+  const parsedMatrix = parseMatrix((project as any).inspectionMatrix);
+  const inspMatrix = matrixHasContent(parsedMatrix) ? parsedMatrix : null;
+  if (inspMatrix) { const md = matrixDates(inspMatrix); if (md.length) dates = md; }
   let bgDocs: { title?: string; author?: string; date?: string }[] = [];
   try { bgDocs = JSON.parse(project.backgroundDocs || "[]"); } catch {}
 
@@ -1062,14 +1125,16 @@ export async function generateProjectIntroduction(projectId: number): Promise<st
 Building / Project: ${project.name}
 Address: ${project.address}
 Client: ${project.client}
-Inspector: ${project.inspector}
+Inspector: ${inspMatrix && inspMatrix.inspectors.length ? inspMatrix.inspectors.join(", ") : project.inspector}
 AFC Reference: ${project.afcReference || "Not specified"}
 Building Age: ${project.buildingAge || "Not specified"}
 Building Use: ${project.buildingUse || "Not specified"}
 Storeys: ${project.storeyCount || "Not specified"}
 Refurbishment History: ${project.refurbishmentHistory || "None noted"}
-Inspection Scope: ${project.inspectionScope || "Not specified"}
-Inspection Dates: ${dates.length > 0 ? dates.join(", ") : "Not specified"}
+Inspection Notes (inspector's raw notes — context only, do not reproduce): ${project.inspectionScope || "Not specified"}
+Inspection Dates: ${dates.length > 0 ? dates.join(", ") : "Not specified"}${inspMatrix ? `
+Inspection Record (already written verbatim in report section 2.2 — use for context; do not repeat it in the introduction):
+${inspectionTextToPlain(buildInspectionText(inspMatrix))}` : ""}
 Background Documents: ${bgDocs.length > 0 ? bgDocs.map(d => `${d.title || "Untitled"}${d.author ? " — " + d.author : ""}${d.date ? " (" + d.date + ")" : ""}`).join("; ") : "None"}
   `.trim();
 
@@ -1120,6 +1185,274 @@ STYLE RULES:
   return response.choices[0]?.message?.content?.trim() || "";
 }
 
+/**
+ * Report v2: writes 2.1 General (short engagement statement), 3.1 General
+ * background (history, FM statement, known incidents/works) and a 3.2 Location
+ * sentence, as one JSON response. Modelled on Lana's edited final reports.
+ */
+export async function generateIntroductionV2(projectId: number): Promise<{ general: string; background: string; location: string }> {
+  const client = await getClient();
+  const project = await storage.getProject(projectId);
+  if (!project) throw new Error("Project not found.");
+  const p: any = project;
+  const rawContext = (p.projectContext || "").trim();
+  const parsedMatrix = parseMatrix(p.inspectionMatrix);
+  const inspMatrix = matrixHasContent(parsedMatrix) ? parsedMatrix : null;
+
+  const meta = `
+Building / Project: ${project.name}
+Address: ${project.address}
+Client (engaged AFC): ${project.client}
+On behalf of: ${p.clientOnBehalfOf || "Not specified"}
+Assessment type: ${p.assessmentType === "due_diligence" ? "Due diligence" : "Condition assessment"}
+Purpose / specific aim (engineer's notes): ${p.inspectionPurpose || "Not specified"}
+Building Age: ${project.buildingAge || "Not specified"}
+Building Use: ${project.buildingUse || "Not specified"}
+Storeys: ${project.storeyCount || "Not specified"}
+Refurbishment History: ${project.refurbishmentHistory || "None noted"}
+Inspection Notes (context only): ${project.inspectionScope || "None"}${inspMatrix ? `
+Inspection Record (already in section 2.2 — do not repeat):
+${inspectionTextToPlain(buildInspectionText(inspMatrix))}` : ""}`.trim();
+
+  const styleQuery = `${project.name} ${project.address} ${project.buildingUse || ""} ${rawContext}`.trim();
+  const styleExamples = await getStyleExamples(styleQuery, "general", 2);
+  const projectContextBlock = buildProjectContextBlock(rawContext);
+  const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
+
+  const isDD = p.assessmentType === "due_diligence";
+  const systemContent = `${projectContextBlock}${projectDocsBlock}${styleExamples}You are Lana Angel of Angel Façade Consulting (AFC), writing three short parts of a façade ${isDD ? "due diligence" : "condition assessment"} report. Write in AFC's voice: plain, factual, first person plural ("we"), Australian English, no marketing language, no filler, no generic statements about the importance of façades or due diligence. Never invent facts — use only the metadata, project context, engineer's notes and project documents.
+
+PART 1 — "general" (report section 2.1 General). 2 to 3 sentences, 35-80 words. Exactly this content and nothing else:
+- Who engaged AFC (and on whose behalf, if known), to carry out ${isDD ? "a condition assessment of the building envelope for due diligence purposes" : "a condition assessment of the building envelope"} of [building name], [address].
+- The purpose of the inspection (one sentence). ${isDD ? 'Default: "We understand that the purpose of the inspection is for due diligence purposes."' : 'Default when no purpose is given: "The purpose of the inspection was for general maintenance and asset management purposes."'}
+- Optionally one sentence for a specific aim, only if the notes give one (e.g. "A specific aim was to ...").
+Do NOT include building history, dates, scope, access or findings in this part.
+Examples of the required length and tone:
+"Angel Façade Consulting (AFC) was engaged by JLL on behalf of their client Quintessential Real Estate to carry out a condition assessment of the building envelope of 240 Queen Street, Brisbane. The purpose of the inspection was for general maintenance and asset management purposes. A specific aim was to understand causal factors and extent of louvre blade detachment from level 4 and determine rectification measures."
+"Angel Façade Consulting (AFC) was engaged by JLL on behalf of their client the Owners to carry out a condition assessment of the building envelope of the Glassworks Building, 19 Harris Street, Pyrmont. We understand that this is the first such inspection since 2018."
+"Angel Façade Consulting (AFC) was engaged by CDC Property on behalf of their client to carry out a condition assessment of the building envelope of 32-36 York Street, Sydney. We understand that the purpose of the inspection is for due diligence purposes."
+
+PART 2 — "background" (report section 3.1 General background). 1 to 3 short paragraphs, 60-220 words, covering only what is known:
+- Building character, original construction date/name, height/storeys, use, notable construction features.
+- Known refurbishment history and who carried it out.
+- A statement on the facility manager (FM) where the notes mention one: who they are, how long they have been involved with the building, what they advised (e.g. leak locations, planned works), and any limits to their knowledge.
+- Other specific known history: incidents (e.g. detached components), previous reports and their findings, planned or imminent works and how they relate to the façade.
+Example:
+"240 Queen Street is an A-Grade commercial office tower located in Brisbane's CBD. Originally completed in 1989 as the Commonwealth Bank Building, the tower stands approximately 120 metres tall with 27 storeys. The structure is characterised by its all-concrete construction and a curved street elevation.
+
+We understand the Lobby is about to go through upgrade works; we are not aware whether these works will extend to the refurbishment of the overhead skylights."
+"The facility manager, Shelley Shaghayeghi, had been involved with the building for around 6 months at the time of the inspection and as such her knowledge of the building in general terms was limited. Notwithstanding, Shelley outlined the location and extent of planned Lobby works, and leak locations at level 18."
+
+PART 3 — "location" (report section 3.2 Location, shown above the site plan with drop locations). 1 to 2 sentences: "The Property is located at [address]." plus the bounding streets and site access ONLY if stated in the notes or documents. Example: "The Property is located at 240 Queen Street, Brisbane. It is bounded by Queen Street to the southeast and Edward Street to the southwest."
+
+Respond ONLY with JSON: {"general": "...", "background": "...", "location": "..."}. Use "\\n\\n" between paragraphs.`;
+
+  const userContent = `Project metadata:\n\n${meta}\n\n${rawContext ? `ENGINEER'S PROJECT CONTEXT NOTES:\n${rawContext}` : "(No project context notes provided.)"}`;
+  logTokenBreakdown("generateIntroductionV2", {
+    context: countTokens(projectContextBlock),
+    docs: countTokens(projectDocsBlock),
+    exemplars: countTokens(styleExamples),
+    user: countTokens(userContent),
+  }, 0);
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: 900,
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+  } as any);
+
+  const raw = response.choices[0]?.message?.content?.trim() || "{}";
+  let out: any = {};
+  try { out = JSON.parse(raw); } catch { out = { general: raw }; }
+  return {
+    general: String(out.general || "").trim(),
+    background: String(out.background || "").trim(),
+    location: String(out.location || "").trim(),
+  };
+}
+
+// ===== v2 Report Issues =====
+
+async function describeObservationsForIssues(projectId: number, onlyIds?: number[]) {
+  const systems = await storage.getSystemsByProject(projectId);
+  const all = await storage.getObservationsByProject(projectId);
+  const recs = await storage.getRecommendationsByProject(projectId);
+  const list = onlyIds ? all.filter(o => onlyIds.includes(o.id)) : all;
+  return list.map(o => {
+    const sys = systems.find(sy => sy.id === o.systemId);
+    const r = recs.filter(rc => rc.observationId === o.id);
+    const narrative = [o.fieldNote, o.aiNarrative].filter(Boolean).join(" | ").replace(/\s+/g, " ").trim();
+    return {
+      id: o.id,
+      ref: o.observationId,
+      system: sys?.name || "",
+      location: o.location,
+      defect: o.defectCategory,
+      severity: o.severity,
+      extent: o.extent || "",
+      grid: [o.gridElevation, o.gridLevel, o.gridDrop ? `drop ${o.gridDrop}` : ""].filter(Boolean).join(", "),
+      notes: narrative.slice(0, onlyIds ? 1500 : 300),
+      recommendations: r.map(rc => `${rc.action} (${rc.timeframe}; ${rc.budgetEstimate || "no budget"})`),
+    };
+  });
+}
+
+/** AI proposes a ranked list of issues grouping observations across systems. */
+export async function suggestIssues(projectId: number): Promise<{ title: string; steer: string; observationIds: number[] }[]> {
+  const client = await getClient();
+  const project = await storage.getProject(projectId);
+  if (!project) throw new Error("Project not found.");
+  const obs = await describeObservationsForIssues(projectId);
+  if (!obs.length) throw new Error("Add observations before asking for suggested issues.");
+  const existing = await storage.getIssuesByProject(projectId);
+  const taken = new Set<number>();
+  for (const iss of existing) { try { for (const id of JSON.parse(iss.observationIds || "[]")) taken.add(id); } catch {} }
+  const pool = obs.filter(o => !taken.has(o.id));
+  if (!pool.length) throw new Error("All observations are already assigned to an issue.");
+  const spatial = await buildSpatialContextBlock(projectId);
+
+  const system = `${buildProjectContextBlock((project as any).projectContext)}${spatial}You are Lana Angel of Angel Façade Consulting, planning Section 4 (Observations) of a façade report. Section 4 is organised by ISSUE, not by system, in priority order. Group the observations below into issues.
+
+RULES:
+- Order issues by importance: safety/risk first, then items most likely to cause damage or cost (water ingress, structural, high budget), then general condition items, then minor/maintenance items.
+- An issue may draw observations from several systems (e.g. "Water ingress" combining a skylight leak and glazing head leaks).
+- Titles are short and plain, like a report heading: "Loose and detaching louvres", "Deteriorated parapet-mounted lightbox", "Water ingress", "Concrete panels", "Main roof, levels 27 - 28", "Ground level awnings".
+- Use 3-10 issues. Minor leftover items can go in a final issue such as "Miscellaneous items".
+- Every observation id must appear in exactly one issue.
+- "steer" is one short sentence telling the writer what to lead with (e.g. "Lead with the safety risk of further detachment above the Level 3 terrace.").
+Respond ONLY with JSON: {"issues": [{"title": "...", "steer": "...", "observationIds": [numbers]}]}.`;
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: `Observations:\n${JSON.stringify(pool, null, 1)}` },
+    ],
+    max_tokens: 1500,
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+  } as any);
+  let parsed: any = {};
+  try { parsed = JSON.parse(response.choices[0]?.message?.content || "{}"); } catch {}
+  const valid = new Set(pool.map(o => o.id));
+  const used = new Set<number>();
+  const out: { title: string; steer: string; observationIds: number[] }[] = [];
+  for (const it of parsed.issues || []) {
+    const ids = (it.observationIds || []).map(Number).filter((n: number) => valid.has(n) && !used.has(n));
+    ids.forEach((n: number) => used.add(n));
+    if (!ids.length || !String(it.title || "").trim()) continue;
+    out.push({ title: String(it.title).trim(), steer: String(it.steer || "").trim(), observationIds: ids });
+  }
+  const left = pool.filter(o => !used.has(o.id)).map(o => o.id);
+  if (left.length) out.push({ title: "Miscellaneous items", steer: "", observationIds: left });
+  return out;
+}
+
+const ISSUE_EXAMPLE = `4.2.2 Level 5 louvres
+The louvre system on Level 5 exhibits significant safety and compliance issues, with defects observed at multiple locations across the building.
+1. Displaced and detaching louvres:
+   a. Several louvres are visibly displaced, with some at risk of imminent detachment, particularly above tenant-accessible balconies, creating a potential flying-debris hazard in high winds.
+   b. The displacement is attributed primarily to failed or missing fixings, compounded by limited safe access for routine maintenance.
+2. Corrosion and fixing integrity:
+   a. General pitting corrosion is evident across the louvre blades but is not concentrated at the fixings, indicating that compatible fixing materials have been used and that bimetallic (galvanic) corrosion is not the cause.
+   b. The corrosion instead reflects environmental exposure combined with inadequate maintenance — notably the build-up of moisture-retaining dirt that is not regularly cleaned.
+
+4.2.3 Roof level louvres to transformer access doors
+The roof parapet louvre doors exhibit several safety and compliance issues that require immediate attention.
+1. Missing, loose and inadequately fixed louvres:
+   a. Several louvres have been removed, leaving the underlying framing exposed, with corroded or failed fixings still visible. Of the louvres remaining, most have at least three fixings but some have only two, reducing their stability.
+   b. Missing and under-fixed louvres present a flying-debris hazard in high winds. Urgent removal or refixing is required.
+2. Localised replacement with galvanised steel cladding:
+   a. On one of the door panels, the louvres have been replaced with galvanised steel cladding fixed with tech screws.
+   b. Considering the louvres are aesthetic only, this is a good solution that removes the risk of future detachments and ongoing maintenance.`;
+
+/** AI writes one issue: brief summary (3-5 sentences, with severity) + numbered key observations. */
+export async function writeIssue(issueId: number): Promise<{ summary: string; keyObservations: string }> {
+  const client = await getClient();
+  const issue = await storage.getIssue(issueId);
+  if (!issue) throw new Error("Issue not found.");
+  const project = await storage.getProject(issue.projectId);
+  if (!project) throw new Error("Project not found.");
+  let ids: number[] = [];
+  try { ids = JSON.parse(issue.observationIds || "[]"); } catch {}
+  if (!ids.length) throw new Error("Link at least one observation to this issue first.");
+  const obs = await describeObservationsForIssues(issue.projectId, ids);
+  const issueRecs = (await storage.getRecommendationsByProject(issue.projectId)).filter(r => (r as any).issueId === issue.id);
+
+  // Photos: the ones chosen for the issue, else the observations' photos (capped).
+  let photoIds: number[] = [];
+  try { photoIds = JSON.parse(issue.photoIds || "[]"); } catch {}
+  const obsPhotos = (await Promise.all(ids.map(id => storage.getPhotosByObservation(id)))).flat();
+  const chosen = photoIds.length ? obsPhotos.filter(p => photoIds.includes(p.id)) : obsPhotos;
+  const imageParts = await buildCaptionedImageParts(chosen, 6);
+
+  const spatial = await buildSpatialContextBlock(issue.projectId);
+  const pinLines: string[] = [];
+  for (const id of ids) {
+    const b = await buildSpatialContextBlock(issue.projectId, id);
+    const m = b.match(/This observation is pinned on: ([^\n]+)/);
+    const o = obs.find(x => x.id === id);
+    if (m && o) pinLines.push(`${o.ref}: ${m[1]}`);
+  }
+  const styleExamples = await getStyleExamples(`${issue.title} ${obs.map(o => o.defect).join(" ")}`, "narrative", 2);
+  const docs = await buildProjectDocumentsBlock(issue.projectId);
+
+  const system = `${buildProjectContextBlock((project as any).projectContext)}${docs}${spatial}${styleExamples}You are Lana Angel of Angel Façade Consulting writing one issue in Section 4 (Observations) of a façade report. Write in her voice: plain, factual, specific, Australian English, first person plural where needed ("we observed"). No filler or generic statements.
+
+Write two parts:
+1. "summary": 3-5 sentences. Say what the issue is, where and how widespread, and how serious it is (state the severity plainly, e.g. "This is a safety item requiring immediate attention" or "These are maintenance items only"). Mention known background (incidents, FM advice, previous reports) only if in the data.
+2. "keyObservations": a numbered list ("1. Heading:" then lettered sub-points "   a. ..."). Each numbered point is one distinct finding. Sub-points cover what was observed and where (elevation, level, drop, pin), the likely cause ONLY where the evidence supports it, and the consequence ONLY where material. Do not add a generic "if left unaddressed" line to every point. Positive findings are fine. Where photos show something, refer to it concretely. Do not repeat the summary.
+Do not include budgets. Do not invent facts, counts or locations.
+${imageParts.length ? CAPTION_GUIDANCE : ""}
+
+EXAMPLE OF THE REQUIRED STYLE (from a past AFC report):
+${ISSUE_EXAMPLE}
+
+Respond ONLY with JSON: {"summary": "...", "keyObservations": "..."} (use \\n for line breaks).`;
+
+  const user = `Issue title: ${issue.title}
+Engineer's steer: ${issue.steer || "(none)"}
+${pinLines.length ? `Pin locations:\n${pinLines.join("\n")}\n` : ""}${issueRecs.length ? `Issue-level recommendations: ${issueRecs.map(r => r.action).join("; ")}\n` : ""}
+Observations in this issue:
+${JSON.stringify(obs, null, 1)}`;
+
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: imageParts.length ? [{ type: "text", text: user }, ...imageParts] : user },
+    ],
+    max_tokens: 1400,
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+  } as any);
+  let parsed: any = {};
+  try { parsed = JSON.parse(response.choices[0]?.message?.content || "{}"); } catch {}
+  return { summary: String(parsed.summary || "").trim(), keyObservations: String(parsed.keyObservations || "").trim() };
+}
+
+/** 4.1 Overview — one paragraph summarising the issues in order. */
+export async function writeObservationsOverview(projectId: number): Promise<string> {
+  const client = await getClient();
+  const issues = (await storage.getIssuesByProject(projectId)).filter(i => !i.parentId);
+  if (!issues.length) throw new Error("Add issues first.");
+  const lines = issues.map((i, n) => `${n + 1}. ${i.title}: ${(i.summary || i.steer || "").slice(0, 400)}`);
+  const response = await callOpenAIChat(client, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: `You are Lana Angel of Angel Façade Consulting. Write the "4.1 Overview" paragraph of Section 4: 2-4 sentences giving the overall condition of the façade and naming the key items in priority order. Plain, factual, Australian English. Example: "The facades of both the tower and the podium are largely in very good condition considering the age of the property. The key items are detachment of the louvres from Level 5, generally deteriorated condition of the concrete panel joint sealants (which may lead to water ingress), ongoing and persistent water ingress into the Lobby from its glazed skylight and a small number of miscellaneous safety-related observations that require attention." Return only the paragraph.` },
+      { role: "user", content: lines.join("\n") },
+    ],
+    max_tokens: 300,
+    temperature: 0.3,
+  });
+  return response.choices[0]?.message?.content?.trim() || "";
+}
+
 export async function generateExecutiveSummary(projectId: number): Promise<string> {
   const client = await getClient();
   const project = await storage.getProject(projectId);
@@ -1166,7 +1499,7 @@ Summary Statistics:
 - Safety/Risk items: ${safetyItems}
 - Essential items: ${essentialItems}
 - Total recommendations: ${allRecommendations.length}
-- Approximate total CAPEX: $${totalBudget.toLocaleString() || "TBC"}
+- Approximate total works budget: $${totalBudget.toLocaleString() || "TBC"}
   `.trim();
 
   const trainingExamples = await getTrainingExamples("executive_summary");
@@ -1174,6 +1507,43 @@ Summary Statistics:
   const styleExamples = await getStyleExamples(styleQuery, "general", 2);
   const contextBlock = buildProjectContextBlock((project as any).projectContext);
   const projectDocsBlock = await buildProjectDocumentsBlock(projectId);
+
+  const v2 = ((project as any).reportVersion ?? 1) >= 2;
+  const isDD = (project as any).assessmentType === "due_diligence";
+  if (v2) {
+    const v2Prompt = `${contextBlock}${projectDocsBlock}${styleExamples}You are Lana Angel of Angel Façade Consulting (AFC) writing Section 1 (Executive Summary) of an Australian ${isDD ? "façade due diligence" : "façade condition assessment"} report. Plain, factual, first person plural ("we"), Australian English. No filler, no generic statements.
+
+FORMAT (use these exact headings, each on its own line):
+[1-2 sentence opening: what AFC assessed and the overall condition in one plain statement]
+
+Safety and Risk items
+1. [Each Safety/Risk item: what and where, in one or two sentences, with counts/locations where known]
+
+Other key findings
+1. [The most significant non-safety findings, most important first; positive findings may be included where they matter]
+
+Major recommendations
+1. [Concise action, most urgent first; note the timeframe in brackets where useful, e.g. "(immediate)", "(within 5 years)"]
+
+RULES:
+- If there are no Safety/Risk items, write "No safety or risk items were identified." under that heading.
+- Do not repeat the same item under more than one heading.
+- Do not include budget figures — a Works BUDGET table follows the summary.
+- Only state facts from the data. Do not speculate on causes unless the data states them.
+- Total length 150-350 words.
+Return ONLY the executive summary text.${trainingExamples}`;
+    const userContentV2 = `Generate an executive summary for this assessment:\n\n${context}`;
+    const responseV2 = await callOpenAIChat(client, {
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: v2Prompt },
+        { role: "user", content: userContentV2 },
+      ],
+      max_tokens: 800,
+      temperature: 0.3,
+    });
+    return responseV2.choices[0]?.message?.content?.trim() || "";
+  }
 
   const systemContent = `${contextBlock}${projectDocsBlock}${styleExamples}You are an expert facade engineer writing Section 1 (Executive Summary) of an Australian facade condition assessment report.
 
