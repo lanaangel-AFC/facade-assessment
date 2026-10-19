@@ -15,6 +15,7 @@ import {
   type CustomDefectCategory, type InsertCustomDefectCategory, customDefectCategories,
   type ProjectRoofLevel, type InsertProjectRoofLevel, projectRoofLevels,
   type Drop, type InsertDrop, drops,
+  type ReportIssue, type InsertReportIssue, reportIssues,
   type ReportLibraryDocument, type InsertReportLibraryDocument, reportLibraryDocuments,
   type ReportLibraryPassage, type InsertReportLibraryPassage, reportLibraryPassages,
   type ObservationLocation, type InsertObservationLocation, observationLocations,
@@ -298,6 +299,36 @@ try {
 // Observation completion timestamp on projects (Feature 2 — used to auto-feed
 // finalised narratives into the Report Library)
 try { sqlite.exec(`ALTER TABLE projects ADD COLUMN completed_at TEXT DEFAULT ''`); } catch {}
+// Inspection matrix (structured 2.2 Inspection data)
+try { sqlite.exec(`ALTER TABLE projects ADD COLUMN inspection_matrix TEXT DEFAULT ''`); } catch {}
+// Report v2 (Stage 1) columns
+for (const sql of [
+  `ALTER TABLE projects ADD COLUMN report_version INTEGER DEFAULT 1`,
+  `ALTER TABLE projects ADD COLUMN assessment_type TEXT DEFAULT 'condition'`,
+  `ALTER TABLE projects ADD COLUMN report_title TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN client_on_behalf_of TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN inspection_purpose TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN ai_background TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN location_description TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN references_intro TEXT DEFAULT ''`,
+  `ALTER TABLE facade_systems ADD COLUMN report_heading TEXT DEFAULT ''`,
+  `ALTER TABLE photos ADD COLUMN include_in_report INTEGER DEFAULT 0`,
+  `ALTER TABLE recommendations ADD COLUMN issue_id INTEGER`,
+  `ALTER TABLE projects ADD COLUMN observations_overview TEXT DEFAULT ''`,
+  `CREATE TABLE IF NOT EXISTS report_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    sort_order INTEGER DEFAULT 0,
+    title TEXT NOT NULL,
+    steer TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    key_observations TEXT DEFAULT '',
+    observation_ids TEXT DEFAULT '[]',
+    photo_ids TEXT DEFAULT '[]',
+    created_at TEXT NOT NULL
+  )`,
+]) { try { sqlite.exec(sql); } catch {} }
 
 // Auto-ingested-passage tracking fields on report_library_passages (Feature 2)
 try { sqlite.exec(`ALTER TABLE report_library_passages ADD COLUMN source_project_id INTEGER`); } catch {}
@@ -509,6 +540,7 @@ export interface IStorage {
   getPhotosByObservation(observationId: number): Promise<Photo[]>;
   createPhoto(photo: InsertPhoto): Promise<Photo>;
   updatePhotoCaption(id: number, caption: string): Promise<Photo | undefined>;
+  updatePhotoInclude(id: number, include: number): Promise<Photo | undefined>;
   deletePhoto(id: number): Promise<Photo | undefined>;
 }
 
@@ -590,6 +622,7 @@ export class DatabaseStorage implements IStorage {
     db.delete(recommendations).where(eq(recommendations.projectId, id)).run();
     db.delete(facadeSystems).where(eq(facadeSystems.projectId, id)).run();
     db.delete(drops).where(eq(drops.projectId, id)).run();
+    db.delete(reportIssues).where(eq(reportIssues.projectId, id)).run();
     db.delete(observationGroups).where(eq(observationGroups.projectId, id)).run();
     db.delete(customIndicators).where(eq(customIndicators.projectId, id)).run();
     db.delete(customDefectCategories).where(eq(customDefectCategories.projectId, id)).run();
@@ -846,6 +879,10 @@ export class DatabaseStorage implements IStorage {
   async updatePhotoCaption(id: number, caption: string): Promise<Photo | undefined> {
     return db.update(photos).set({ caption }).where(eq(photos.id, id)).returning().get();
   }
+  async updatePhotoInclude(id: number, include: number): Promise<Photo | undefined> {
+    return db.update(photos).set({ includeInReport: include } as any).where(eq(photos.id, id)).returning().get();
+  }
+
   async deletePhoto(id: number): Promise<Photo | undefined> {
     const photo = db.select().from(photos).where(eq(photos.id, id)).get();
     if (photo) {
@@ -993,6 +1030,27 @@ export class DatabaseStorage implements IStorage {
   }
   async deleteProjectRoofLevel(id: number): Promise<void> {
     db.delete(projectRoofLevels).where(eq(projectRoofLevels.id, id)).run();
+  }
+
+  // v2 Report Issues
+  async getIssuesByProject(projectId: number): Promise<ReportIssue[]> {
+    return db.select().from(reportIssues).where(eq(reportIssues.projectId, projectId)).all()
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+  }
+  async getIssue(id: number): Promise<ReportIssue | undefined> {
+    return db.select().from(reportIssues).where(eq(reportIssues.id, id)).get();
+  }
+  async createIssue(data: InsertReportIssue): Promise<ReportIssue> {
+    return db.insert(reportIssues).values(data).returning().get();
+  }
+  async updateIssue(id: number, data: Partial<InsertReportIssue>): Promise<ReportIssue | undefined> {
+    return db.update(reportIssues).set(data).where(eq(reportIssues.id, id)).returning().get();
+  }
+  async deleteIssue(id: number): Promise<void> {
+    // children become top-level; issue-level recommendations are removed
+    db.update(reportIssues).set({ parentId: null }).where(eq(reportIssues.parentId, id)).run();
+    db.delete(recommendations).where(eq(recommendations.issueId, id)).run();
+    db.delete(reportIssues).where(eq(reportIssues.id, id)).run();
   }
 
   // Drops (roof plan markers)

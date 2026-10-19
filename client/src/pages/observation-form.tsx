@@ -1,4 +1,5 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
+import { TIMEFRAMES as V2_TIMEFRAMES, isV2 } from "@shared/reportV2";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import { Link, useParams, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,7 @@ const PHOTO_SLOTS = [
 
 type SlotKey = typeof PHOTO_SLOTS[number]["key"];
 
-const TIMEFRAMES = ["Now", "1 year", "2 years", "5 years", "Prior to leasing"];
+const LEGACY_TIMEFRAMES = ["Now", "1 year", "2 years", "5 years", "Prior to leasing"];
 const REC_CATEGORIES = ["Essential", "Desirable", "Monitor"];
 
 export default function ObservationForm() {
@@ -1730,7 +1731,7 @@ export default function ObservationForm() {
                       <SelectValue placeholder="Select timeframe" />
                     </SelectTrigger>
                     <SelectContent>
-                      {TIMEFRAMES.map((t) => (
+                      {(projectData && isV2(projectData as any) ? V2_TIMEFRAMES : LEGACY_TIMEFRAMES).map((t) => (
                         <SelectItem key={t} value={t}>{t}</SelectItem>
                       ))}
                     </SelectContent>

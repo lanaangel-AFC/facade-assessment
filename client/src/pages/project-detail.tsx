@@ -1,4 +1,5 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
+import { isV2 } from "@shared/reportV2";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import { Link, useParams, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
@@ -24,12 +25,15 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft, Plus, ChevronRight, Trash2, X,
   MapPin, Building, Eye, Layers, DollarSign,
-  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList, Download, Camera,
-} from "lucide-react";
+  FileText, Calendar, Sparkles, Loader2, Image as ImageIcon, Upload, CheckCircle2, ClipboardList, Download, Camera, ListOrdered } from "lucide-react";
 import type { Project, FacadeSystem, Observation, Recommendation, Elevation } from "@shared/schema";
 import { useState, useEffect, useCallback, useRef } from "react";
 import RoofPlanMarkup from "@/components/roof-plan-markup";
 import ProjectDataTab from "@/components/ProjectDataTab";
+import InspectionMatrixCard from "@/components/InspectionMatrixCard";
+import SystemsReportList from "@/components/SystemsReportList";
+import IssuesTab from "@/components/IssuesTab";
+import { ReportTypeCard, IntroBackgroundCard, ReferencesIntroField, LimitationsV2Card } from "@/components/ReportV2Cards";
 
 const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -55,7 +59,7 @@ const COMMON_LIMITATIONS = [
   "Heritage listing constraints limit intrusive investigation",
 ];
 
-const VALID_TABS = ["overview", "systems", "elevations", "observations", "project-data", "capex"] as const;
+const VALID_TABS = ["overview", "systems", "elevations", "observations", "issues", "project-data", "capex"] as const;
 type TabValue = typeof VALID_TABS[number];
 
 const readTabFromUrl = (): TabValue => {
@@ -93,6 +97,7 @@ export default function ProjectDetail() {
   const { data: project, isLoading: projectLoading } = useQuery<Project>({
     queryKey: ["/api/projects", id],
   });
+  const v2 = isV2(project as any);
 
   const { data: systems } = useQuery<FacadeSystem[]>({
     queryKey: [`/api/projects/${id}/systems`],
@@ -214,16 +219,20 @@ export default function ProjectDetail() {
     },
   });
 
+  // Pending edits are merged so quick edits to different fields are all saved.
+  const pendingSave = useRef<Partial<Project>>({});
   const autoSave = useCallback((data: Partial<Project>) => {
+    pendingSave.current = { ...pendingSave.current, ...data };
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      updateMutation.mutate(data);
+      const payload = pendingSave.current;
+      pendingSave.current = {};
+      updateMutation.mutate(payload);
     }, 800);
   }, [id]);
 
   const updateField = (field: string, value: string) => {
-    const updated = { ...editForm, [field]: value };
-    setEditForm(updated);
+    setEditForm(prev => ({ ...prev, [field]: value }));
     autoSave({ [field]: value });
   };
 
@@ -348,7 +357,7 @@ export default function ProjectDetail() {
       <div className="flex items-center justify-between mb-1">
         <h1 className="text-xl font-semibold tracking-tight">{project.name}</h1>
         <div className="flex gap-2">
-          {project.inspectionStatus === "complete" ? (
+          {v2 ? null : project.inspectionStatus === "complete" ? (
             <Link href={`/projects/${id}/groups`}>
               <Button variant="outline" size="sm">
                 <ClipboardList className="w-4 h-4 mr-2" />
@@ -369,7 +378,7 @@ export default function ProjectDetail() {
           <Link href={`/projects/${id}/capex`}>
             <Button variant="outline" size="sm">
               <DollarSign className="w-4 h-4 mr-2" />
-              Edit CAPEX
+              {isV2(project as any) ? "Edit Works BUDGET" : "Edit CAPEX"}
             </Button>
           </Link>
           <Button
@@ -473,13 +482,19 @@ export default function ProjectDetail() {
             <Eye className="w-4 h-4" />
             Observations
           </TabsTrigger>
+          {v2 && (
+            <TabsTrigger value="issues" className="gap-1.5" data-testid="tab-issues">
+              <ListOrdered className="w-4 h-4" />
+              Issues
+            </TabsTrigger>
+          )}
           <TabsTrigger value="project-data" className="gap-1.5">
             <ClipboardList className="w-4 h-4" />
             Project Data
           </TabsTrigger>
           <TabsTrigger value="capex" className="gap-1.5">
             <DollarSign className="w-4 h-4" />
-            CAPEX
+            {isV2(project as any) ? "Works BUDGET" : "CAPEX"}
           </TabsTrigger>
         </TabsList>
 
@@ -525,6 +540,8 @@ export default function ProjectDetail() {
               />
             </Card>
 
+            {v2 && <ReportTypeCard form={editForm as any} updateField={updateField} />}
+
             <Card className="p-4 space-y-4">
               <h3 className="text-sm font-medium">Project Details</h3>
               <div className="grid grid-cols-2 gap-4">
@@ -541,7 +558,7 @@ export default function ProjectDetail() {
                   <Input value={editForm.client || ""} onChange={e => updateField("client", e.target.value)} />
                 </div>
                 <div>
-                  <Label>Inspector</Label>
+                  <Label>Inspector (cover page contact)</Label>
                   <Input value={editForm.inspector || ""} onChange={e => updateField("inspector", e.target.value)} />
                 </div>
                 <div>
@@ -575,12 +592,15 @@ export default function ProjectDetail() {
                 />
               </div>
               <div>
-                <Label>Inspection Scope</Label>
+                <Label>Inspection Notes (read by AI only)</Label>
+                <p className="text-xs text-muted-foreground mb-1">
+                  Raw site notes for the AI. Not printed in the report once the Inspection matrix below has been filled in.
+                </p>
                 <Textarea
                   value={editForm.inspectionScope || ""}
                   onChange={e => updateField("inspectionScope", e.target.value)}
                   rows={2}
-                  placeholder="Scope of facade inspection..."
+                  placeholder="e.g. TTW numbered pins differently; FM advised leaks at Level 18..."
                 />
               </div>
             </Card>
@@ -621,9 +641,27 @@ export default function ProjectDetail() {
               />
             </Card>
 
+            {v2 && (
+              <IntroBackgroundCard
+                form={editForm as any}
+                updateField={updateField}
+                onGenerate={async () => {
+                  try {
+                    const res = await aiRequest("/api/ai/generate-introduction", { projectId: Number(id) });
+                    const data = await res.json();
+                    setEditForm(prev => ({ ...prev, aiIntroduction: data.introduction, aiBackground: data.background, locationDescription: data.location } as any));
+                    queryClient.invalidateQueries({ queryKey: ["/api/projects", id] });
+                    toast({ title: "Introduction and background generated — review and edit" });
+                  } catch (err: any) {
+                    toast({ title: err.message || "Generation failed", variant: "destructive" });
+                  }
+                }}
+              />
+            )}
+
             {/* AI-Generated Introduction — polished Background/Introduction
                 section, used in the Word export's section 2.1. */}
-            <Card className="p-4 space-y-3">
+            {!v2 && <Card className="p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <div>
                   <h3 className="text-sm font-medium flex items-center gap-2">
@@ -669,7 +707,7 @@ export default function ProjectDetail() {
                 rows={8}
                 placeholder="Click 'Generate Introduction' to have AI rewrite your Project Context above into a polished AFC-style Background/Introduction section."
               />
-            </Card>
+            </Card>}
 
             {/* Building Elevations */}
             <Card className="p-4 space-y-3">
@@ -725,46 +763,14 @@ export default function ProjectDetail() {
               </div>
             </Card>
 
-            {/* Inspection Dates */}
-            <Card className="p-4 space-y-3">
-              <h3 className="text-sm font-medium">Inspection Dates</h3>
-              {inspectionDates.map((date, idx) => (
-                <div key={idx} className="flex items-center gap-2">
-                  <Input
-                    type="date"
-                    value={date}
-                    onChange={e => {
-                      const updated = [...inspectionDates];
-                      updated[idx] = e.target.value;
-                      saveDates(updated);
-                    }}
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => {
-                      const updated = inspectionDates.filter((_, i) => i !== idx);
-                      saveDates(updated);
-                    }}
-                  >
-                    <X className="w-4 h-4" />
-                  </Button>
-                </div>
-              ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => saveDates([...inspectionDates, new Date().toISOString().split("T")[0]])}
-              >
-                <Plus className="w-4 h-4 mr-1" />
-                Add Date
-              </Button>
-            </Card>
+            {/* Inspection — structured matrix (exports as report section 2.2) */}
+            {project && <InspectionMatrixCard project={project} />}
 
             {/* Limitations */}
-            <Card className="p-4 space-y-3">
+            {v2 && project && (
+              <LimitationsV2Card raw={project.limitations} onSave={(json) => autoSave({ limitations: json } as any)} />
+            )}
+            {!v2 && <Card className="p-4 space-y-3">
               <h3 className="text-sm font-medium">Limitations</h3>
               {limitations.map((lim, idx) => (
                 <div key={idx} className="flex items-center gap-2">
@@ -808,11 +814,12 @@ export default function ProjectDetail() {
                 <Plus className="w-4 h-4 mr-1" />
                 Add Custom Limitation
               </Button>
-            </Card>
+            </Card>}
 
             {/* Background Documents */}
             <Card className="p-4 space-y-3">
-              <h3 className="text-sm font-medium">Background Documents Register</h3>
+              <h3 className="text-sm font-medium">{v2 ? "2.3 Background information (references)" : "Background Documents Register"}</h3>
+              {v2 && <ReferencesIntroField form={editForm as any} updateField={updateField} />}
               {backgroundDocs.map((doc, idx) => (
                 <div key={idx} className="flex items-center gap-2">
                   <Input
@@ -883,6 +890,8 @@ export default function ProjectDetail() {
               <Layers className="w-10 h-10 text-muted-foreground/40 mb-3" />
               <p className="text-sm text-muted-foreground">No facade systems defined yet.</p>
             </div>
+          ) : v2 ? (
+            <SystemsReportList projectId={Number(id)} systems={systems} onDelete={(sid) => deleteSystemMutation.mutate(sid)} />
           ) : (
             <div className="space-y-3">
               {systems.map((sys) => (
@@ -1190,10 +1199,22 @@ export default function ProjectDetail() {
           <ProjectDataTab projectId={Number(id)} />
         </TabsContent>
 
+        {v2 && (
+          <TabsContent value="issues">
+            <IssuesTab
+              projectId={Number(id)}
+              systems={systems || []}
+              observations={observations || []}
+              recommendations={allRecommendations || []}
+              overview={(project as any).observationsOverview || ""}
+            />
+          </TabsContent>
+        )}
+
         {/* === CAPEX TAB === */}
         <TabsContent value="capex">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-medium">Capital Expenditure Summary</h2>
+            <h2 className="text-lg font-medium">{v2 ? "Works BUDGET Summary" : "Capital Expenditure Summary"}</h2>
             <Link href={`/projects/${id}/capex`}>
               <Button size="sm" variant="outline">
                 <DollarSign className="w-4 h-4 mr-2" />

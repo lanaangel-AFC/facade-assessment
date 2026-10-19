@@ -1,7 +1,13 @@
 import type { Express } from "express";
 import express from "express";
 import { registerDictationRoutes } from "./word-library";
+import { parseMatrix, matrixHasContent, buildInspectionText, emptyMatrix, DEFAULT_INSPECTOR } from "@shared/inspectionMatrix";
+import {
+  REPORT_VERSION_CURRENT, isV2, STANDARD_LIMITATIONS, REFERENCES_INTRO_PRESETS, parseLimitations, stripBrackets,
+  reportTitleOf, timeframeRank, isWithinOneYear, parseBudget, parseBudgetRange, formatMoney, TIMEFRAME_GROUP_LABELS, assessmentPhrase,
+} from "@shared/reportV2";
 import { createServer, type Server } from "http";
+import type { ReportIssue } from "@shared/schema";
 import { storage, dataDir } from "./storage";
 import {
   insertProjectSchema,
@@ -19,6 +25,10 @@ import {
   generateExecutiveSummary,
   generateGroupNarrative,
   generateProjectIntroduction,
+  generateIntroductionV2,
+  suggestIssues,
+  writeIssue,
+  writeObservationsOverview,
 } from "./ai";
 import multer from "multer";
 import path from "path";
@@ -183,7 +193,17 @@ export async function registerRoutes(
   });
 
   app.post("/api/projects", async (req, res) => {
-    const parsed = insertProjectSchema.safeParse(req.body);
+    // New projects use the Stage 1 (v2) report layout; existing projects are untouched.
+    const body = { ...req.body };
+    if (body.reportVersion == null) body.reportVersion = REPORT_VERSION_CURRENT;
+    if (body.reportVersion >= 2) {
+      if (!body.inspector || !String(body.inspector).trim()) body.inspector = DEFAULT_INSPECTOR;
+      if (!body.limitations || body.limitations === "[]") body.limitations = JSON.stringify(STANDARD_LIMITATIONS);
+      if (!body.assessmentType) body.assessmentType = "condition";
+      if (!body.referencesIntro) body.referencesIntro = REFERENCES_INTRO_PRESETS[0];
+      if (!body.inspectionMatrix) body.inspectionMatrix = JSON.stringify({ ...emptyMatrix(), inspectors: [body.inspector] });
+    }
+    const parsed = insertProjectSchema.safeParse(body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
     const project = await storage.createProject(parsed.data);
     res.status(201).json(project);
@@ -203,6 +223,7 @@ export async function registerRoutes(
   // === FACADE SYSTEMS ===
   app.get("/api/projects/:projectId/systems", async (req, res) => {
     const systems = await storage.getSystemsByProject(Number(req.params.projectId));
+    systems.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
     res.json(systems);
   });
 
@@ -225,6 +246,13 @@ export async function registerRoutes(
     const system = await storage.updateSystem(Number(req.params.id), req.body);
     if (!system) return res.status(404).json({ message: "System not found" });
     res.json(system);
+  });
+
+  // Reorder systems: body { order: number[] } (system ids in display order)
+  app.post("/api/projects/:projectId/systems/reorder", async (req, res) => {
+    const order: number[] = Array.isArray(req.body?.order) ? req.body.order.map(Number) : [];
+    for (let i = 0; i < order.length; i++) await storage.updateSystem(order[i], { sortOrder: i } as any);
+    res.json({ success: true });
   });
 
   app.delete("/api/systems/:id", async (req, res) => {
@@ -362,6 +390,92 @@ export async function registerRoutes(
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
     const rec = await storage.createRecommendation(parsed.data);
     res.status(201).json(rec);
+  });
+
+  // ===== v2 Report Issues (Section 4 built from a ranked list of issues) =====
+  const ISSUE_FIELDS = ["title", "steer", "summary", "keyObservations", "observationIds", "photoIds", "parentId", "sortOrder"] as const;
+  const pickIssue = (body: any) => {
+    const out: any = {};
+    for (const k of ISSUE_FIELDS) if (body[k] !== undefined) out[k] = (k === "observationIds" || k === "photoIds") && Array.isArray(body[k]) ? JSON.stringify(body[k]) : body[k];
+    return out;
+  };
+  app.get("/api/projects/:projectId/issues", async (req, res) => {
+    res.json(await storage.getIssuesByProject(Number(req.params.projectId)));
+  });
+  app.post("/api/projects/:projectId/issues", async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    const existing = await storage.getIssuesByProject(projectId);
+    const data = { title: "New issue", ...pickIssue(req.body), projectId, createdAt: new Date().toISOString() };
+    if (data.sortOrder === undefined) data.sortOrder = existing.length ? Math.max(...existing.map(i => i.sortOrder ?? 0)) + 1 : 0;
+    res.status(201).json(await storage.createIssue(data));
+  });
+  app.patch("/api/issues/:id", async (req, res) => {
+    const issue = await storage.updateIssue(Number(req.params.id), pickIssue(req.body));
+    if (!issue) return res.status(404).json({ message: "Issue not found" });
+    res.json(issue);
+  });
+  app.delete("/api/issues/:id", async (req, res) => {
+    await storage.deleteIssue(Number(req.params.id));
+    res.status(204).end();
+  });
+  // Body: { order: [{ id, parentId }] } in display order.
+  app.post("/api/projects/:projectId/issues/reorder", async (req, res) => {
+    const order = (req.body?.order || []) as { id: number; parentId?: number | null }[];
+    for (let i = 0; i < order.length; i++) {
+      await storage.updateIssue(Number(order[i].id), { sortOrder: i, parentId: order[i].parentId ?? null } as any);
+    }
+    res.json(await storage.getIssuesByProject(Number(req.params.projectId)));
+  });
+  // Issue-level recommendation: stored against the first linked observation with issueId set.
+  app.post("/api/issues/:id/recommendations", async (req, res) => {
+    const issue = await storage.getIssue(Number(req.params.id));
+    if (!issue) return res.status(404).json({ message: "Issue not found" });
+    let obsIds: number[] = [];
+    try { obsIds = JSON.parse(issue.observationIds || "[]"); } catch {}
+    if (!obsIds.length) return res.status(400).json({ message: "Link at least one observation to this issue first." });
+    const parsed = insertRecommendationSchema.safeParse({
+      timeframe: "Within 1 year", category: "Essential", ...req.body,
+      observationId: obsIds[0], projectId: issue.projectId, issueId: issue.id, createdAt: new Date().toISOString(),
+    });
+    if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+    res.status(201).json(await storage.createRecommendation(parsed.data));
+  });
+  app.post("/api/ai/suggest-issues", async (req, res) => {
+    try {
+      const projectId = Number(req.body?.projectId);
+      const suggestions = await suggestIssues(projectId);
+      const existing = await storage.getIssuesByProject(projectId);
+      let order = existing.length ? Math.max(...existing.map(i => i.sortOrder ?? 0)) + 1 : 0;
+      const created = [];
+      for (const sg of suggestions) {
+        created.push(await storage.createIssue({
+          projectId, title: sg.title, steer: sg.steer || "", observationIds: JSON.stringify(sg.observationIds),
+          sortOrder: order++, createdAt: new Date().toISOString(),
+        } as any));
+      }
+      res.json(created);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "Suggestion failed" });
+    }
+  });
+  app.post("/api/ai/write-observations-overview", async (req, res) => {
+    try {
+      const projectId = Number(req.body?.projectId);
+      const overview = await writeObservationsOverview(projectId);
+      await storage.updateProject(projectId, { observationsOverview: overview } as any);
+      res.json({ overview });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "Writing failed" });
+    }
+  });
+  app.post("/api/ai/write-issue", async (req, res) => {
+    try {
+      const issueId = Number(req.body?.issueId);
+      const out = await writeIssue(issueId);
+      res.json(await storage.updateIssue(issueId, { summary: out.summary, keyObservations: out.keyObservations } as any));
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "Writing failed" });
+    }
   });
 
   app.patch("/api/recommendations/:id", async (req, res) => {
@@ -504,8 +618,11 @@ export async function registerRoutes(
 
   // Update photo caption
   app.patch("/api/photos/:id", async (req, res) => {
-    const photo = await storage.updatePhotoCaption(Number(req.params.id), req.body.caption || "");
+    const id = Number(req.params.id);
+    let photo = await storage.getPhoto(id);
     if (!photo) return res.status(404).json({ message: "Photo not found" });
+    if (typeof req.body.caption === "string") photo = await storage.updatePhotoCaption(id, req.body.caption);
+    if (req.body.includeInReport !== undefined) photo = await storage.updatePhotoInclude(id, req.body.includeInReport ? 1 : 0);
     res.json(photo);
   });
 
@@ -905,6 +1022,14 @@ export async function registerRoutes(
     try {
       const { projectId } = req.body;
       if (!projectId) return res.status(400).json({ message: "projectId is required" });
+      const proj = await storage.getProject(Number(projectId));
+      if (proj && isV2(proj as any)) {
+        const out = await generateIntroductionV2(Number(projectId));
+        const updates: any = { aiIntroduction: out.general, aiBackground: out.background };
+        if (!((proj as any).locationDescription || "").trim()) updates.locationDescription = out.location;
+        await storage.updateProject(Number(projectId), updates);
+        return res.json({ introduction: out.general, background: out.background, location: updates.locationDescription ?? (proj as any).locationDescription });
+      }
       const introduction = await generateProjectIntroduction(Number(projectId));
       // Persist on the project so the Word export picks it up automatically.
       await storage.updateProject(Number(projectId), { aiIntroduction: introduction } as any);
@@ -1821,9 +1946,37 @@ export async function registerRoutes(
       const project = await storage.getProject(projectId);
       if (!project) return res.status(404).json({ message: "Project not found" });
 
+      const v2 = isV2(project as any);
+      const REPORT_TITLE = v2 ? reportTitleOf(project as any) : "FACADE DUE DILIGENCE REPORT";
+      // v2 Issues: ordered list (top-level then sub-issues), numbered from 4.2.
+      const rawIssues = v2 ? await storage.getIssuesByProject(projectId) : [];
+      const orderedIssues: { issue: ReportIssue; number: string; depth: number }[] = [];
+      {
+        const top = rawIssues.filter(i => !i.parentId || !rawIssues.some(p => p.id === i.parentId));
+        top.forEach((t, n) => {
+          orderedIssues.push({ issue: t, number: `4.${n + 2}`, depth: 0 });
+          rawIssues.filter(c => c.parentId === t.id).forEach((c, m) => orderedIssues.push({ issue: c, number: `4.${n + 2}.${m + 1}`, depth: 1 }));
+        });
+      }
+      const useIssues = orderedIssues.length > 0;
+      const jsonIds = (raw: string | null | undefined): number[] => { try { const v = JSON.parse(raw || "[]"); return Array.isArray(v) ? v.map(Number) : []; } catch { return []; } };
       const systems = await storage.getSystemsByProject(projectId);
       const allObservations = await storage.getObservationsByProject(projectId);
       const allRecommendations = await storage.getRecommendationsByProject(projectId);
+      // Budget IDs follow the issue numbering (4.2-1, 4.2-2 …) when issues are used.
+      const budgetIdByRec = new Map<number, { id: string; anchor: string; issueTitle?: string }>();
+      for (const { issue, number } of orderedIssues) {
+        const linked = jsonIds(issue.observationIds);
+        const recs = [
+          ...linked.flatMap(oid => allRecommendations.filter(r => r.observationId === oid && !(r as any).issueId)),
+          ...allRecommendations.filter(r => (r as any).issueId === issue.id),
+        ];
+        let k = 1;
+        for (const r of recs) {
+          if (budgetIdByRec.has(r.id)) continue;
+          budgetIdByRec.set(r.id, { id: `${number}-${k++}`, anchor: number, issueTitle: (r as any).issueId ? issue.title : undefined });
+        }
+      }
       const projectDocs = await storage.getProjectDocuments(projectId);
 
       // Fetch photos for each system and observation
@@ -1916,7 +2069,7 @@ export async function registerRoutes(
       // Anything else renders as a plain paragraph.
       const renderNarrativeParagraphs = (
         narrative: string,
-        opts: { fontSize?: number; afterSpacing?: number } = {}
+        opts: { fontSize?: number; afterSpacing?: number; plainIndent?: number } = {}
       ): Paragraph[] => {
         const fontSize = opts.fontSize ?? 22;
         const afterSpacing = opts.afterSpacing ?? 100;
@@ -2008,6 +2161,7 @@ export async function registerRoutes(
 
           out.push(new Paragraph({
             children: buildRuns(line),
+            ...(opts.plainIndent ? { indent: { left: opts.plainIndent } } : {}),
             spacing: { after: afterSpacing },
           }));
         }
@@ -2149,7 +2303,7 @@ export async function registerRoutes(
         children: [
           new Paragraph({
             children: [
-              new TextRun({ text: "FACADE DUE DILIGENCE REPORT", font: "Arial", size: 16, color: MUTED }),
+              new TextRun({ text: REPORT_TITLE, font: "Arial", size: 16, color: MUTED }),
               new TextRun({ text: "\t" }),
               new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: MUTED }),
             ],
@@ -2164,7 +2318,7 @@ export async function registerRoutes(
       const buildCapexRow = (
         obsId: string, location: string, defect: string, action: string,
         timeframe: string, category: string, budget: string,
-        isHeader: boolean, isAlt: boolean, withLink: boolean
+        isHeader: boolean, isAlt: boolean, withLink: boolean, anchorOverride?: string
       ): TableRow => {
         const bgColor = isHeader ? TEAL : isAlt ? ALT_ROW : WHITE;
         const textColor = isHeader ? WHITE : BLACK;
@@ -2181,20 +2335,22 @@ export async function registerRoutes(
 
         const idChildren = withLink && !isHeader
           ? [new InternalHyperlink({
-              anchor: sanitizeBookmark(obsId),
+              anchor: sanitizeBookmark(anchorOverride || obsId),
               children: [new TextRun({ text: obsId, font: "Arial", size: fontSize, color: TEAL, bold: true, underline: {} })],
             })]
           : [textRun(obsId)];
 
+        // v2: wider Actions column so long actions don't stretch rows over pages (legacy widths unchanged)
+        const W = v2 ? [800, 1050, 1100, 2950, 1050, 1000, 1076] : [800, 1200, 1800, 2200, 800, 900, 1326];
         return new TableRow({
           children: [
-            new TableCell({ ...cellProps(800), children: [new Paragraph({ children: idChildren })] }),
-            new TableCell({ ...cellProps(1200), children: [new Paragraph({ children: [textRun(location)] })] }),
-            new TableCell({ ...cellProps(1800), children: [new Paragraph({ children: [textRun(defect)] })] }),
-            new TableCell({ ...cellProps(2200), children: [new Paragraph({ children: [textRun(action)] })] }),
-            new TableCell({ ...cellProps(800), children: [new Paragraph({ children: [textRun(timeframe)] })] }),
-            new TableCell({ ...cellProps(900), children: [new Paragraph({ children: [textRun(category)] })] }),
-            new TableCell({ ...cellProps(1326), children: [new Paragraph({ children: [textRun(budget)] })] }),
+            new TableCell({ ...cellProps(W[0]), children: [new Paragraph({ children: idChildren })] }),
+            new TableCell({ ...cellProps(W[1]), children: [new Paragraph({ children: [textRun(location)] })] }),
+            new TableCell({ ...cellProps(W[2]), children: [new Paragraph({ children: [textRun(defect)] })] }),
+            new TableCell({ ...cellProps(W[3]), children: [new Paragraph({ children: [textRun(action)] })] }),
+            new TableCell({ ...cellProps(W[4]), children: [new Paragraph({ children: [textRun(timeframe)] })] }),
+            new TableCell({ ...cellProps(W[5]), children: [new Paragraph({ children: [textRun(category)] })] }),
+            new TableCell({ ...cellProps(W[6]), children: [new Paragraph({ children: [textRun(budget)] })] }),
           ],
         });
       };
@@ -2217,6 +2373,38 @@ export async function registerRoutes(
         return rows;
       };
 
+      // v2: budget rows grouped by timeframe, with a subtotal row per group.
+      const buildBudgetTableRowsV2 = (items: { rec: Recommendation; obs?: Observation }[]): TableRow[] => {
+        const rows: TableRow[] = [buildCapexRow("ID", "Location", "Defect/Issue", "Actions", "Time", "Severity", "Budget", true, false, false)];
+        const sorted = [...items].sort((a, b) =>
+          timeframeRank(a.rec.timeframe) - timeframeRank(b.rec.timeframe) ||
+          (budgetIdByRec.get(a.rec.id)?.id || a.obs?.observationId || "").localeCompare(budgetIdByRec.get(b.rec.id)?.id || b.obs?.observationId || "", undefined, { numeric: true }));
+        const groups = new Map<number, typeof sorted>();
+        for (const it of sorted) {
+          const k = timeframeRank(it.rec.timeframe);
+          if (!groups.has(k)) groups.set(k, []);
+          groups.get(k)!.push(it);
+        }
+
+        for (const [rank, list] of Array.from(groups.entries())) {
+          let lo = 0; let sum = 0; let unpriced = 0;
+          for (const { rec, obs } of list) {
+            const bid = budgetIdByRec.get(rec.id);
+            rows.push(buildCapexRow(
+              bid?.id || obs?.observationId || "", obs?.location || "", bid?.issueTitle || obs?.defectCategory || "",
+              rec.action, rec.timeframe || "", effectiveSeverity(rec.category, obs?.severity), rec.budgetEstimate || "",
+              false, false, useIssues ? !!bid : true, bid?.anchor,
+            ));
+            const br = parseBudgetRange(rec.budgetEstimate);
+            if (br) { lo += br[0]; sum += br[1]; } else unpriced++;
+          }
+          const label = TIMEFRAME_GROUP_LABELS[rank] || "Other";
+          const amt = !sum ? "TBC" : (lo === sum ? formatMoney(sum) : `${formatMoney(lo)} – ${formatMoney(sum)}`) + (unpriced ? " + TBC" : "");
+          rows.push(buildCapexRow("", "", `Subtotal – ${label}`, "", "", "", amt, false, true, false));
+        }
+        return rows;
+      };
+
       // === SECTION 0: COVER PAGE ===
       const coverChildren: Paragraph[] = [];
       // Spacing at top
@@ -2235,7 +2423,7 @@ export async function registerRoutes(
       }));
       coverChildren.push(new Paragraph({
         alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: "FACADE DUE DILIGENCE REPORT", font: "Arial", size: 32, bold: true, color: DARK_GRAY })],
+        children: [new TextRun({ text: REPORT_TITLE, font: "Arial", size: 32, bold: true, color: DARK_GRAY })],
         spacing: { after: 400 },
       }));
       coverChildren.push(new Paragraph({
@@ -2271,7 +2459,22 @@ export async function registerRoutes(
         spacing: { before: 400, after: 200 },
       }));
 
-      if (project.executiveSummary) {
+      if (project.executiveSummary && v2) {
+        // v2: the three fixed headings are bold sub-headings; numbered items are plain list items.
+        const EXEC_HEADS = /^(safety and risk items|other key findings|major recommendations)\s*:?$/i;
+        for (const raw of project.executiveSummary.split(/\r?\n/)) {
+          const line = raw.trim().replace(/^\*\*(.*)\*\*$/, "$1");
+          if (!line) continue;
+          const num = line.match(/^(\d+)\.\s+(.*)$/);
+          if (EXEC_HEADS.test(line)) {
+            execChildren.push(new Paragraph({ children: [new TextRun({ text: line.replace(/:$/, ""), font: "Arial", size: 22, bold: true, color: DARK_GRAY })], spacing: { before: 200, after: 80 }, keepNext: true }));
+          } else if (num) {
+            execChildren.push(new Paragraph({ children: [new TextRun({ text: `${num[1]}.\t${num[2]}`, font: "Arial", size: 22 })], indent: { left: 360, hanging: 360 }, tabStops: [{ type: TabStopType.LEFT, position: 360 }], spacing: { after: 60 } }));
+          } else {
+            execChildren.push(new Paragraph({ children: [new TextRun({ text: line, font: "Arial", size: 22 })], spacing: { after: 150 } }));
+          }
+        }
+      } else if (project.executiveSummary) {
         execChildren.push(...renderNarrativeParagraphs(project.executiveSummary, { fontSize: 22, afterSpacing: 150 }));
       } else {
         execChildren.push(new Paragraph({
@@ -2280,6 +2483,31 @@ export async function registerRoutes(
         }));
       }
 
+      if (v2) {
+        // BUDGETS table: safety items + Immediate / Within 1 year + the most
+        // expensive 25% (by parsed budget), grouped by timeframe with subtotals.
+        const withObs = allRecommendations.map(rec => ({ rec, obs: allObservations.find(o => o.id === rec.observationId) }));
+        const priced = withObs.map(x => parseBudget(x.rec.budgetEstimate)).filter((n): n is number => n != null).sort((a, b) => b - a);
+        const topN = Math.max(1, Math.ceil(priced.length * 0.25));
+        const threshold = priced.length ? priced[topN - 1] : Infinity;
+        const picked = withObs.filter(({ rec, obs }) => {
+          const b = parseBudget(rec.budgetEstimate);
+          return obs?.severity === "Safety/Risk" || isWithinOneYear(rec.timeframe) || (b != null && b >= threshold);
+        });
+        if (picked.length > 0) {
+          execChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun({ text: "BUDGETS for major and safety-related recommendations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+            spacing: { before: 300, after: 150 },
+          }));
+          execChildren.push(new Table({
+            layout: TableLayoutType.FIXED,
+            width: { size: 9026, type: WidthType.DXA },
+            columnWidths: [800, 1050, 1100, 2950, 1050, 1000, 1076],
+            rows: buildBudgetTableRowsV2(picked),
+          } as any));
+        }
+      } else {
       // Major recommendations table (Essential or Safety/Risk)
       const majorRecs = allRecommendations.filter(r => {
         const obs = allObservations.find(o => o.id === r.observationId);
@@ -2310,6 +2538,7 @@ export async function registerRoutes(
           rows: buildCapexTableRows(majorCapexData),
         } as any));
       }
+      }
 
       // === SECTION 2: INTRODUCTION ===
       const introChildren: Paragraph[] = [];
@@ -2332,6 +2561,12 @@ export async function registerRoutes(
       const rawProjectContext = ((project as any).projectContext || "").trim();
       if (aiIntro) {
         introChildren.push(...renderNarrativeParagraphs(aiIntro, { fontSize: 22, afterSpacing: 150 }));
+      } else if (v2) {
+        const onBehalf = ((project as any).clientOnBehalfOf || "").trim();
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: `Angel Fa\u00E7ade Consulting (AFC) was engaged by ${project.client}${onBehalf ? ` on behalf of their client ${onBehalf}` : ""} to carry out ${assessmentPhrase((project as any).assessmentType)} of the building envelope of ${project.name}${project.address && project.address !== project.name ? `, ${project.address}` : ""}.`, font: "Arial", size: 22 })],
+          spacing: { after: 150 },
+        }));
       } else {
         introChildren.push(new Paragraph({
           children: [new TextRun({ text: `Angel Fa\u00E7ade Consulting (AFC) was engaged by ${project.client} to carry out a condition assessment of the building envelope(s) at ${project.address}.`, font: "Arial", size: 22 })],
@@ -2348,34 +2583,141 @@ export async function registerRoutes(
         children: [new TextRun({ text: "2.2 Inspection", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
         spacing: { before: 300, after: 150 },
       }));
-      introChildren.push(new Paragraph({
-        children: [new TextRun({ text: "The inspection was carried out on the following dates:", font: "Arial", size: 22 })],
-        spacing: { after: 100 },
-      }));
-
-      const dates = safeJsonArray(project.inspectionDates);
-      if (dates.length > 0) {
-        for (const date of dates) {
+      const inspMatrix = parseMatrix((project as any).inspectionMatrix);
+      if (matrixHasContent(inspMatrix)) {
+        // Structured inspection matrix → AFC-standard 2.2 wording (deterministic, no AI).
+        const it = buildInspectionText(inspMatrix);
+        const bodyPara = (text: string, after = 120) => new Paragraph({
+          children: [new TextRun({ text, font: "Arial", size: 22 })],
+          spacing: { after },
+        });
+        introChildren.push(bodyPara(it.opening, it.accessIntro ? 60 : 150));
+        if (it.accessIntro) introChildren.push(bodyPara(it.accessIntro, it.accessDays.length ? 60 : (it.accessClosing ? 60 : 150)));
+        for (const d of it.accessDays) {
           introChildren.push(new Paragraph({
-            children: [new TextRun({ text: formatDate(date), font: "Arial", size: 22 })],
+            children: [new TextRun({ text: d, font: "Arial", size: 22 })],
             bullet: { level: 0 },
-            spacing: { after: 50 },
+            spacing: { after: 40 },
           }));
+        }
+        if (it.accessClosing) introChildren.push(bodyPara(it.accessClosing, 150));
+        if (it.coveredIntro) {
+          introChildren.push(bodyPara(it.coveredIntro, 80));
+          it.covered.forEach((c, i) => {
+            const text = c.text;
+            introChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: `${i + 1}.\t`, font: "Arial", size: 22 }),
+                new TextRun({ text, font: "Arial", size: 22 }),
+              ],
+              tabStops: [{ type: TabStopType.LEFT, position: 360 }],
+              indent: { left: 360, hanging: 360 },
+              spacing: { after: 60 },
+            }));
+            c.subPoints.forEach((sp, j) => {
+              introChildren.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `${String.fromCharCode(97 + j)}.\t`, font: "Arial", size: 22 }),
+                  new TextRun({ text: sp, font: "Arial", size: 22 }),
+                ],
+                tabStops: [{ type: TabStopType.LEFT, position: 720 }],
+                indent: { left: 720, hanging: 360 },
+                spacing: { after: 40 },
+              }));
+            });
+          });
+          introChildren.push(new Paragraph({ children: [], spacing: { after: 100 } }));
         }
       } else {
         introChildren.push(new Paragraph({
-          children: [new TextRun({ text: "No inspection dates recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+          children: [new TextRun({ text: "The inspection was carried out on the following dates:", font: "Arial", size: 22 })],
           spacing: { after: 100 },
         }));
+
+        const dates = safeJsonArray(project.inspectionDates);
+        if (dates.length > 0) {
+          for (const date of dates) {
+            introChildren.push(new Paragraph({
+              children: [new TextRun({ text: formatDate(date), font: "Arial", size: 22 })],
+              bullet: { level: 0 },
+              spacing: { after: 50 },
+            }));
+          }
+        } else {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: "No inspection dates recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+            spacing: { after: 100 },
+          }));
+        }
+
+        if (project.inspectionScope) {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: project.inspectionScope, font: "Arial", size: 22 })],
+            spacing: { before: 100, after: 150 },
+          }));
+        }
       }
 
-      if (project.inspectionScope) {
+      // Harvard-style reference: Author (Year). Title. Publisher.
+      const formatHarvardRef = (d: { author?: string | null; year?: string | null; title?: string | null; originalName?: string | null; publisher?: string | null }): string => {
+        const author = (d.author || "").trim();
+        const year = (d.year || "").trim();
+        const titleStr = (d.title || d.originalName || "Untitled").trim();
+        const publisher = (d.publisher || "").trim();
+        const parts: string[] = [];
+        if (author) parts.push(year ? `${author} (${year}).` : `${author}.`);
+        else if (year) parts.push(`(${year}).`);
+        parts.push(`${titleStr}.`);
+        if (publisher) parts.push(`${publisher}.`);
+        return parts.join(" ");
+      };
+      const numberedPara = (num: string, text: string, level = 0, after = 60) => new Paragraph({
+        children: [
+          new TextRun({ text: `${num}\t`, font: "Arial", size: 22 }),
+          new TextRun({ text, font: "Arial", size: 22 }),
+        ],
+        tabStops: [{ type: TabStopType.LEFT, position: 360 * (level + 1) }],
+        indent: { left: 360 * (level + 1), hanging: 360 },
+        spacing: { after },
+      });
+
+      if (v2) {
         introChildren.push(new Paragraph({
-          children: [new TextRun({ text: project.inspectionScope, font: "Arial", size: 22 })],
-          spacing: { before: 100, after: 150 },
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "2.3 Background information", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
         }));
-      }
+        const refs: string[] = [
+          ...projectDocs.map(d => formatHarvardRef(d as any)),
+          ...safeJsonArray(project.backgroundDocs).filter((d: any) => (d.title || "").trim()).map((d: any) =>
+            formatHarvardRef({ author: d.author, year: d.date ? String(d.date).slice(0, 4) : "", title: d.title })),
+        ];
+        const refIntro = ((project as any).referencesIntro || "").trim()
+          || (refs.length ? REFERENCES_INTRO_PRESETS[0] : REFERENCES_INTRO_PRESETS[3]);
+        introChildren.push(new Paragraph({
+          children: [new TextRun({ text: refIntro, font: "Arial", size: 22 })],
+          spacing: { after: refs.length ? 80 : 150 },
+        }));
+        refs.forEach((r, i) => introChildren.push(numberedPara(`${i + 1}.`, r, 0, i === refs.length - 1 ? 150 : 60)));
 
+        introChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "2.4 Limitations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        }));
+        const limsV2 = parseLimitations(project.limitations).filter(l => l.text.trim());
+        if (limsV2.length) {
+          limsV2.forEach((l, i) => {
+            introChildren.push(numberedPara(`${i + 1}.`, stripBrackets(l.text), 0, l.subs.length ? 40 : 80));
+            l.subs.filter(sb => sb.trim()).forEach((sb, j) => introChildren.push(numberedPara(`${String.fromCharCode(97 + j)}.`, stripBrackets(sb), 1, 40)));
+          });
+        } else {
+          introChildren.push(new Paragraph({
+            children: [new TextRun({ text: "No limitations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
+            spacing: { after: 150 },
+          }));
+        }
+      } else {
       // 2.3 Background Information
       introChildren.push(new Paragraph({
         heading: HeadingLevel.HEADING_2,
@@ -2463,6 +2805,8 @@ export async function registerRoutes(
         }
       }
 
+      } // end legacy 2.3-2.5
+
       // === SECTION 3: SITE DESCRIPTION ===
       const siteChildren: Paragraph[] = [];
       const figureCounter = { n: 1 };
@@ -2473,6 +2817,278 @@ export async function registerRoutes(
         spacing: { before: 400, after: 200 },
       }));
 
+      const projectElevations = await storage.getElevationsByProject(projectId);
+      projectElevations.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+      const renderElevationFigures = async (target: Paragraph[]) => {
+        for (const elev of projectElevations) {
+          const srcPath = path.join(elevationDir, elev.filename);
+          if (!fs.existsSync(srcPath)) continue;
+
+          const pins = await storage.getPinsByElevation(elev.id);
+          let annotatedBuffer: Buffer | null = null;
+          let annotatedWidth = elev.width || 1600;
+          let annotatedHeight = elev.height || 1200;
+
+          try {
+            const baseImg = sharp(srcPath);
+            const meta = await baseImg.metadata();
+            const W = meta.width || 1600;
+            const H = meta.height || 1200;
+            annotatedWidth = W;
+            annotatedHeight = H;
+
+            // Build SVG overlay with pins
+            const pinRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
+            const svgPins = pins.map((pin) => {
+              const obs = allObservations.find(o => o.id === pin.observationId);
+              if (!obs) return "";
+              const color = obs.severity === "Safety/Risk" ? "#EF4444"
+                : obs.severity === "Essential" ? "#F97316"
+                : obs.severity === "Desirable" ? "#EAB308"
+                : "#22C55E";
+              const cx = Math.round((pin.x / 10000) * W);
+              const cy = Math.round((pin.y / 10000) * H);
+              const label = (obs.observationId || "").replace(/[<>&"']/g, "");
+              const fontSize = Math.round(pinRadius * 0.75);
+              return `
+                <circle cx="${cx}" cy="${cy}" r="${pinRadius}" fill="${color}" stroke="white" stroke-width="3" />
+                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
+              `;
+            }).join("");
+
+            const svgOverlay = Buffer.from(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgPins}</svg>`
+            );
+
+            annotatedBuffer = await baseImg
+              .composite([{ input: svgOverlay, top: 0, left: 0 }])
+              .png()
+              .toBuffer();
+          } catch (err) {
+            console.warn("Failed to annotate elevation", elev.id, err);
+            try {
+              annotatedBuffer = fs.readFileSync(srcPath);
+            } catch {}
+          }
+
+          if (!annotatedBuffer) continue;
+
+          // Figure heading
+          target.push(new Paragraph({
+            heading: HeadingLevel.HEADING_3,
+            children: [new TextRun({ text: `Figure ${figureCounter.n} \u2013 ${elev.name}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+            spacing: { before: 200, after: 100 },
+          }));
+          figureCounter.n++;
+
+          // Scale to fit page width ~500px target
+          const targetWidth = 500;
+          const aspect = annotatedHeight && annotatedWidth ? annotatedHeight / annotatedWidth : 0.75;
+          const targetHeight = Math.round(targetWidth * aspect);
+
+          target.push(new Paragraph({
+            children: [
+              new ImageRun({
+                data: annotatedBuffer,
+                transformation: { width: targetWidth, height: targetHeight },
+                type: "png",
+                altText: { title: elev.name, description: elev.name, name: elev.filename },
+              }),
+            ],
+            spacing: { after: 200 },
+          }));
+
+          // Legend / pin list
+          if (pins.length > 0) {
+            for (const pin of pins) {
+              const obs = allObservations.find(o => o.id === pin.observationId);
+              if (!obs) continue;
+              target.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `Pin ${obs.observationId}: `, font: "Arial", size: 20, bold: true, color: DARK_GRAY }),
+                  new TextRun({ text: `${obs.defectCategory} — ${obs.location} (${obs.severity})${(() => {
+                    const hit = orderedIssues.find(x => jsonIds(x.issue.observationIds).includes(obs.id));
+                    return hit ? `; refer Section ${hit.number}` : "";
+                  })()}`, font: "Arial", size: 20, color: MUTED }),
+                ],
+                spacing: { after: 40 },
+              }));
+            }
+          }
+        }
+      };
+      const renderRoofPlanFigure = async (target: Paragraph[], caption: string, showDropList: boolean) => {
+        if (!project.roofPlanImagePath) return false;
+        const roofPlanFilename = path.basename(project.roofPlanImagePath);
+        const roofPlanPath = path.join(roofPlanDir, roofPlanFilename);
+        const projectDrops = await storage.getDropsByProject(projectId);
+        projectDrops.sort((a, b) => a.id - b.id);
+        if (!fs.existsSync(roofPlanPath)) return false;
+          let annotatedBuffer: Buffer | null = null;
+          let W = 1600;
+          let H = 1200;
+
+          try {
+            const baseImg = sharp(roofPlanPath);
+            const meta = await baseImg.metadata();
+            W = meta.width || 1600;
+            H = meta.height || 1200;
+
+            const markerRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
+            const svgMarkers = projectDrops.map((drop) => {
+              const cx = Math.round((drop.x / 10000) * W);
+              const cy = Math.round((drop.y / 10000) * H);
+              const label = (drop.dropNumber || "").replace(/[<>&"']/g, "");
+              const fontSize = Math.round(markerRadius * 0.7);
+              return `
+                <circle cx="${cx}" cy="${cy}" r="${markerRadius}" fill="#00B5B8" stroke="white" stroke-width="3" />
+                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
+              `;
+            }).join("");
+
+            const svgOverlay = Buffer.from(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgMarkers}</svg>`
+            );
+
+            annotatedBuffer = await baseImg
+              .composite([{ input: svgOverlay, top: 0, left: 0 }])
+              .png()
+              .toBuffer();
+          } catch (err) {
+            console.warn("Failed to annotate roof plan", err);
+            try {
+              annotatedBuffer = fs.readFileSync(roofPlanPath);
+            } catch {}
+          }
+
+          if (annotatedBuffer) {
+            target.push(new Paragraph({
+              heading: HeadingLevel.HEADING_3,
+              children: [new TextRun({ text: `Figure ${figureCounter.n} – ${caption}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
+              spacing: { before: 200, after: 100 },
+            }));
+            figureCounter.n++;
+
+            const targetWidth = 500;
+            const aspect = H && W ? H / W : 0.75;
+            const targetHeight = Math.round(targetWidth * aspect);
+
+            target.push(new Paragraph({
+              children: [
+                new ImageRun({
+                  data: annotatedBuffer,
+                  transformation: { width: targetWidth, height: targetHeight },
+                  type: "png",
+                  altText: { title: "Roof Plan", description: "Roof plan with drop locations", name: roofPlanFilename },
+                }),
+              ],
+              spacing: { after: 200 },
+            }));
+
+            if (!showDropList) {
+              // v2: drops are shown on the figure only
+            } else if (projectDrops.length > 0) {
+              target.push(new Paragraph({
+                children: [new TextRun({ text: `${projectDrops.length} drop${projectDrops.length === 1 ? "" : "s"} annotated:`, font: "Arial", size: 20, italics: true, color: MUTED })],
+                spacing: { after: 60 },
+              }));
+              const dropLabels = projectDrops.map(d => d.dropNumber).join(", ");
+              target.push(new Paragraph({
+                children: [new TextRun({ text: dropLabels, font: "Arial", size: 20, color: DARK_GRAY })],
+                spacing: { after: 150 },
+              }));
+            } else {
+              target.push(new Paragraph({
+                children: [new TextRun({ text: "No drops annotated on the roof plan.", font: "Arial", size: 20, italics: true, color: MUTED })],
+                spacing: { after: 150 },
+              }));
+            }
+          }
+        return true;
+      };
+
+      const appendixChildren: Paragraph[] = [];
+      if (v2) {
+        const h2 = (t: string) => new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: t, font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        });
+        // 3.1 General background
+        siteChildren.push(h2("3.1 General background"));
+        const bg = ((project as any).aiBackground || "").trim();
+        if (bg) siteChildren.push(...renderNarrativeParagraphs(bg, { fontSize: 22, afterSpacing: 150 }));
+        else siteChildren.push(new Paragraph({
+          children: [new TextRun({ text: `${project.name} is a ${project.buildingAge || ""} ${project.buildingUse || "building"}${project.storeyCount ? ` of ${project.storeyCount} storeys` : ""}.`.replace(/\s+/g, " "), font: "Arial", size: 22 })],
+          spacing: { after: 150 },
+        }));
+        // 3.2 Location (+ roof plan with drops)
+        const locText = ((project as any).locationDescription || "").trim() || `The Property is located at ${project.address}.`;
+        siteChildren.push(h2("3.2 Location"));
+        siteChildren.push(...renderNarrativeParagraphs(locText, { fontSize: 22, afterSpacing: 150 }));
+        await renderRoofPlanFigure(siteChildren, "Site layout, showing inspection drop locations", false);
+
+        // 3.3 Façade description — one numbered list; systems sharing a report heading are combined.
+        if (systems.length > 0) {
+          siteChildren.push(h2("3.3 Fa\u00E7ade description"));
+          siteChildren.push(new Paragraph({
+            children: [new TextRun({ text: "The building envelope comprises the following key systems:", font: "Arial", size: 22 })],
+            spacing: { after: 100 },
+          }));
+          const groups: { heading: string; items: typeof systems }[] = [];
+          for (const sy of systems) {
+            const h = (((sy as any).reportHeading || "").trim()) || sy.name;
+            const g = groups.find(x => x.heading.toLowerCase() === h.toLowerCase());
+            if (g) g.items.push(sy); else groups.push({ heading: h, items: [sy] });
+          }
+          groups.forEach((g, gi) => {
+            siteChildren.push(new Paragraph({
+              children: [
+                new TextRun({ text: `${gi + 1}.\t`, font: "Arial", size: 22, bold: true }),
+                new TextRun({ text: g.heading, font: "Arial", size: 22, bold: true }),
+              ],
+              tabStops: [{ type: TabStopType.LEFT, position: 360 }],
+              indent: { left: 360, hanging: 360 },
+              spacing: { before: 120, after: 60 },
+            }));
+            for (const sy of g.items) {
+              if (g.items.length > 1) {
+                siteChildren.push(new Paragraph({
+                  children: [new TextRun({ text: sy.name, font: "Arial", size: 22, italics: true })],
+                  indent: { left: 360 },
+                  spacing: { before: 60, after: 40 },
+                }));
+              }
+              const desc = (sy.aiDescription || "").trim();
+              if (desc) {
+                const paras = renderNarrativeParagraphs(desc, { fontSize: 22, afterSpacing: 80, plainIndent: 360 });
+                siteChildren.push(...paras);
+              } else {
+                siteChildren.push(new Paragraph({
+                  children: [new TextRun({ text: `${sy.systemType}${sy.location ? `, ${sy.location}` : ""}.`, font: "Arial", size: 22 })],
+                  indent: { left: 360 },
+                  spacing: { after: 80 },
+                }));
+              }
+            }
+          });
+          const chosen = systems.flatMap(sy => (systemPhotosMap[sy.id] || []).filter(ph => (ph as any).includeInReport));
+          if (chosen.length) {
+            siteChildren.push(new Paragraph({ children: [], spacing: { after: 100 } }));
+            siteChildren.push(...buildPhotoRows(chosen, figureCounter));
+          }
+        }
+
+        // Appendix A — elevation drawings with pinned observations
+        if (projectElevations.length > 0) {
+          appendixChildren.push(new Paragraph({
+            heading: HeadingLevel.HEADING_1,
+            children: [new TextRun({ text: "Appendix A \u2013 Elevations", font: "Arial", size: 36, bold: true, color: TEAL })],
+            spacing: { before: 400, after: 200 },
+          }));
+          await renderElevationFigures(appendixChildren);
+        }
+      } else {
       // 3.1 Introduction
       siteChildren.push(new Paragraph({
         heading: HeadingLevel.HEADING_2,
@@ -2554,205 +3170,25 @@ export async function registerRoutes(
       }
 
       // 3.3 Elevation Drawings (with pinned observations)
-      const projectElevations = await storage.getElevationsByProject(projectId);
-      projectElevations.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
-
       if (projectElevations.length > 0) {
         siteChildren.push(new Paragraph({
           heading: HeadingLevel.HEADING_2,
           children: [new TextRun({ text: "3.3 Elevation Drawings", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
           spacing: { before: 300, after: 150 },
         }));
-
-        for (const elev of projectElevations) {
-          const srcPath = path.join(elevationDir, elev.filename);
-          if (!fs.existsSync(srcPath)) continue;
-
-          const pins = await storage.getPinsByElevation(elev.id);
-          let annotatedBuffer: Buffer | null = null;
-          let annotatedWidth = elev.width || 1600;
-          let annotatedHeight = elev.height || 1200;
-
-          try {
-            const baseImg = sharp(srcPath);
-            const meta = await baseImg.metadata();
-            const W = meta.width || 1600;
-            const H = meta.height || 1200;
-            annotatedWidth = W;
-            annotatedHeight = H;
-
-            // Build SVG overlay with pins
-            const pinRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
-            const svgPins = pins.map((pin) => {
-              const obs = allObservations.find(o => o.id === pin.observationId);
-              if (!obs) return "";
-              const color = obs.severity === "Safety/Risk" ? "#EF4444"
-                : obs.severity === "Essential" ? "#F97316"
-                : obs.severity === "Desirable" ? "#EAB308"
-                : "#22C55E";
-              const cx = Math.round((pin.x / 10000) * W);
-              const cy = Math.round((pin.y / 10000) * H);
-              const label = (obs.observationId || "").replace(/[<>&"']/g, "");
-              const fontSize = Math.round(pinRadius * 0.75);
-              return `
-                <circle cx="${cx}" cy="${cy}" r="${pinRadius}" fill="${color}" stroke="white" stroke-width="3" />
-                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
-              `;
-            }).join("");
-
-            const svgOverlay = Buffer.from(
-              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgPins}</svg>`
-            );
-
-            annotatedBuffer = await baseImg
-              .composite([{ input: svgOverlay, top: 0, left: 0 }])
-              .png()
-              .toBuffer();
-          } catch (err) {
-            console.warn("Failed to annotate elevation", elev.id, err);
-            try {
-              annotatedBuffer = fs.readFileSync(srcPath);
-            } catch {}
-          }
-
-          if (!annotatedBuffer) continue;
-
-          // Figure heading
-          siteChildren.push(new Paragraph({
-            heading: HeadingLevel.HEADING_3,
-            children: [new TextRun({ text: `Figure ${figureCounter.n} \u2013 ${elev.name}`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
-            spacing: { before: 200, after: 100 },
-          }));
-          figureCounter.n++;
-
-          // Scale to fit page width ~500px target
-          const targetWidth = 500;
-          const aspect = annotatedHeight && annotatedWidth ? annotatedHeight / annotatedWidth : 0.75;
-          const targetHeight = Math.round(targetWidth * aspect);
-
-          siteChildren.push(new Paragraph({
-            children: [
-              new ImageRun({
-                data: annotatedBuffer,
-                transformation: { width: targetWidth, height: targetHeight },
-                type: "png",
-                altText: { title: elev.name, description: elev.name, name: elev.filename },
-              }),
-            ],
-            spacing: { after: 200 },
-          }));
-
-          // Legend / pin list
-          if (pins.length > 0) {
-            for (const pin of pins) {
-              const obs = allObservations.find(o => o.id === pin.observationId);
-              if (!obs) continue;
-              siteChildren.push(new Paragraph({
-                children: [
-                  new TextRun({ text: `Pin ${obs.observationId}: `, font: "Arial", size: 20, bold: true, color: DARK_GRAY }),
-                  new TextRun({ text: `${obs.defectCategory} — ${obs.location} (${obs.severity})`, font: "Arial", size: 20, color: MUTED }),
-                ],
-                spacing: { after: 40 },
-              }));
-            }
-          }
-        }
+        await renderElevationFigures(siteChildren);
       }
 
       // 3.4 Roof Plan and Drop Locations
-      if (project.roofPlanImagePath) {
-        const roofPlanFilename = path.basename(project.roofPlanImagePath);
-        const roofPlanPath = path.join(roofPlanDir, roofPlanFilename);
-        const projectDrops = await storage.getDropsByProject(projectId);
-        projectDrops.sort((a, b) => a.id - b.id);
-
-        if (fs.existsSync(roofPlanPath)) {
-          siteChildren.push(new Paragraph({
-            heading: HeadingLevel.HEADING_2,
-            children: [new TextRun({ text: "3.4 Roof Plan and Drop Locations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
-            spacing: { before: 300, after: 150 },
-          }));
-
-          let annotatedBuffer: Buffer | null = null;
-          let W = 1600;
-          let H = 1200;
-
-          try {
-            const baseImg = sharp(roofPlanPath);
-            const meta = await baseImg.metadata();
-            W = meta.width || 1600;
-            H = meta.height || 1200;
-
-            const markerRadius = Math.max(24, Math.round(Math.min(W, H) * 0.02));
-            const svgMarkers = projectDrops.map((drop) => {
-              const cx = Math.round((drop.x / 10000) * W);
-              const cy = Math.round((drop.y / 10000) * H);
-              const label = (drop.dropNumber || "").replace(/[<>&"']/g, "");
-              const fontSize = Math.round(markerRadius * 0.7);
-              return `
-                <circle cx="${cx}" cy="${cy}" r="${markerRadius}" fill="#00B5B8" stroke="white" stroke-width="3" />
-                <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="central" fill="white" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="bold">${label}</text>
-              `;
-            }).join("");
-
-            const svgOverlay = Buffer.from(
-              `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${svgMarkers}</svg>`
-            );
-
-            annotatedBuffer = await baseImg
-              .composite([{ input: svgOverlay, top: 0, left: 0 }])
-              .png()
-              .toBuffer();
-          } catch (err) {
-            console.warn("Failed to annotate roof plan", err);
-            try {
-              annotatedBuffer = fs.readFileSync(roofPlanPath);
-            } catch {}
-          }
-
-          if (annotatedBuffer) {
-            siteChildren.push(new Paragraph({
-              heading: HeadingLevel.HEADING_3,
-              children: [new TextRun({ text: `Figure ${figureCounter.n} – Roof Plan with Drop Locations`, font: "Arial", size: 22, bold: true, color: DARK_GRAY })],
-              spacing: { before: 200, after: 100 },
-            }));
-            figureCounter.n++;
-
-            const targetWidth = 500;
-            const aspect = H && W ? H / W : 0.75;
-            const targetHeight = Math.round(targetWidth * aspect);
-
-            siteChildren.push(new Paragraph({
-              children: [
-                new ImageRun({
-                  data: annotatedBuffer,
-                  transformation: { width: targetWidth, height: targetHeight },
-                  type: "png",
-                  altText: { title: "Roof Plan", description: "Roof plan with drop locations", name: roofPlanFilename },
-                }),
-              ],
-              spacing: { after: 200 },
-            }));
-
-            if (projectDrops.length > 0) {
-              siteChildren.push(new Paragraph({
-                children: [new TextRun({ text: `${projectDrops.length} drop${projectDrops.length === 1 ? "" : "s"} annotated:`, font: "Arial", size: 20, italics: true, color: MUTED })],
-                spacing: { after: 60 },
-              }));
-              const dropLabels = projectDrops.map(d => d.dropNumber).join(", ");
-              siteChildren.push(new Paragraph({
-                children: [new TextRun({ text: dropLabels, font: "Arial", size: 20, color: DARK_GRAY })],
-                spacing: { after: 150 },
-              }));
-            } else {
-              siteChildren.push(new Paragraph({
-                children: [new TextRun({ text: "No drops annotated on the roof plan.", font: "Arial", size: 20, italics: true, color: MUTED })],
-                spacing: { after: 150 },
-              }));
-            }
-          }
-        }
+      if (project.roofPlanImagePath && fs.existsSync(path.join(roofPlanDir, path.basename(project.roofPlanImagePath)))) {
+        siteChildren.push(new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: "3.4 Roof Plan and Drop Locations", font: "Arial", size: 28, bold: true, color: DARK_GRAY })],
+          spacing: { before: 300, after: 150 },
+        }));
+        await renderRoofPlanFigure(siteChildren, "Roof Plan with Drop Locations", true);
       }
+      } // end legacy section 3
 
       // Build pin-to-elevation map for observation cross-references
       const pinByObs: Record<number, { elevationName: string; observationId: string }> = {};
@@ -2780,12 +3216,48 @@ export async function registerRoutes(
         spacing: { before: 300, after: 150 },
       }));
 
+      if (useIssues) {
+        const ov = ((project as any).observationsOverview || "").trim();
+        if (ov) obsChildren.push(...renderNarrativeParagraphs(ov, { fontSize: 22, afterSpacing: 150 }));
+        const allObsPhotos = new Map<number, Photo>();
+        for (const o of allObservations) for (const ph of (obsPhotosMap[o.id] || [])) allObsPhotos.set(ph.id, ph);
+        for (const { issue, number, depth } of orderedIssues) {
+          const bm = sanitizeBookmark(number);
+          obsChildren.push(new Paragraph({
+            heading: depth ? HeadingLevel.HEADING_3 : HeadingLevel.HEADING_2,
+            children: [
+              new BookmarkStart(bm, getBookmarkLinkId(number)),
+              new TextRun({ text: `${number} ${issue.title}`, font: "Arial", size: depth ? 24 : 28, bold: true, color: DARK_GRAY }),
+              new BookmarkEnd(getBookmarkLinkId(number)),
+            ],
+            spacing: { before: depth ? 200 : 300, after: 150 },
+          }));
+          const summary = (issue.summary || "").trim();
+          if (summary) obsChildren.push(...renderNarrativeParagraphs(summary, { fontSize: 22, afterSpacing: 120 }));
+          const keyObs = (issue.keyObservations || "").trim();
+          if (keyObs) obsChildren.push(...renderNarrativeParagraphs(keyObs, { fontSize: 22, afterSpacing: 80 }));
+          if (!summary && !keyObs) {
+            obsChildren.push(new Paragraph({
+              children: [new TextRun({ text: "[Issue text not yet written]", font: "Arial", size: 22, italics: true, color: MUTED })],
+              spacing: { after: 120 },
+            }));
+          }
+          const photosForIssue = jsonIds(issue.photoIds).map(pid => allObsPhotos.get(pid)).filter((p): p is Photo => !!p);
+          if (photosForIssue.length) {
+            obsChildren.push(new Paragraph({ children: [], spacing: { after: 80 } }));
+            obsChildren.push(...buildPhotoRows(photosForIssue, figureCounter));
+          }
+        }
+      }
+
       // Fetch groups for this project (if inspection is complete, we use grouped structure)
       const projectGroups = await storage.getGroupsByProject(projectId);
       projectGroups.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
       const useGroups = project.inspectionStatus === "complete" && projectGroups.length > 0;
 
-      if (allObservations.length === 0) {
+      if (useIssues) {
+        // Section 4 already built from issues above.
+      } else if (allObservations.length === 0) {
         obsChildren.push(new Paragraph({
           children: [new TextRun({ text: "No observations recorded.", font: "Arial", size: 22, italics: true, color: MUTED })],
           spacing: { after: 150 },
@@ -3100,7 +3572,7 @@ export async function registerRoutes(
       const capexChildren: (Paragraph | Table)[] = [];
       capexChildren.push(new Paragraph({
         heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: "5. CAPEX Summary", font: "Arial", size: 36, bold: true, color: TEAL })],
+        children: [new TextRun({ text: v2 ? "5. Works BUDGET Summary" : "5. CAPEX Summary", font: "Arial", size: 36, bold: true, color: TEAL })],
         spacing: { before: 400, after: 200 },
       }));
 
@@ -3124,7 +3596,10 @@ export async function registerRoutes(
         capexChildren.push(new Table({
           layout: TableLayoutType.FIXED,
           width: { size: 9026, type: WidthType.DXA },
-          rows: buildCapexTableRows(allCapexData),
+          ...(v2 ? { columnWidths: [800, 1050, 1100, 2950, 1050, 1000, 1076] } : {}),
+          rows: v2
+            ? buildBudgetTableRowsV2(allRecommendations.map(rec => ({ rec, obs: allObservations.find(o => o.id === rec.observationId) })))
+            : buildCapexTableRows(allCapexData),
         } as any));
       } else {
         capexChildren.push(new Paragraph({
@@ -3213,6 +3688,17 @@ export async function registerRoutes(
             footers: { default: contentFooter },
             children: capexChildren,
           },
+          ...(appendixChildren.length ? [{
+            properties: {
+              page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+              },
+            },
+            headers: { default: contentHeader },
+            footers: { default: contentFooter },
+            children: appendixChildren,
+          }] : []),
         ],
       });
 
