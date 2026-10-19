@@ -37,6 +37,8 @@ export const projects = sqliteTable("projects", {
   observationsOverview: text("observations_overview").default(""), // v2: 4.1 Overview
   locationDescription: text("location_description").default(""), // 3.2 Location text
   referencesIntro: text("references_intro").default(""), // 2.3 opening sentence
+  authorPhone: text("author_phone").default(""), // v2 cover: report author's phone (blank = AFC_AUTHORS lookup)
+  reportDate: text("report_date").default(""), // v2 cover date (YYYY-MM-DD); blank = export date
   inspectionMatrix: text("inspection_matrix").default(""), // JSON InspectionMatrix (shared/inspectionMatrix.ts); empty = legacy 2.2 export
   completedAt: text("completed_at").default(""), // Set on first successful Word export — used to auto-feed narratives into the Report Library
   createdAt: text("created_at").notNull(),
