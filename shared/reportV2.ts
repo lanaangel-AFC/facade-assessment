@@ -130,3 +130,16 @@ export function parseBudgetRange(b: string | null | undefined): [number, number]
 }
 
 export const formatMoney = (n: number) => `$${Math.round(n).toLocaleString("en-AU")}`;
+
+/** AFC report authors and their cover-page phone numbers. Add new staff here. */
+export const AFC_AUTHORS: { name: string; phone: string }[] = [
+  { name: "Lana Angel", phone: "0407 759 590" },
+];
+
+/** Phone for the report author: the project's own entry wins, else the AFC_AUTHORS directory. */
+export function authorPhoneFor(name: string | null | undefined, override?: string | null): string {
+  const o = (override || "").trim();
+  if (o) return o;
+  const n = (name || "").trim().toLowerCase();
+  return AFC_AUTHORS.find(a => a.name.toLowerCase() === n)?.phone || "";
+}

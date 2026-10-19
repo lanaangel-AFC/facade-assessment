@@ -315,6 +315,8 @@ for (const sql of [
   `ALTER TABLE photos ADD COLUMN include_in_report INTEGER DEFAULT 0`,
   `ALTER TABLE recommendations ADD COLUMN issue_id INTEGER`,
   `ALTER TABLE projects ADD COLUMN observations_overview TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN author_phone TEXT DEFAULT ''`,
+  `ALTER TABLE projects ADD COLUMN report_date TEXT DEFAULT ''`,
   `CREATE TABLE IF NOT EXISTS report_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL,

@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Plus, X, ArrowUp, ArrowDown, Sparkles, Loader2, RotateCcw, FileText } from "lucide-react";
 import {
   ASSESSMENT_TYPES, REPORT_TITLES, defaultTitleFor, REFERENCES_INTRO_PRESETS,
-  STANDARD_LIMITATIONS, parseLimitations, type Limitation,
+  STANDARD_LIMITATIONS, parseLimitations, type Limitation, authorPhoneFor,
 } from "@shared/reportV2";
 
 type Form = Record<string, any>;
@@ -64,6 +64,30 @@ export function ReportTypeCard({ form, updateField }: { form: Form; updateField:
             onChange={e => updateField("inspectionPurpose", e.target.value)}
             placeholder="e.g. understand cause and extent of louvre blade detachment at level 4"
           />
+        </div>
+        <div>
+          <Label>Author phone (cover)</Label>
+          <Input
+            value={form.authorPhone || ""}
+            onChange={e => updateField("authorPhone", e.target.value)}
+            placeholder={authorPhoneFor(form.inspector) || "e.g. 0400 000 000"}
+            data-testid="input-author-phone"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            {authorPhoneFor(form.inspector)
+              ? `Leave blank to use ${form.inspector}'s number. Clears when the inspector changes.`
+              : "Shown next to the inspector's name on the cover. Clears when the inspector changes."}
+          </p>
+        </div>
+        <div>
+          <Label>Report date (cover)</Label>
+          <Input
+            type="date"
+            value={form.reportDate || ""}
+            onChange={e => updateField("reportDate", e.target.value)}
+            data-testid="input-report-date"
+          />
+          <p className="text-xs text-muted-foreground mt-1">Date the report is issued to the client. Leave blank to use the export date.</p>
         </div>
       </div>
     </Card>

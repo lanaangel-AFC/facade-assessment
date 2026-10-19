@@ -559,7 +559,7 @@ export default function ProjectDetail() {
                 </div>
                 <div>
                   <Label>Inspector (cover page contact)</Label>
-                  <Input value={editForm.inspector || ""} onChange={e => updateField("inspector", e.target.value)} />
+                  <Input value={editForm.inspector || ""} onChange={e => { updateField("inspector", e.target.value); if (v2 && (editForm as any).authorPhone) updateField("authorPhone", ""); }} />
                 </div>
                 <div>
                   <Label>AFC Reference</Label>

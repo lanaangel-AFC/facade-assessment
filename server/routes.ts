@@ -4,7 +4,7 @@ import { registerDictationRoutes } from "./word-library";
 import { parseMatrix, matrixHasContent, buildInspectionText, emptyMatrix, DEFAULT_INSPECTOR } from "@shared/inspectionMatrix";
 import {
   REPORT_VERSION_CURRENT, isV2, STANDARD_LIMITATIONS, REFERENCES_INTRO_PRESETS, parseLimitations, stripBrackets,
-  reportTitleOf, timeframeRank, isWithinOneYear, parseBudget, parseBudgetRange, formatMoney, TIMEFRAME_GROUP_LABELS, assessmentPhrase,
+  reportTitleOf, timeframeRank, isWithinOneYear, parseBudget, parseBudgetRange, formatMoney, TIMEFRAME_GROUP_LABELS, assessmentPhrase, authorPhoneFor,
 } from "@shared/reportV2";
 import { createServer, type Server } from "http";
 import type { ReportIssue } from "@shared/schema";
@@ -2568,8 +2568,11 @@ export async function registerRoutes(
           timeframeRank(a.rec.timeframe) - timeframeRank(b.rec.timeframe) ||
           (budgetIdByRec.get(a.rec.id)?.id || a.obs?.observationId || "").localeCompare(budgetIdByRec.get(b.rec.id)?.id || b.obs?.observationId || "", undefined, { numeric: true }));
         const groups = new Map<number, typeof sorted>();
+        // v2: Immediate + Within 1 year share one total ("BUDGET FOR NOW TO 1 YEAR").
+        const groupKey = (tf: string | null | undefined) => Math.max(1, timeframeRank(tf));
+        const V2_TOTAL_LABELS: Record<number, string> = { 1: "NOW TO 1 YEAR", 2: "5 YEARS", 3: "THE LONGER TERM", 4: "ONGOING ITEMS" };
         for (const it of sorted) {
-          const k = timeframeRank(it.rec.timeframe);
+          const k = groupKey(it.rec.timeframe);
           if (!groups.has(k)) groups.set(k, []);
           groups.get(k)!.push(it);
         }
@@ -2589,7 +2592,7 @@ export async function registerRoutes(
           const label = TIMEFRAME_GROUP_LABELS[rank] || "Other";
           const amt = !sum ? "TBC" : (lo === sum ? formatMoney(sum) : `${formatMoney(lo)} – ${formatMoney(sum)}`) + (unpriced ? " + TBC" : "");
           rows.push(v2
-            ? buildCapexRow("", "", "", `BUDGET FOR ${label.toUpperCase()}`, "", "", amt, false, true, false)
+            ? buildCapexRow("", "", "", `BUDGET FOR ${V2_TOTAL_LABELS[rank] || label.toUpperCase()}`, "", "", amt, false, true, false)
             : buildCapexRow("", "", `Subtotal – ${label}`, "", "", "", amt, false, true, false));
         }
         return rows;
@@ -2666,7 +2669,13 @@ export async function registerRoutes(
           children: [new TextRun({ __raw: true, text, size, color, ...extra } as any)],
           spacing: { after },
         });
-        const exportDate = new Date().toLocaleDateString("en-AU", { day: "2-digit", month: "long", year: "numeric", timeZone: "Australia/Sydney" }).toUpperCase();
+        // Cover date: the issue date set on the project, else the export date.
+        const rd = String((project as any).reportDate || "").trim();
+        const rdParsed = /^\d{4}-\d{2}-\d{2}$/.test(rd) ? new Date(`${rd}T12:00:00Z`) : null;
+        const exportDate = (rdParsed && !isNaN(rdParsed.getTime()) ? rdParsed : new Date())
+          .toLocaleDateString("en-AU", { day: "2-digit", month: "long", year: "numeric", timeZone: "Australia/Sydney" }).toUpperCase();
+        const authorName = (project.inspector || "").trim() || DEFAULT_INSPECTOR;
+        const authorPhone = authorPhoneFor(authorName, (project as any).authorPhone);
         const rev = String((project as any).revision ?? "0").replace(/^0+(?=\d)/, "") || "0";
         coverChildren.push(new Paragraph({ children: [], spacing: { before: 9600 } }));
         coverChildren.push(coverLine((project.address || project.name || "").toUpperCase(), 52, "0A1D30"));
@@ -2674,7 +2683,7 @@ export async function registerRoutes(
         coverChildren.push(coverLine(`Revision ${rev}`, 24, "0E2841", 160, { smallCaps: true }));
         coverChildren.push(coverLine(exportDate, 24, "262626", 840));
         coverChildren.push(coverLine("ANGEL FA\u00C7ADE CONSULTING", 28, "262626"));
-        coverChildren.push(coverLine(`${(project.inspector || "Lana Angel").toUpperCase()} | 0407 759 590`, 20, "262626"));
+        coverChildren.push(coverLine(`${authorName.toUpperCase()}${authorPhone ? ` | ${authorPhone}` : ""}`, 20, "262626"));
         coverChildren.push(coverLine(project.afcReference || "", 20, "262626"));
       }
 
